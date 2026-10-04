@@ -1,0 +1,6 @@
+# Artifact Hub repository metadata for oci://ghcr.io/maks3201/charts/decision-model-operator.
+# Pushed to the registry as the `artifacthub.io` tag by .github/workflows/artifacthub.yml.
+# https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-support
+owners:
+  - name: maks3201
+    email: eumaxpl@gmail.com
