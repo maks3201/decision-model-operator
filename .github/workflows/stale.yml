@@ -1,0 +1,38 @@
+name: Stale
+
+# Weekly housekeeping: mark inactive issues/PRs stale after 60 days, close 14
+# days later. Dependabot PRs (label "dependencies") are never touched.
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, Monday 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: "pinned,security"
+          exempt-pr-labels: "pinned,security,dependencies"
+          stale-issue-message: >
+            This issue has been inactive for 60 days and is now marked stale.
+            Remove the stale label or comment to keep it open; otherwise it will
+            be closed in 14 days.
+          stale-pr-message: >
+            This pull request has been inactive for 60 days and is now marked
+            stale. Remove the stale label or comment to keep it open; otherwise
+            it will be closed in 14 days.
+          exempt-all-milestones: true
+          operations-per-run: 60

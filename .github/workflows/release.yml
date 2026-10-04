@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build multi-arch without pushing, no Release"
+        type: boolean
+        default: true
+  # Reusable entrypoint: release-please.yml calls this after it has created the
+  # GitHub Release (a Release/tag made with GITHUB_TOKEN does not trigger the
+  # push event above, so the caller invokes us explicitly).
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing release tag to build and upload assets to (e.g. v0.1.0)"
+        type: string
+        required: true
+
+# Minimal by default; each job widens what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Dry run: verify the multi-arch build and the installer manifest without
+  # publishing anything. Runs on workflow_dispatch with dry_run=true (default).
+  # No GHCR login, no Release; contents: read only.
+  dry-run:
+    name: dry-run (build multi-arch, no push)
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+
+      - name: Build multi-arch image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ghcr.io/maks3201/decision-model-operator:dry-run
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build installer manifest
+        run: make build-installer IMG=ghcr.io/maks3201/decision-model-operator:dry-run
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p dist
+          helm package charts/decision-model-operator --destination dist
+
+      - name: Upload install.yaml + chart artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-yaml-dry-run
+          path: |
+            dist/install.yaml
+            dist/*.tgz
+
+  # Real release: build + push multi-arch and attach install.yaml + chart to the
+  # Release. Runs on a v* tag push, or when called by release-please.yml.
+  release:
+    name: build image + installer
+    if: github.event_name == 'push' || github.event_name == 'workflow_call'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    env:
+      # inputs.tag is set on workflow_call; github.ref_name is the tag on push.
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/maks3201/decision-model-operator:${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build installer manifest
+        run: make build-installer IMG=ghcr.io/maks3201/decision-model-operator:${{ env.TAG }}
+
+      - name: Package Helm chart
+        run: helm package charts/decision-model-operator --destination dist
+
+      # OCI chart: oci://ghcr.io/maks3201/charts/decision-model-operator:<version>
+      # (Artifact Hub indexes this repository).
+      - name: Push Helm chart to GHCR (OCI)
+        env:
+          HELM_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$HELM_PASSWORD" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push dist/decision-model-operator-*.tgz oci://ghcr.io/maks3201/charts
+
+      - name: Upload install.yaml + chart to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ env.TAG }}" \
+            dist/install.yaml dist/*.tgz \
+            --clobber

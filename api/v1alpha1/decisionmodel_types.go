@@ -1,0 +1,461 @@
+/*
+Copyright 2026 maks3201.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// DecisionModelSpec defines the desired state of DecisionModel.
+type DecisionModelSpec struct {
+	// Engine is the serving runtime for the model.
+	// +kubebuilder:validation:Enum=ollaya
+	// +kubebuilder:default=ollaya
+	// +optional
+	Engine string `json:"engine,omitempty"`
+
+	// Model is the model name in engine terms, e.g. "laya:en". The last path
+	// segment must include an explicit ":tag" (a bare name resolves to :latest,
+	// a different and heavier artifact — see spike 001 §9).
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self.split('/')[size(self.split('/')) - 1].contains(':')",message="model must include an explicit tag, e.g. laya:en"
+	Model string `json:"model"`
+
+	// Digest optionally pins the model to an immutable digest (bare hex sha256).
+	// When empty, the operator resolves the tag and records the digest in status.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +optional
+	Digest string `json:"digest,omitempty"`
+
+	// Replicas is the number of serving Pods for the stable revision (default 1).
+	// With replicas > 1 spread across nodes the model store must be shareable —
+	// see cache.accessModes; otherwise the operator reports Degraded
+	// (CacheNotShareable).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// Device selects the target compute device for serving. "cuda" also requests
+	// an nvidia.com/gpu and uses the engine's CUDA image.
+	// +kubebuilder:validation:Enum=cpu;cuda
+	// +kubebuilder:default=cpu
+	// +optional
+	Device string `json:"device,omitempty"`
+
+	// Image overrides the engine's default container image. Rejected unless the
+	// operator is started with --allow-image-override (a DecisionModel editor
+	// could otherwise run an arbitrary image under the operator's Pod template).
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Resources are the compute resource requirements for the serving container.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Scheduling is a passthrough of nodeSelector/tolerations/affinity for serving Pods.
+	// +optional
+	Scheduling *SchedulingSpec `json:"scheduling,omitempty"`
+
+	// Cache configures the model store PVC.
+	// +optional
+	Cache *CacheSpec `json:"cache,omitempty"`
+
+	// Auth configures the engine API key.
+	// +optional
+	Auth *AuthSpec `json:"auth,omitempty"`
+
+	// Rollout configures rollout behaviour, including eval-gated promotion.
+	// +optional
+	Rollout *RolloutSpec `json:"rollout,omitempty"`
+}
+
+// SchedulingSpec is a passthrough of standard Pod scheduling controls.
+type SchedulingSpec struct {
+	// NodeSelector is a selector which must be true for the Pod to fit on a node.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations allow the Pod to schedule onto nodes with matching taints.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// Affinity constrains Pod scheduling.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// RuntimeClassName selects the RuntimeClass for serving Pods, e.g. "nvidia"
+	// when the NVIDIA GPU Operator does not make it the default runtime. It is
+	// applied to serving Pods only (the prefetch Job needs no GPU runtime).
+	// Because it is part of spec.scheduling, changing it changes the revision's
+	// placement hash and therefore starts a new revision (blue-green), like any
+	// other scheduling change.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+}
+
+// CacheSpec configures the model store PVC.
+type CacheSpec struct {
+	// Size is the requested PVC size for the model store.
+	// +kubebuilder:default="10Gi"
+	// +optional
+	Size resource.Quantity `json:"size,omitempty"`
+
+	// StorageClassName selects the PVC storage class. RWX is required for
+	// replicas>1 spread across nodes.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// AccessModes for the model store PVC. Defaults to ReadWriteOnce. Set
+	// ReadWriteMany when running replicas>1 spread across nodes. ReadOnlyMany is
+	// rejected: the prefetch Job must write the store. PVC access modes are
+	// immutable once created.
+	// +kubebuilder:validation:XValidation:rule="self.all(m, m != 'ReadOnlyMany')",message="ReadOnlyMany is not allowed: the prefetch Job writes the model store"
+	// +optional
+	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+}
+
+// AuthSpec configures the engine API key.
+type AuthSpec struct {
+	// APIKeySecretRef references a Secret key holding the engine API key. The
+	// Secret must carry the label decisionmodel.io/api-key: "true" (opt-in), or
+	// the operator reports Degraded (SecretNotAllowed) and creates no workloads.
+	// The same key is used by the operator's prober and evaluator.
+	// +optional
+	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
+}
+
+// RolloutSpec configures rollout behaviour.
+type RolloutSpec struct {
+	// Evaluation gates promotion on a golden-dataset accuracy check. When unset,
+	// a candidate is promoted as soon as all its Pods are model-ready.
+	// +optional
+	Evaluation *EvaluationSpec `json:"evaluation,omitempty"`
+
+	// ManualPromotion holds a candidate that passed its gate (model-ready, plus
+	// evaluation when configured) in phase AwaitingPromotion until a human
+	// approves it by setting the annotation decisionmodel.io/promote to the
+	// candidate's revision hash. The stable revision keeps serving meanwhile.
+	// There is no progress timeout while waiting. The very first revision of a
+	// DecisionModel (no stable revision yet) is promoted without approval, since
+	// there is no traffic to protect. The approval annotation is removed once the
+	// promotion has been persisted.
+	// +kubebuilder:default=false
+	// +optional
+	ManualPromotion bool `json:"manualPromotion,omitempty"`
+
+	// Timeouts overrides the progress timeouts of a rollout. Unset fields keep
+	// the built-in defaults. Large models (tens of GB) need more than the
+	// defaults on a cold node. Not part of the revision hash; a change applies to
+	// the phase timeouts immediately, but a prefetch Job that already exists keeps
+	// the deadline it was created with.
+	// +optional
+	Timeouts *RolloutTimeouts `json:"timeouts,omitempty"`
+}
+
+// RolloutTimeouts overrides the progress timeouts of a rollout. Each value must
+// be between 1m and 24h.
+type RolloutTimeouts struct {
+	// Caching bounds the Caching phase and is also used as the prefetch Job's
+	// activeDeadlineSeconds. Default 30m.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="must be between 1m and 24h"
+	// +optional
+	Caching *metav1.Duration `json:"caching,omitempty"`
+
+	// Starting bounds the Starting phase (candidate Pods becoming model-ready)
+	// and, when set, also the background model warmup on each Pod. When unset the
+	// phase timeout is 10m and the warmup bound stays 2m. Default 10m.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="must be between 1m and 24h"
+	// +optional
+	Starting *metav1.Duration `json:"starting,omitempty"`
+
+	// Evaluating bounds the Evaluating phase and each golden-dataset run.
+	// Default 10m.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="must be between 1m and 24h"
+	// +optional
+	Evaluating *metav1.Duration `json:"evaluating,omitempty"`
+}
+
+// DatasetRef references a golden dataset (JSONL) in a ConfigMap or Secret.
+// Exactly one of configMapRef / secretRef must be set.
+// +kubebuilder:validation:XValidation:rule="(has(self.configMapRef) ? 1 : 0) + (has(self.secretRef) ? 1 : 0) == 1",message="exactly one of configMapRef or secretRef must be set"
+type DatasetRef struct {
+	// ConfigMapRef selects a key in a ConfigMap holding the JSONL dataset.
+	// +optional
+	ConfigMapRef *DatasetKeyRef `json:"configMapRef,omitempty"`
+	// SecretRef selects a key in a Secret holding the JSONL dataset. The Secret
+	// must carry the label decisionmodel.io/api-key: "true" (opt-in guard).
+	// +optional
+	SecretRef *DatasetKeyRef `json:"secretRef,omitempty"`
+}
+
+// DatasetKeyRef names an object and a key within it.
+type DatasetKeyRef struct {
+	// Name of the ConfigMap or Secret.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Key holding the JSONL content.
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
+}
+
+// EvaluationSpec configures the eval-gated rollout.
+type EvaluationSpec struct {
+	// DatasetRef points at the golden dataset (JSONL).
+	DatasetRef DatasetRef `json:"datasetRef"`
+
+	// MinAccuracy is the minimum accuracy (decimal string in [0,1], e.g. "0.90")
+	// the candidate must reach to be promoted.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	MinAccuracy string `json:"minAccuracy"`
+
+	// MaxAccuracyDrop is the maximum tolerated accuracy drop vs the stable
+	// baseline (decimal string, e.g. "0.02"). Only enforced when a stable
+	// revision exists to provide a baseline; empty means no drop constraint.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	// +optional
+	MaxAccuracyDrop string `json:"maxAccuracyDrop,omitempty"`
+
+	// MaxCases caps how many dataset cases are used (first N).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5000
+	// +kubebuilder:default=500
+	// +optional
+	MaxCases int32 `json:"maxCases,omitempty"`
+
+	// MaxECE is the maximum tolerated Expected Calibration Error (decimal string
+	// in [0,1], e.g. "0.10"). Empty disables the absolute ECE gate.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	// +optional
+	MaxECE string `json:"maxECE,omitempty"`
+
+	// MaxECEIncrease is the maximum tolerated ECE increase vs the stable baseline
+	// (decimal string). Only enforced when a stable revision exists to provide a
+	// baseline; empty disables the relative ECE gate.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	// +optional
+	MaxECEIncrease string `json:"maxECEIncrease,omitempty"`
+}
+
+// DecisionModelPhase enumerates the high-level lifecycle phase of a DecisionModel.
+type DecisionModelPhase string
+
+// RevisionStatus records the resolved, model-affecting identity of a revision.
+//
+// Model-affecting fields (engine, model, digest, device, image, resources)
+// together reproduce the revision hash, so a stable revision can be rendered
+// from its own recorded state rather than the current spec (which may already
+// describe a different, pending candidate).
+type RevisionStatus struct {
+	// Hash is the short revision hash of the model-affecting spec fields.
+	Hash string `json:"hash,omitempty"`
+
+	// Engine is the serving runtime for this revision.
+	// +optional
+	Engine string `json:"engine,omitempty"`
+
+	// Model is the model name for this revision.
+	Model string `json:"model,omitempty"`
+
+	// Digest is the resolved immutable digest for this revision.
+	Digest string `json:"digest,omitempty"`
+
+	// Device is the target device for this revision.
+	Device string `json:"device,omitempty"`
+
+	// Image is the resolved serving container image for this revision.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Resources are the compute resource requirements of this revision's serving
+	// container.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Precision is the quantization level reported by the engine (e.g. F32, F16).
+	Precision string `json:"precision,omitempty"`
+
+	// Placement is a short hash of spec.scheduling (nodeSelector, tolerations,
+	// affinity, runtimeClassName) as it was when this revision was created, or
+	// "none" when no scheduling was set. Empty only on a revision recorded by an
+	// older operator version, which the controller adopts on its first reconcile.
+	// Placement is part of a revision's identity: a change of scheduling starts a
+	// new revision (blue-green, own store) instead of rolling the running
+	// Deployment in place. A hash is recorded, not the spec, because Affinity is a
+	// very large schema and this type appears three times in the CRD.
+	// +optional
+	Placement string `json:"placement,omitempty"`
+}
+
+// PreviousRevisionStatus records the revision demoted by the latest promotion
+// and when the promotion happened, so its workloads may linger for a grace
+// period before being garbage-collected.
+type PreviousRevisionStatus struct {
+	// Hash is the demoted revision's hash.
+	Hash string `json:"hash,omitempty"`
+	// PromotedAt is when the newer revision was promoted (this one demoted).
+	// +optional
+	PromotedAt *metav1.Time `json:"promotedAt,omitempty"`
+}
+
+// ReplicaStatus reports desired and model-ready replica counts.
+type ReplicaStatus struct {
+	// Desired is the desired number of serving replicas.
+	// +optional
+	Desired int32 `json:"desired,omitempty"`
+
+	// ModelReady is the number of replicas that passed the model readiness gate.
+	// +optional
+	ModelReady int32 `json:"modelReady,omitempty"`
+}
+
+// EvaluationStatus records the outcome of an eval-gated rollout evaluation.
+type EvaluationStatus struct {
+	// Revision is the revision hash the evaluation was run against.
+	Revision string `json:"revision,omitempty"`
+	// Accuracy is the candidate accuracy (decimal string).
+	Accuracy string `json:"accuracy,omitempty"`
+	// BaselineAccuracy is the stable revision's accuracy for this dataset, if known.
+	BaselineAccuracy string `json:"baselineAccuracy,omitempty"`
+	// Cases is the number of questions scored.
+	Cases int32 `json:"cases,omitempty"`
+	// FailedCases is the number of questions that were wrong or unanswerable.
+	FailedCases int32 `json:"failedCases,omitempty"`
+	// ECE is the candidate's expected calibration error (decimal string).
+	ECE string `json:"ece,omitempty"`
+	// Brier is the candidate's Brier score (decimal string).
+	Brier string `json:"brier,omitempty"`
+	// BaselineECE is the stable revision's ECE for this dataset, if known.
+	BaselineECE string `json:"baselineEce,omitempty"`
+	// PolicyHash is a hash of the effective evaluation policy (thresholds,
+	// datasetRef, maxCases) this result was produced under. A parked candidate in
+	// AwaitingPromotion whose current policy hash differs is re-evaluated rather
+	// than promoted on the stale result.
+	// +optional
+	PolicyHash string `json:"policyHash,omitempty"`
+	// CompletedAt is when the evaluation finished.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+}
+
+// DecisionModelStatus defines the observed state of DecisionModel.
+type DecisionModelStatus struct {
+	// Phase is the high-level lifecycle phase.
+	// +optional
+	Phase DecisionModelPhase `json:"phase,omitempty"`
+
+	// PhaseTransitionTime is when Phase last changed. Used for progress timeouts.
+	// +optional
+	PhaseTransitionTime *metav1.Time `json:"phaseTransitionTime,omitempty"`
+
+	// ObservedGeneration is the generation last processed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Endpoint is the in-cluster serving endpoint URL.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// StableRevision is the revision currently receiving traffic.
+	// +optional
+	StableRevision *RevisionStatus `json:"stableRevision,omitempty"`
+
+	// CandidateRevision is the revision being rolled out, if any.
+	// +optional
+	CandidateRevision *RevisionStatus `json:"candidateRevision,omitempty"`
+
+	// FailedRevision is a revision that failed to roll out. The controller does
+	// not automatically retry it; a spec change (new revision) is required, or
+	// setting the decisionmodel.io/retry annotation to a new token re-attempts
+	// the same revision.
+	// +optional
+	FailedRevision *RevisionStatus `json:"failedRevision,omitempty"`
+
+	// PreviousRevision is the revision that was stable immediately before the
+	// most recent promotion. It may linger for a short grace period after
+	// promotedAt so the new revision's endpoints populate before it is removed.
+	// +optional
+	PreviousRevision *PreviousRevisionStatus `json:"previousRevision,omitempty"`
+
+	// LastRetryToken is the value of the decisionmodel.io/retry annotation the
+	// controller last consumed to clear a failed revision.
+	// +optional
+	LastRetryToken string `json:"lastRetryToken,omitempty"`
+
+	// Replicas reports desired and model-ready replica counts.
+	// +optional
+	Replicas ReplicaStatus `json:"replicas,omitempty"`
+
+	// Evaluation records the most recent eval-gated rollout result.
+	// +optional
+	Evaluation *EvaluationStatus `json:"evaluation,omitempty"`
+
+	// Conditions represent the latest available observations of the object's state.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=dm
+// +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.spec.model`
+// +kubebuilder:printcolumn:name="Digest",type=string,JSONPath=`.status.stableRevision.digest`,priority=1
+// +kubebuilder:printcolumn:name="Device",type=string,JSONPath=`.spec.device`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.replicas.modelReady`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// DecisionModel is the Schema for the decisionmodels API.
+//
+// metadata.name must be a DNS-1035 label of at most 43 characters (see
+// MaxNameLength): the operator derives a Service named after it (no dots) and
+// Job/PVC names that must stay within 63 characters.
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must be a DNS-1035 label: lowercase letters, digits and '-', starting with a letter and ending with a letter or digit (no dots)"
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 43",message="metadata.name must be at most 43 characters (derived Job and PVC names must fit in 63)"
+type DecisionModel struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   DecisionModelSpec   `json:"spec,omitempty"`
+	Status DecisionModelStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// DecisionModelList contains a list of DecisionModel.
+type DecisionModelList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []DecisionModel `json:"items"`
+}

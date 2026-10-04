@@ -1,0 +1,7 @@
+.DS_Store
+*.tmp
+*.bak
+*.orig
+.git/
+# helm-docs template (source for README.md; not shipped in the package)
+README.md.gotmpl

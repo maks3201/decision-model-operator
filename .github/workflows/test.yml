@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unit + envtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Generated files are up to date
+        run: |
+          make manifests generate
+          git diff --exit-code -- api config
+
+      - name: API reference is up to date
+        run: |
+          make api-docs
+          git diff --exit-code -- docs/api-reference.md
+
+      - name: Run tests
+        run: make test
+
+      - name: Race detector
+        run: |
+          v=$(go list -m -f '{{ .Version }}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')
+          KUBEBUILDER_ASSETS="$PWD/$(bin/setup-envtest use "$v" --bin-dir bin -p path)" \
+            go test -race $(go list ./... | grep -v /e2e)

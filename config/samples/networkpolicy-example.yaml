@@ -1,0 +1,71 @@
+# Example NetworkPolicies for a DecisionModel named "support-router".
+#
+# NOT wired into any kustomization — copy, adjust the names/namespaces/labels,
+# and apply into the namespace where the DecisionModel runs. Requires a CNI that
+# enforces NetworkPolicy (Calico, Cilium, etc.; kind's default CNI does not).
+#
+# Adjust:
+#   - metadata.namespace: the DecisionModel's namespace.
+#   - decisionmodel.io/name: your DecisionModel's name.
+#   - the client namespace label (here: decisionmodel.io/client=allowed).
+#   - the operator namespace label (kubernetes.io/metadata.name of the
+#     operator's namespace, default decision-model-operator-system).
+---
+# 1) Ingress to serving Pods on 11435, only from a labelled client namespace and
+#    from the operator namespace (the prober / evaluator connect to Pods).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: support-router-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      decisionmodel.io/name: support-router
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # Clients in a namespace explicitly labelled decisionmodel.io/client=allowed.
+        - namespaceSelector:
+            matchLabels:
+              decisionmodel.io/client: allowed
+        # The operator namespace (prober warms up Pods, evaluator scores them).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: decision-model-operator-system
+      ports:
+        - protocol: TCP
+          port: 11435
+---
+# 2) Egress for the prefetch Job pods to the model registry: DNS (53) plus
+#    HTTPS (443) to pull weights from ollaya.dev. Prefetch Job pods carry the
+#    same decisionmodel.io/name label as serving Pods; this policy also allows
+#    serving Pods the same egress (harmless — they only serve). Tighten the
+#    443 destination with an egress CIDR or a CNI FQDN policy if your CNI
+#    supports it (plain NetworkPolicy cannot match a DNS name).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: support-router-egress-registry
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      decisionmodel.io/name: support-router
+  policyTypes: ["Egress"]
+  egress:
+    # DNS resolution (kube-dns / CoreDNS in kube-system).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to the registry (ollaya.dev). Restrict `to:` with a CIDR or an FQDN
+    # policy (Cilium/Calico) in production; plain NetworkPolicy allows all 443.
+    - ports:
+        - protocol: TCP
+          port: 443

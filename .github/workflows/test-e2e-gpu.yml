@@ -1,0 +1,98 @@
+name: E2E Tests (GPU)
+
+# Manual only: never on push or pull_request. GPU runs need a self-hosted GPU
+# runner (see docs/gpu-ci.md) and must not be triggered by untrusted refs.
+on:
+  workflow_dispatch:
+    inputs:
+      ollaya_cuda_image:
+        description: "Ollaya CUDA runtime image to load into kind"
+        default: "ghcr.io/ollaya-dev/ollaya:0.7.3-cuda"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-e2e-gpu:
+    name: kind (CUDA, laya:en)
+    # Requires a self-hosted runner labelled gpu (see docs/gpu-ci.md).
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    env:
+      # C's e2e switch: run the DecisionModel with device: cuda and assert the
+      # cuda-specific status/limits. The operator picks the :0.7.3-cuda image
+      # from device=cuda, so the CUDA runtime image must be loaded into kind.
+      E2E_DEVICE: cuda
+      OLLAYA_IMAGE: ${{ github.event.inputs.ollaya_cuda_image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify GPU is visible on the runner
+        run: |
+          nvidia-smi
+          # The NVIDIA container runtime must be the Docker default on this host
+          # (nvidia-ctk runtime configure --runtime=docker --set-as-default), and
+          # accept-nvidia-visible-devices-as-volume-mounts = true. See docs/gpu-ci.md.
+          docker info --format '{{.DefaultRuntime}}'
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Create a GPU-enabled kind cluster
+        # kind has no native GPU support. This uses the community approach:
+        # the NVIDIA container runtime is the Docker default, the kind node
+        # mounts the toolkit, and the NVIDIA k8s-device-plugin advertises
+        # nvidia.com/gpu. See docs/gpu-ci.md for the config and the nvkind
+        # alternative. hack/kind-up.sh is reused for image loading only.
+        run: |
+          cat > /tmp/kind-gpu.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              # Expose the toolkit + libraries so the kubelet/containerd in the
+              # node can run CUDA containers.
+              extraMounts:
+                - hostPath: /dev/null
+                  containerPath: /var/run/nvidia-container-devices/all
+          EOF
+          kind create cluster --name dmo-gpu --config /tmp/kind-gpu.yaml
+          kubectl label node dmo-gpu-control-plane nvidia.com/gpu.present=true --overwrite
+
+      - name: Install the NVIDIA device plugin
+        run: |
+          kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
+          # Wait for a node to advertise a GPU.
+          for i in $(seq 1 30); do
+            gpus=$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.nvidia\.com/gpu}')
+            if [ -n "$gpus" ] && [ "$gpus" != "0" ]; then echo "allocatable GPUs: $gpus"; break; fi
+            sleep 5
+          done
+          kubectl get nodes -o jsonpath='{.items[0].status.allocatable}'; echo
+
+      - name: Load the Ollaya CUDA runtime image into kind
+        run: |
+          docker pull "$OLLAYA_IMAGE"
+          kind load docker-image "$OLLAYA_IMAGE" --name dmo-gpu
+
+      - name: Run e2e (CUDA)
+        # KIND_CLUSTER reuses the GPU cluster we just created rather than
+        # hack/kind-up.sh's default; E2E_DEVICE=cuda is honoured by the suite (C).
+        run: KIND_CLUSTER=dmo-gpu make test-e2e
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: kind delete cluster --name dmo-gpu || true

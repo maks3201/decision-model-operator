@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dmo.managerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dmo.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        {{- include "dmo.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "dmo.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: {{ include "dmo.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/manager"]
+          args:
+            - --health-probe-bind-address={{ .Values.healthProbeBindAddress }}
+            {{- if .Values.leaderElection }}
+            - --leader-elect
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - --metrics-bind-address={{ .Values.metrics.bindAddress }}
+            - --metrics-secure={{ .Values.metrics.secure }}
+            {{- else }}
+            - --metrics-bind-address=0
+            {{- end }}
+            {{- with .Values.manager.allowedRegistries }}
+            - --allowed-registries={{ . }}
+            {{- end }}
+            {{- if .Values.manager.allowInsecureRegistries }}
+            - --allow-insecure-registries
+            {{- end }}
+            {{- if .Values.manager.allowImageOverride }}
+            - --allow-image-override
+            {{- end }}
+            {{- with .Values.manager.maxConcurrentReconciles }}
+            - --max-concurrent-reconciles={{ . }}
+            {{- end }}
+            {{- with .Values.manager.ollayaRegistry }}
+            - --ollaya-registry={{ . }}
+            {{- end }}
+            {{- with .Values.watchNamespaces }}
+            - --watch-namespaces={{ join "," . }}
+            {{- end }}
+          {{- if .Values.proxy.existingSecret }}
+          env:
+            - name: HTTP_PROXY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.proxy.existingSecret }}
+                  key: httpProxy
+                  optional: true
+            - name: HTTPS_PROXY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.proxy.existingSecret }}
+                  key: httpsProxy
+                  optional: true
+            - name: NO_PROXY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.proxy.existingSecret }}
+                  key: noProxy
+                  optional: true
+          {{- else if or .Values.proxy.httpProxy .Values.proxy.httpsProxy .Values.proxy.noProxy }}
+          env:
+            {{- with .Values.proxy.httpProxy }}
+            - name: HTTP_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.httpsProxy }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

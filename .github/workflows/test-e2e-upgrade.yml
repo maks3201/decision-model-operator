@@ -1,0 +1,162 @@
+name: E2E Upgrade & Release Smoke
+
+# Release go/no-go gates (RELEASING.md §3): upgrade E2E from a published release to
+# the code under test, and a smoke test of the published release artifacts. Not on
+# every push — invoked manually or by the release pipeline (workflow_call).
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Release tag to upgrade FROM (default: latest release)"
+        type: string
+        required: false
+      tag:
+        description: "Release tag to smoke-test the artifacts of (default: same as 'from')"
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      from:
+        description: "Release tag to upgrade FROM (default: latest release)"
+        type: string
+        required: false
+      tag:
+        description: "Release tag to smoke-test (default: same as 'from')"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Resolve the release tags and the k8s version matrix once, so every job and the
+  # job summary agree on them. 'from'/'tag' default to the latest GitHub release.
+  resolve:
+    name: resolve tags + versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      from: ${{ steps.tags.outputs.from }}
+      tag: ${{ steps.tags.outputs.tag }}
+      newest: ${{ steps.ver.outputs.newest }}
+      oldest: ${{ steps.ver.outputs.oldest }}
+      node_newest: ${{ steps.ver.outputs.node_newest }}
+      node_oldest: ${{ steps.ver.outputs.node_oldest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve release tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_FROM: ${{ inputs.from }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          from="${IN_FROM}"
+          if [ -z "${from}" ]; then
+            from="$(gh release view -R "${GITHUB_REPOSITORY}" --json tagName -q .tagName)"
+          fi
+          tag="${IN_TAG:-${from}}"
+          echo "from=${from}" >>"$GITHUB_OUTPUT"
+          echo "tag=${tag}"  >>"$GITHUB_OUTPUT"
+
+      - name: Load k8s version matrix
+        id: ver
+        run: |
+          set -euo pipefail
+          . hack/k8s-versions.env
+          {
+            echo "newest=${K8S_NEWEST}"
+            echo "oldest=${K8S_OLDEST}"
+            echo "node_newest=${KIND_NODE_IMAGE_NEWEST}"
+            echo "node_oldest=${KIND_NODE_IMAGE_OLDEST}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          FROM: ${{ steps.tags.outputs.from }}
+          TAG: ${{ steps.tags.outputs.tag }}
+          NEWEST: ${{ steps.ver.outputs.newest }}
+          OLDEST: ${{ steps.ver.outputs.oldest }}
+        run: |
+          {
+            echo "### E2E Upgrade & Release Smoke"
+            echo ""
+            echo "| what | value |"
+            echo "|---|---|"
+            echo "| upgrade from | \`${FROM}\` |"
+            echo "| smoke tag | \`${TAG}\` |"
+            echo "| k8s matrix (upgrade) | \`${OLDEST}\`, \`${NEWEST}\` |"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  upgrade:
+    name: upgrade ${{ needs.resolve.outputs.from }} -> source (k8s ${{ matrix.k8s }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - k8s: ${{ needs.resolve.outputs.oldest }}
+            node: ${{ needs.resolve.outputs.node_oldest }}
+          - k8s: ${{ needs.resolve.outputs.newest }}
+            node: ${{ needs.resolve.outputs.node_newest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Upgrade E2E
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          KIND_NODE_IMAGE: ${{ matrix.node }}
+          KIND_CLUSTER: dmo-upgrade
+        run: ./hack/upgrade-e2e.sh "${{ needs.resolve.outputs.from }}"
+
+  smoke:
+    name: release-artifact smoke ${{ needs.resolve.outputs.tag }} (k8s ${{ needs.resolve.outputs.newest }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Release-artifact smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          KIND_NODE_IMAGE: ${{ needs.resolve.outputs.node_newest }}
+          KIND_CLUSTER: dmo-smoke
+        run: ./hack/release-smoke.sh "${{ needs.resolve.outputs.tag }}"

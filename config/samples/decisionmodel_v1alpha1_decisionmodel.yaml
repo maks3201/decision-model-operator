@@ -1,0 +1,18 @@
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  labels:
+    app.kubernetes.io/name: decision-model-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: decisionmodel-sample
+spec:
+  engine: ollaya
+  model: laya:en
+  device: cpu
+  replicas: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: 3500Mi
+    limits:
+      memory: 4Gi

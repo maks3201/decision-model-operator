@@ -1,0 +1,1350 @@
+/*
+Copyright 2026 maks3201.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package ollaya implements the engine.Engine contract for the Ollaya runtime.
+package ollaya
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	neturl "net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/maks3201/decision-model-operator/internal/engine"
+)
+
+const (
+	// defaultRegistryURL is the base of the Ollaya model registry.
+	defaultRegistryURL = "https://ollaya.dev"
+	// servicePort is the port the Ollaya runtime listens on.
+	servicePort int32 = 11435
+	// engineName matches DecisionModel spec.engine.
+	engineName = "ollaya"
+
+	// Per-method default deadlines, applied only when the caller's context has
+	// no deadline of its own. Warmup is generous because loading a large model
+	// on CPU can take minutes (matches OLLAYA_LOAD_TIMEOUT's default).
+	defaultResolveTimeout = 10 * time.Second
+	defaultInspectTimeout = 10 * time.Second
+	defaultWarmupTimeout  = 5 * time.Minute
+	defaultDecideTimeout  = 30 * time.Second
+
+	// Transport-level timeouts for the default client. These bound connection
+	// setup and the wait for response headers, but not the total request: the
+	// per-method deadline (or the caller's ctx) bounds the body/streaming read.
+	dialTimeout           = 10 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	responseHeaderTimeout = 30 * time.Second
+	expectContinueTimeout = 1 * time.Second
+	idleConnTimeout       = 90 * time.Second
+)
+
+// methodTimeouts holds the per-method default deadlines. It is a field so tests
+// can shorten the values without waiting real seconds.
+type methodTimeouts struct {
+	resolve time.Duration
+	inspect time.Duration
+	warmup  time.Duration
+	decide  time.Duration
+}
+
+// Engine is the Ollaya implementation of engine.Engine.
+type Engine struct {
+	registryURL string
+	// httpClient talks to the model registry (Resolve). It honours the proxy
+	// environment (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) so pulls work in proxied
+	// clusters.
+	httpClient *http.Client
+	// runtimeClient talks to serving Pods by Pod IP (Inspect, Warmup, Decide).
+	// It is deliberately proxy-less (Proxy: nil): these are in-cluster calls that
+	// carry the Authorization: Bearer <api key> header, and must never be routed
+	// through a corporate proxy even if the Pod CIDR is missing from NO_PROXY.
+	runtimeClient *http.Client
+	timeouts      methodTimeouts
+}
+
+// Option configures an Engine.
+type Option func(*Engine)
+
+// WithRegistryURL overrides the registry base URL (default https://ollaya.dev).
+func WithRegistryURL(url string) Option {
+	return func(e *Engine) {
+		e.registryURL = strings.TrimRight(url, "/")
+	}
+}
+
+// WithHTTPClient overrides BOTH HTTP clients (registry and runtime) entirely
+// (default: clients with no global Timeout, using a transport with sane
+// dial/TLS/header timeouts; the registry client honours the proxy env, the
+// runtime client does not). Injecting one client here opts out of the
+// registry/runtime proxy split, so use it only in tests or when you have a
+// single trusted destination.
+func WithHTTPClient(c *http.Client) Option {
+	return func(e *Engine) {
+		if c != nil {
+			e.httpClient = c
+			e.runtimeClient = c
+		}
+	}
+}
+
+// WithRuntimeHTTPClient overrides only the runtime client (Inspect/Warmup/
+// Decide, which call Pod IPs with the API key). The registry client is left
+// untouched. Used by tests that need to assert the runtime client's proxy
+// behaviour independently of the registry client.
+func WithRuntimeHTTPClient(c *http.Client) Option {
+	return func(e *Engine) {
+		if c != nil {
+			e.runtimeClient = c
+		}
+	}
+}
+
+// defaultHTTPClient returns the registry client: no global Timeout so long calls
+// are bounded by the request context, and the proxy env is honoured so pulls
+// work behind a corporate proxy. Connection setup and header wait are bounded. A
+// CheckRedirect refuses a redirect that leaves the original scheme+host+port (or
+// downgrades https->http), so a registry cannot bounce the client to a host the
+// operator's allow-list never approved .
+func defaultHTTPClient() *http.Client {
+	return &http.Client{Transport: newTransport(true), CheckRedirect: refuseCrossOriginRedirect}
+}
+
+// refuseCrossOriginRedirect is an http.Client.CheckRedirect that allows a
+// redirect only when it stays on the same scheme, host and port as the request
+// that triggered it; any change of origin (including an https->http downgrade or
+// a different port) is refused. via holds the chain so far, most recent last; we
+// compare the new request against the immediately preceding one.
+func refuseCrossOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	prev := via[len(via)-1].URL
+	next := req.URL
+	if !sameOrigin(prev, next) {
+		return fmt.Errorf("ollaya: refusing cross-origin registry redirect from %s://%s to %s://%s",
+			prev.Scheme, prev.Host, next.Scheme, next.Host)
+	}
+	// Defuse the standard library's own 10-redirect cap being hit silently.
+	if len(via) >= 10 {
+		return fmt.Errorf("ollaya: too many registry redirects")
+	}
+	return nil
+}
+
+// sameOrigin compares scheme + hostname + effective port of two URLs. The
+// default port is filled from the scheme so "https://h" and "https://h:443" are
+// the same origin, but "https://h" and "http://h" (or a different port) are not.
+func sameOrigin(a, b *neturl.URL) bool {
+	return a.Scheme == b.Scheme &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort returns the URL's explicit port or the scheme default.
+func effectivePort(u *neturl.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case schemeHTTPS:
+		return defaultPortTLS
+	case schemeHTTP:
+		return defaultPortHTTP
+	default:
+		return ""
+	}
+}
+
+// defaultRuntimeClient returns the client used for in-cluster calls to serving
+// Pods (Inspect/Warmup/Decide). It is identical to the registry client except
+// that it has NO proxy (Proxy: nil): those calls carry the API key and target
+// Pod IPs, so they must go direct and never traverse a proxy, even when the Pod
+// CIDR is absent from NO_PROXY.
+func defaultRuntimeClient() *http.Client {
+	return &http.Client{Transport: newTransport(false)}
+}
+
+// newTransport builds the shared transport. When useProxy is true the proxy env
+// is honoured (http.ProxyFromEnvironment); when false Proxy stays nil (direct).
+// Dial/TLS/header timeouts are identical for both clients.
+func newTransport(useProxy bool) *http.Transport {
+	tr := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       idleConnTimeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: expectContinueTimeout,
+	}
+	if useProxy {
+		tr.Proxy = http.ProxyFromEnvironment
+	}
+	return tr
+}
+
+// New builds an Engine with the given options.
+func New(opts ...Option) *Engine {
+	e := &Engine{
+		registryURL:   defaultRegistryURL,
+		httpClient:    defaultHTTPClient(),
+		runtimeClient: defaultRuntimeClient(),
+		timeouts: methodTimeouts{
+			resolve: defaultResolveTimeout,
+			inspect: defaultInspectTimeout,
+			warmup:  defaultWarmupTimeout,
+			decide:  defaultDecideTimeout,
+		},
+	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
+}
+
+// withTimeout applies d as a deadline only when ctx has none of its own. It
+// returns a cancel func the caller must defer.
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok || d <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// Compile-time check that Engine satisfies the contract.
+var _ engine.Engine = (*Engine)(nil)
+
+// Compile-time check that Engine implements the optional Decider capability.
+var _ engine.Decider = (*Engine)(nil)
+
+// Compile-time check that Engine implements the optional RegistryHoster capability.
+var _ engine.RegistryHoster = (*Engine)(nil)
+
+// Name returns the engine name.
+func (e *Engine) Name() string { return engineName }
+
+// ServicePort returns the port the runtime listens on.
+func (e *Engine) ServicePort() int32 { return servicePort }
+
+// CanonicalName delegates to the package-level CanonicalName so callers holding
+// an *Engine (e.g. via an interface assertion) can canonicalise names without
+// importing the package function directly. See CanonicalName for the rules.
+func (e *Engine) CanonicalName(name string) (string, error) {
+	return CanonicalName(name)
+}
+
+// namePartRE matches a namespace, model or tag part: 1-80 chars,
+// [A-Za-z0-9_][A-Za-z0-9_.-]* (Ollaya docs/api.md §3).
+var namePartRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$`)
+
+// hostLabelRE matches one DNS-ish label of a registry host: lowercase
+// alphanumerics and hyphens, not empty, not starting/ending with a hyphen is
+// not enforced (registries are lenient), but empty labels and ".." are rejected
+// by validateHostSegment below.
+var hostLabelRE = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// portRE matches an optional numeric port (1-5 digits).
+var portRE = regexp.MustCompile(`^[0-9]{1,5}$`)
+
+// validateHostSegment checks a registry host (scheme already stripped): a
+// hostname of dot-separated [a-z0-9-] labels with an optional :port, no empty
+// labels and no "..". Returns an error otherwise.
+func validateHostSegment(host string) error {
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	if strings.Contains(host, "..") {
+		return fmt.Errorf("host %q contains an empty label", host)
+	}
+	hostname := host
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		hostname = host[:i]
+		port := host[i+1:]
+		if !portRE.MatchString(port) {
+			return fmt.Errorf("host %q has an invalid port", host)
+		}
+	}
+	if hostname == "" {
+		return fmt.Errorf("host %q has no hostname", host)
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if label == "" || !hostLabelRE.MatchString(label) {
+			return fmt.Errorf("host %q has an invalid label %q", host, label)
+		}
+	}
+	return nil
+}
+
+// parsedName is a fully parsed and normalized Ollaya model name.
+type parsedName struct {
+	// host is the registry host as written (may include scheme and port), or
+	// "" when the name carried no host (use the engine default registry).
+	host      string
+	namespace string
+	model     string
+	tag       string
+}
+
+// canonical returns the shortest canonical name with the tag always shown,
+// per §3 (host and default "library" namespace omitted when absent).
+func (p parsedName) canonical() string {
+	var b strings.Builder
+	if p.host != "" {
+		b.WriteString(p.host)
+		b.WriteByte('/')
+	}
+	if p.namespace != "" && p.namespace != defaultNamespace {
+		b.WriteString(p.namespace)
+		b.WriteByte('/')
+	} else if p.host != "" {
+		// With an explicit host, keep the namespace so the name round-trips
+		// (e.g. localhost:8080/library/laya:en stays as is).
+		b.WriteString(p.namespace)
+		b.WriteByte('/')
+	}
+	b.WriteString(p.model)
+	b.WriteByte(':')
+	b.WriteString(p.tag)
+	return b.String()
+}
+
+// registryBase returns the registry base URL for this name: the name's host
+// (defaulting the scheme to https) when present, else the engine default.
+func (p parsedName) registryBase(def string) string {
+	if p.host == "" {
+		return def
+	}
+	h := p.host
+	if !strings.HasPrefix(h, "http://") && !strings.HasPrefix(h, "https://") {
+		h = "https://" + h
+	}
+	return strings.TrimRight(h, "/")
+}
+
+const defaultNamespace = "library"
+
+const (
+	schemeHTTP      = "http"
+	schemeHTTPS     = "https"
+	defaultPortHTTP = "80"
+	defaultPortTLS  = "443"
+)
+
+// defaultManifestHost is the on-disk manifest host directory used when a name
+// carries no explicit host (matches the default registry ollaya.dev).
+const defaultManifestHost = "ollaya.dev"
+
+// manifestDiskPath returns the path of the manifest file inside the model store
+// relative to OLLAYA_MODELS: manifests/<host>/<namespace>/<model>/<tag>. The
+// host directory is the registry authority with the scheme stripped and the
+// port separator ':' replaced by '_', exactly how the ollaya CLI lays out the
+// store (verified against ghcr.io/ollaya-dev/ollaya:0.7.3: a pull with
+// OLLAYA_REGISTRY=http://mirror:8080 writes manifests/mirror_8080/...). A
+// host-less name uses defaultHost, which the engine derives from its configured
+// registry so the Job's digest verification reads the file `ollaya pull`
+// actually wrote under --ollaya-registry.
+func (p parsedName) manifestDiskPath(defaultHost string) string {
+	host := manifestHostDir(p.host)
+	if host == "" {
+		host = defaultHost
+	}
+	if host == "" {
+		host = defaultManifestHost
+	}
+	ns := p.namespace
+	if ns == "" {
+		ns = defaultNamespace
+	}
+	return fmt.Sprintf("manifests/%s/%s/%s/%s", host, ns, p.model, p.tag)
+}
+
+// defaultManifestHostDir returns the on-disk store host directory for a
+// host-less model name, derived from the engine's configured registry (the same
+// authority `ollaya pull` writes under when OLLAYA_REGISTRY is set).
+// For the default registry it is "ollaya.dev".
+func (e *Engine) defaultManifestHostDir() string {
+	h := manifestHostDir(e.registryURL)
+	if h == "" {
+		return defaultManifestHost
+	}
+	return h
+}
+
+// manifestHostDir turns a registry authority (optionally with an http(s)://
+// scheme) into the on-disk store directory name the ollaya CLI uses: scheme
+// stripped and the port separator ':' replaced by '_' (e.g.
+// "http://mirror:8080" -> "mirror_8080", "ollaya.dev" -> "ollaya.dev"). An empty
+// input returns "". Verified in the image.
+func manifestHostDir(host string) string {
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimRight(host, "/")
+	return strings.ReplaceAll(host, ":", "_")
+}
+
+// looksLikeHost reports whether the first path segment is a registry host
+// rather than a namespace, following Ollama's heuristic: it contains a ".",
+// a ":" (port), or is exactly "localhost" (optionally with a scheme).
+func looksLikeHost(seg string) bool {
+	s := strings.TrimPrefix(strings.TrimPrefix(seg, "https://"), "http://")
+	if s == "localhost" || strings.HasPrefix(s, "localhost:") {
+		return true
+	}
+	return strings.Contains(s, ".") || strings.Contains(s, ":")
+}
+
+// parseName parses [host/][namespace/]model[:tag] per docs/api.md §3, applying
+// normalization (trim, lowercase). Invalid names return an error without any
+// network call. The tag is split only from the last path segment.
+func parseName(name string) (parsedName, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return parsedName{}, fmt.Errorf("ollaya: empty model name")
+	}
+	lower := strings.ToLower(trimmed)
+
+	// A leading http:// or https:// scheme belongs to the host; strip it before
+	// splitting on "/" and re-attach it to the host segment afterwards.
+	scheme := ""
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		scheme = "https://"
+	case strings.HasPrefix(lower, "http://"):
+		scheme = "http://"
+	}
+	rest := strings.TrimPrefix(lower, scheme)
+
+	segs := strings.Split(rest, "/")
+
+	var p parsedName
+	// A leading host is only possible when there are 2+ path segments and the
+	// first segment looks like a host (has ".", ":" or is localhost), or when an
+	// explicit scheme was given.
+	if len(segs) >= 2 && (scheme != "" || looksLikeHost(segs[0])) {
+		p.host = scheme + segs[0]
+		if err := validateHostSegment(segs[0]); err != nil {
+			return parsedName{}, fmt.Errorf("ollaya: model name %q: %w", name, err)
+		}
+		segs = segs[1:]
+	} else if scheme != "" {
+		return parsedName{}, fmt.Errorf("ollaya: model name %q has a scheme but no host segment", name)
+	}
+
+	switch len(segs) {
+	case 1:
+		p.namespace = defaultNamespace
+	case 2:
+		p.namespace = segs[0]
+		segs = segs[1:]
+	default:
+		return parsedName{}, fmt.Errorf("ollaya: model name %q has too many path segments", name)
+	}
+
+	// Split the tag from the final segment only.
+	modelSeg := segs[0]
+	p.tag = "latest"
+	if i := strings.LastIndex(modelSeg, ":"); i >= 0 {
+		p.model = modelSeg[:i]
+		p.tag = modelSeg[i+1:]
+	} else {
+		p.model = modelSeg
+	}
+
+	if !namePartRE.MatchString(p.namespace) {
+		return parsedName{}, fmt.Errorf("ollaya: invalid namespace in model name %q", name)
+	}
+	if !namePartRE.MatchString(p.model) {
+		return parsedName{}, fmt.Errorf("ollaya: invalid model in model name %q", name)
+	}
+	if !namePartRE.MatchString(p.tag) {
+		return parsedName{}, fmt.Errorf("ollaya: invalid tag in model name %q", name)
+	}
+	return p, nil
+}
+
+// CanonicalName parses and normalizes an Ollaya model name and returns its
+// canonical form per docs/api.md §3: trimmed, lowercased, with the tag always
+// shown and the default "library" namespace / default host omitted. Examples:
+//
+//	"Laya:EN"                      -> "laya:en"
+//	"laya"                         -> "laya:latest"
+//	"ollaya.dev/library/laya:en"   -> "laya:en"
+//	"acme/triage"                  -> "acme/triage:latest"
+//
+// The controller uses it to compare a user-written spec.model against the
+// (already canonical) names Ollaya reports in /api/ps. Invalid names return an
+// error. Note: an explicit non-default host is preserved (it changes identity),
+// so "ollaya.dev/..." canonicalises to the short form only because ollaya.dev
+// is the default registry host.
+func CanonicalName(name string) (string, error) {
+	p, err := parseName(name)
+	if err != nil {
+		return "", err
+	}
+	// A host equal to the default registry (ollaya.dev, any scheme/port-less
+	// form) is dropped so it matches the short canonical names Ollaya reports.
+	if hostIsDefault(p.host) {
+		p.host = ""
+	}
+	return p.canonical(), nil
+}
+
+// hostIsDefault reports whether host (possibly with scheme) is the default
+// registry host ollaya.dev, which the canonical short form omits. Only the exact
+// default authority counts: the hostname must be ollaya.dev AND the port must be
+// absent or the scheme's default (443 for https/none, 80 for http). A non-default
+// port such as "ollaya.dev:5000" is a DIFFERENT registry and is NOT the default
+// (stripping the port let it inherit the built-in resource
+// defaults and the short canonical form).
+func hostIsDefault(host string) bool {
+	if host == "" {
+		return true
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	scheme := schemeHTTPS
+	switch {
+	case strings.HasPrefix(host, "https://"):
+		host = strings.TrimPrefix(host, "https://")
+	case strings.HasPrefix(host, "http://"):
+		scheme = schemeHTTP
+		host = strings.TrimPrefix(host, "http://")
+	}
+	host = strings.TrimRight(host, "/")
+	hostname := host
+	port := ""
+	if i := strings.LastIndexByte(host, ':'); i >= 0 {
+		hostname = host[:i]
+		port = host[i+1:]
+	}
+	if hostname != defaultManifestHost {
+		return false
+	}
+	// Accept only an absent port or the scheme's default port.
+	defPort := defaultPortTLS
+	if scheme == schemeHTTP {
+		defPort = defaultPortHTTP
+	}
+	return port == "" || port == defPort
+}
+
+// RegistryHost parses a model name and returns the registry host it targets
+// (lowercase hostname with optional :port, scheme stripped) and whether plain
+// http:// is used. It uses exactly the parser Resolve uses. For a name without
+// a host it returns the host of the engine's configured registry
+// (WithRegistryURL), not a hard-coded default, with insecure=true when that URL
+// is http://. Invalid names return an error. Implements engine.RegistryHoster.
+func (e *Engine) RegistryHost(name string) (host string, insecure bool, err error) {
+	p, err := parseName(name)
+	if err != nil {
+		return "", false, err
+	}
+	if p.host == "" {
+		// Fall back to the engine's configured registry, not a hard-coded host.
+		h, ins := hostFromRegistryURL(e.registryURL)
+		return h, ins, nil
+	}
+	h, ins := stripSchemeHost(p.host)
+	return h, ins, nil
+}
+
+// stripSchemeHost removes an http(s):// prefix from a host segment and reports
+// whether it was plain http://.
+func stripSchemeHost(h string) (host string, insecure bool) {
+	switch {
+	case strings.HasPrefix(h, "http://"):
+		return strings.TrimPrefix(h, "http://"), true
+	case strings.HasPrefix(h, "https://"):
+		return strings.TrimPrefix(h, "https://"), false
+	default:
+		return h, false
+	}
+}
+
+// hostFromRegistryURL extracts the lowercase host[:port] and insecure flag from
+// a registry base URL such as "https://ollaya.dev" or "http://localhost:5000".
+func hostFromRegistryURL(registryURL string) (host string, insecure bool) {
+	h, insecure := stripSchemeHost(strings.ToLower(strings.TrimSpace(registryURL)))
+	h = strings.TrimRight(h, "/")
+	// Drop any trailing path (defensive; registryURL is normally scheme+host).
+	if i := strings.IndexByte(h, '/'); i >= 0 {
+		h = h[:i]
+	}
+	if h == "" {
+		return defaultManifestHost, false
+	}
+	return h, insecure
+}
+
+// registryIsDefault reports whether registryURL is the default Ollaya registry
+// over the default (https) transport, in which case the prefetch and serving
+// Pods need no OLLAYA_REGISTRY env: `ollaya` already defaults there. The
+// hostname must be ollaya.dev on https with no port or :443; an http:// base
+// (plaintext) or a non-default port is NOT the default and must be forwarded.
+func registryIsDefault(registryURL string) bool {
+	registryURL = strings.TrimSpace(registryURL)
+	if registryURL == "" {
+		return true
+	}
+	// An explicit http:// base changes the transport, so it is never "default".
+	if strings.HasPrefix(strings.ToLower(registryURL), "http://") {
+		return false
+	}
+	return hostIsDefault(registryURL)
+}
+
+// ollayaManifest is the subset of the registry manifest we validate.
+type ollayaManifest struct {
+	SchemaVersion int `json:"schemaVersion"`
+}
+
+// maxBodyBytes caps how much of any response body we read (manifest, /api/ps,
+// /api/decide). A larger body is treated as an error rather than read into
+// memory unbounded.
+const maxBodyBytes = 1 << 20 // 1 MiB
+
+// retry policy: up to maxAttempts tries with these backoffs between them.
+const maxAttempts = 3
+
+// retryBackoffs is the wait before attempt i+1 (len == maxAttempts-1).
+var retryBackoffs = []time.Duration{100 * time.Millisecond, 400 * time.Millisecond}
+
+// readCappedBody reads at most maxBodyBytes of resp.Body and errors if the body
+// is larger than the cap.
+func readCappedBody(resp *http.Response) ([]byte, error) {
+	limited := io.LimitReader(resp.Body, maxBodyBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxBodyBytes {
+		return nil, fmt.Errorf("ollaya: response body exceeds %d bytes", maxBodyBytes)
+	}
+	return body, nil
+}
+
+// retryableStatus reports whether an HTTP status warrants a retry: 429 and 5xx
+// are transient; 404 and other 4xx are not.
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// retryAfter parses a Retry-After header (delta-seconds form only) into a wait
+// duration, capped so a hostile header can't stall us. Returns 0 if absent/bad.
+func retryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	v := resp.Header.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs < 0 {
+		return 0
+	}
+	d := time.Duration(secs) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+// sleepCtx waits for d or until ctx is done, whichever comes first. Returns
+// ctx.Err() if the context finished first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// doRetry executes newReq (a fresh request per attempt) with the retry policy.
+// It returns the last response (already status-checked by shouldRetry) or the
+// last error. Retries happen on transport errors and retryableStatus responses;
+// 404/4xx return immediately. The context is honoured between attempts and a
+// Retry-After header is respected.
+func (e *Engine) doRetry(ctx context.Context, newReq func() (*http.Request, error)) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			wait := retryBackoffs[attempt-1]
+			if err := sleepCtx(ctx, wait); err != nil {
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, err
+			}
+		}
+
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := e.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // transport error: retry
+		}
+
+		if attempt < maxAttempts-1 && retryableStatus(resp.StatusCode) {
+			// Honour Retry-After if present by folding it into the next backoff.
+			if ra := retryAfter(resp); ra > 0 {
+				_ = resp.Body.Close()
+				if err := sleepCtx(ctx, ra); err != nil {
+					return nil, err
+				}
+				// The fixed backoff still applies on the next loop; that's fine.
+				lastErr = fmt.Errorf("ollaya: status %d", resp.StatusCode)
+				continue
+			}
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("ollaya: status %d", resp.StatusCode)
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
+// Resolve turns a model name into a pinned ModelRef by fetching its manifest.
+func (e *Engine) Resolve(ctx context.Context, name string) (engine.ModelRef, error) {
+	p, err := parseName(name)
+	if err != nil {
+		return engine.ModelRef{}, err
+	}
+	ctx, cancel := withTimeout(ctx, e.timeouts.resolve)
+	defer cancel()
+	base := p.registryBase(e.registryURL)
+	url := fmt.Sprintf("%s/v2/%s/%s/manifests/%s", base, p.namespace, p.model, p.tag)
+
+	resp, err := e.doRetry(ctx, func() (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	})
+	if err != nil {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: resolve %q: %w", name, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := readCappedBody(resp)
+	if err != nil {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: read manifest for %q: %w", name, err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: resolve %q: %w", name, engine.ErrNotFound)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: resolve %q: unexpected status %d", name, resp.StatusCode)
+	}
+
+	var m ollayaManifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: manifest for %q is not valid JSON: %w", name, err)
+	}
+	if m.SchemaVersion != 2 {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: manifest for %q has unsupported schemaVersion %d", name, m.SchemaVersion)
+	}
+
+	sum := sha256.Sum256(body)
+	return engine.ModelRef{
+		Name:   p.canonical(),
+		Digest: hex.EncodeToString(sum[:]),
+	}, nil
+}
+
+// psResponse is the /api/ps response shape.
+type psResponse struct {
+	Models []psModel `json:"models"`
+}
+
+type psModel struct {
+	Name      string     `json:"name"`
+	Digest    string     `json:"digest"`
+	Device    string     `json:"device"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Details   struct {
+		QuantizationLevel string `json:"quantization_level"`
+	} `json:"details"`
+}
+
+// Inspect lists models loaded in the runtime at baseURL.
+func (e *Engine) Inspect(ctx context.Context, baseURL, apiKey string) ([]engine.Loaded, error) {
+	ctx, cancel := withTimeout(ctx, e.timeouts.inspect)
+	defer cancel()
+	url := strings.TrimRight(baseURL, "/") + "/api/ps"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ollaya: build inspect request: %w", err)
+	}
+	setAuth(req, apiKey)
+
+	resp, err := e.runtimeClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollaya: inspect: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := readCappedBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("ollaya: read inspect body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("ollaya: inspect: unexpected status %d", resp.StatusCode)
+	}
+
+	var ps psResponse
+	if err := json.Unmarshal(body, &ps); err != nil {
+		return nil, fmt.Errorf("ollaya: inspect: invalid JSON: %w", err)
+	}
+
+	loaded := make([]engine.Loaded, 0, len(ps.Models))
+	for _, m := range ps.Models {
+		loaded = append(loaded, engine.Loaded{
+			Name:      m.Name,
+			Digest:    strings.TrimPrefix(m.Digest, "sha256:"),
+			Device:    normalizeDevice(m.Device),
+			Precision: m.Details.QuantizationLevel,
+			Pinned:    m.ExpiresAt == nil,
+		})
+	}
+	return loaded, nil
+}
+
+// decideRequest is the /api/decide warmup payload.
+type decideRequest struct {
+	Model     string `json:"model"`
+	KeepAlive int    `json:"keep_alive"`
+}
+
+// decideResponse is the subset of the /api/decide response we read.
+type decideResponse struct {
+	DoneReason string `json:"done_reason"`
+	Error      string `json:"error"`
+	Code       string `json:"code"`
+}
+
+// Warmup loads a model into memory and pins it (keep_alive=-1).
+func (e *Engine) Warmup(ctx context.Context, baseURL, apiKey, model string) error {
+	ctx, cancel := withTimeout(ctx, e.timeouts.warmup)
+	defer cancel()
+	url := strings.TrimRight(baseURL, "/") + "/api/decide"
+	payload, err := json.Marshal(decideRequest{Model: model, KeepAlive: -1})
+	if err != nil {
+		return fmt.Errorf("ollaya: marshal warmup request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("ollaya: build warmup request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setAuth(req, apiKey)
+
+	resp, err := e.runtimeClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ollaya: warmup %q: %w", model, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := readCappedBody(resp)
+	if err != nil {
+		return fmt.Errorf("ollaya: read warmup body: %w", err)
+	}
+
+	var dr decideResponse
+	// Best-effort decode; body may be empty on some transports.
+	_ = json.Unmarshal(body, &dr)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if dr.Code != "" {
+			return fmt.Errorf("ollaya: warmup %q failed (status %d, code %s): %s", model, resp.StatusCode, dr.Code, dr.Error)
+		}
+		return fmt.Errorf("ollaya: warmup %q: unexpected status %d", model, resp.StatusCode)
+	}
+
+	if dr.DoneReason != "load" {
+		return fmt.Errorf("ollaya: warmup %q: unexpected done_reason %q", model, dr.DoneReason)
+	}
+	return nil
+}
+
+// setAuth adds a bearer token header when apiKey is non-empty.
+func setAuth(req *http.Request, apiKey string) {
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+}
+
+// Exported runtime image defaults (decided in spike 001:
+// the ghcr tag is "0.7.3", no "v" prefix).
+const (
+	// DefaultImageCPU is the CPU serving/prefetch image.
+	DefaultImageCPU = "ghcr.io/ollaya-dev/ollaya:0.7.3"
+	// DefaultImageCUDA is the CUDA serving image.
+	DefaultImageCUDA = "ghcr.io/ollaya-dev/ollaya:0.7.3-cuda"
+)
+
+const (
+	containerName   = "ollaya"
+	prefetchName    = "prefetch"
+	modelsMount     = "/models"
+	stateMountPath  = "/home/ollaya/.ollaya"
+	modelsVolume    = "models"
+	stateVolume     = "ollaya-state"
+	runtimeUID      = int64(1000)
+	runtimeGID      = int64(1000)
+	terminationSecs = int64(30)
+	prefetchDeadl   = int64(1800)
+	prefetchBackoff = int32(4)
+	gpuResourceName = corev1.ResourceName("nvidia.com/gpu")
+
+	// Prefetch container resource defaults. `ollaya pull` is I/O-bound: it
+	// downloads layers and writes them to the store, it does not load the model
+	// into memory. Measured peak RSS pulling laya:en (853 MB) in the CPU image
+	// under OrbStack was ~36-39 MiB (sampling `docker stats`); the store on disk
+	// was ~814 MiB. Without any request the Job is BestEffort and the first to
+	// be evicted / OOM-killed on a busy node, so we set a small guaranteed
+	// request with generous headroom and a memory limit that still fits a larger
+	// multi-GB GGUF pull. CPU is left unlimited (download throughput), only
+	// requested, so the Job is Burstable rather than throttled.
+	prefetchCPUReq = "100m"
+	prefetchMemReq = "256Mi"
+	prefetchMemLim = "1Gi"
+)
+
+// imageFor picks the image: p.Image override, else the device default.
+func imageFor(p engine.Params) string {
+	if p.Image != "" {
+		return p.Image
+	}
+	if p.Device == engine.DeviceCUDA {
+		return DefaultImageCUDA
+	}
+	return DefaultImageCPU
+}
+
+// ptr returns a pointer to v (Kubernetes API fields want pointers).
+func ptr[T any](v T) *T { return &v }
+
+// podSecurityContext is shared by the serving Pod and prefetch Job.
+func podSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: ptr(true),
+		RunAsUser:    ptr(runtimeUID),
+		RunAsGroup:   ptr(runtimeGID),
+		FSGroup:      ptr(runtimeGID),
+		// Skip the recursive chown of the store on every mount when the root
+		// already has the right group: stores hold multi-GB weights (GGUF), and
+		// a full walk on each Pod start delays readiness.
+		FSGroupChangePolicy: ptr(corev1.FSGroupChangeOnRootMismatch),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// apiKeyEnv returns the OLLAYA_API_KEY env var sourced from the secret, or nil.
+func apiKeyEnv(p engine.Params) *corev1.EnvVar {
+	if p.APIKey == nil {
+		return nil
+	}
+	return &corev1.EnvVar{
+		Name:      "OLLAYA_API_KEY",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: p.APIKey},
+	}
+}
+
+// ServingPodSpec returns the PodSpec for serving Pods. The model store is
+// mounted read-only at /models; a writable emptyDir backs /home/ollaya/.ollaya.
+func (e *Engine) ServingPodSpec(p engine.Params) corev1.PodSpec {
+	env := []corev1.EnvVar{
+		{Name: "OLLAYA_HOST", Value: "0.0.0.0:11435"},
+		{Name: "OLLAYA_MODELS", Value: modelsMount},
+		{Name: "OLLAYA_DEVICE", Value: p.Device},
+		// §6: OLLAYA_KEEP_ALIVE accepts a negative value ("-1") to keep a model
+		// loaded until the server stops; Warmup also pins via the API.
+		{Name: "OLLAYA_KEEP_ALIVE", Value: "-1"},
+	}
+	if ake := apiKeyEnv(p); ake != nil {
+		env = append(env, *ake)
+	}
+	// When the engine registry is non-default, set OLLAYA_REGISTRY on serving Pods
+	// too: `ollaya serve` resolves a host-less name (e.g. "laya:en") against the
+	// store under manifests/<OLLAYA_REGISTRY host>/..., which is where the prefetch
+	// Job wrote it. Without it, serve would look under
+	// manifests/ollaya.dev/... and /api/ps would never show the model, so the
+	// readiness gate could not pass on a mirror-pulled store. Proven in the image
+	// (serve with OLLAYA_REGISTRY=http://mirror:8080 loads a mirror-pulled
+	// laya:en, /api/ps shows it). Default registry renders byte-identically.
+	if !registryIsDefault(e.registryURL) {
+		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: e.registryURL})
+	}
+
+	// Liveness/startup on GET / (§7.1: always 200, even when an API key is set,
+	// unlike /api/tags which would 401).
+	rootProbe := func() *corev1.Probe {
+		return &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/",
+					Port: intstr.FromString("http"),
+				},
+			},
+		}
+	}
+	startup := rootProbe()
+	startup.PeriodSeconds = 2
+	startup.FailureThreshold = 30
+	liveness := rootProbe()
+	liveness.PeriodSeconds = 10
+
+	return corev1.PodSpec{
+		SecurityContext:               podSecurityContext(),
+		AutomountServiceAccountToken:  ptr(false), // Ollaya needs no API access (review E5)
+		TerminationGracePeriodSeconds: ptr(terminationSecs),
+		Containers: []corev1.Container{
+			{
+				Name:  containerName,
+				Image: imageFor(p),
+				Ports: []corev1.ContainerPort{
+					{Name: "http", ContainerPort: servicePort},
+				},
+				Env:       env,
+				Resources: servingResources(p),
+				SecurityContext: &corev1.SecurityContext{
+					ReadOnlyRootFilesystem:   ptr(true),
+					AllowPrivilegeEscalation: ptr(false),
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: modelsVolume, MountPath: modelsMount, SubPath: p.StoreSubPath, ReadOnly: true},
+					{Name: stateVolume, MountPath: stateMountPath},
+				},
+				StartupProbe:   startup,
+				LivenessProbe:  liveness,
+				ReadinessProbe: nil, // model readiness is driven by the readiness gate
+			},
+		},
+		Volumes: []corev1.Volume{
+			{
+				Name: modelsVolume,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: p.CacheClaimName,
+						ReadOnly:  true,
+					},
+				},
+			},
+			{
+				Name:         stateVolume,
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			},
+		},
+	}
+}
+
+// servingResources returns the serving container resources: it first fills
+// memory/cpu requests from the per-model default table for any key the user
+// left unset (applyModelDefaults), then adds nvidia.com/gpu:1 to limits for
+// CUDA when the user has not already set it. User-provided values always win,
+// per resource key, and no CPU limit is ever added.
+func servingResources(p engine.Params) corev1.ResourceRequirements {
+	res := applyModelDefaults(p.Model.Name, p.Device, p.Resources)
+	if p.Device != engine.DeviceCUDA {
+		return res
+	}
+	if _, ok := res.Limits[gpuResourceName]; ok {
+		return res // keep the user's GPU value
+	}
+	if res.Limits == nil {
+		res.Limits = corev1.ResourceList{}
+	}
+	res.Limits[gpuResourceName] = resource.MustParse("1")
+	return res
+}
+
+// prefetchResources returns the resource requests/limits for the prefetch
+// container. See the prefetch* constants for the measured rationale: a small
+// guaranteed memory/cpu request so the Job is not BestEffort (first to be
+// evicted/OOM-killed on a busy node), and a memory limit with headroom for
+// larger pulls. CPU is requested but not limited.
+func prefetchResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(prefetchCPUReq),
+			corev1.ResourceMemory: resource.MustParse(prefetchMemReq),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse(prefetchMemLim),
+		},
+	}
+}
+
+// prefetchScript pulls the model and verifies its digest, then optionally
+// prunes sibling revision sub-paths from the store root. The manifest path is
+// computed in Go (MANIFEST_PATH); the model name uses the "--" separator so a
+// value starting with "-" cannot be read as a CLI flag (review E4).
+const prefetchScript = `set -eu
+ollaya pull -- "$MODEL"
+if [ -z "${EXPECT_DIGEST:-}" ]; then
+  echo "no expected digest; skipping verification"
+else
+  got="$(sha256sum "$OLLAYA_MODELS/$MANIFEST_PATH" | cut -d' ' -f1)"
+  echo "pulled digest: $got"
+  if [ "$got" != "$EXPECT_DIGEST" ]; then
+    echo "digest mismatch: got $got want $EXPECT_DIGEST" >&2
+    exit 1
+  fi
+  echo "digest ok: $got"
+fi
+# Prune other revisions' stores. Runs only when the operator provided a valid,
+# non-empty keep list (KEEP_SUBPATHS) and STORE_ROOT is mounted. Only prune
+# entries that are directories whose name is a 10-hex revision hash (defence in
+# depth via the case below); anything else at the root (legacy manifests/,
+# blobs/, lost+found, files) is left untouched.
+if [ -n "${KEEP_SUBPATHS:-}" ] && [ -n "${STORE_ROOT:-}" ]; then
+  for entry in "$STORE_ROOT"/*; do
+    [ -d "$entry" ] || continue
+    base="$(basename "$entry")"
+    case "$base" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) continue ;;  # not a revision hash: never prune
+    esac
+    keep=no
+    for k in $KEEP_SUBPATHS; do
+      if [ "$base" = "$k" ]; then keep=yes; break; fi
+    done
+    if [ "$keep" = "no" ]; then
+      echo "pruning store sub-path: $base"
+      rm -rf -- "$entry"
+    fi
+  done
+fi
+`
+
+// unparsableNameScript is used when the model name does not parse: it never
+// runs ollaya pull, prints the reason and exits 1 (review E4).
+const unparsableNameScript = `echo "ollaya: refusing to prefetch: model name did not parse in the operator" >&2
+exit 1
+`
+
+// invalidSubPathScript is used when a non-empty StoreSubPath is not a valid
+// revision hash: the Job refuses rather than pulling into an unexpected path.
+const invalidSubPathScript = `echo "ollaya: refusing to prefetch: store sub-path is not a valid revision hash" >&2
+exit 1
+`
+
+// storeRootMount is where the Job mounts the PVC root (no subPath) so it can
+// prune sibling revision sub-paths.
+const storeRootMount = "/store-root"
+
+// revHashRE validates a store sub-path / keep-list entry: the controller's
+// revision hash is exactly 10 lowercase hex chars. Only entries matching this
+// may ever be pruned; legacy store dirs (manifests/, blobs/, lost+found) never
+// match, so they are always left untouched.
+var revHashRE = regexp.MustCompile(`^[a-f0-9]{10}$`)
+
+// PrefetchJobSpec returns a Job that downloads p.Model into the store (RW
+// mount, at StoreSubPath). Idempotent (ollaya pull is a fast no-op when
+// present) and fails if the downloaded digest != p.Model.Digest. After a
+// successful pull it prunes sibling revision sub-paths not in
+// KeepStoreSubPaths (never when that list is empty).
+func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
+	// Pulling needs no GPU: always use the CPU image unless p.Image overrides.
+	image := DefaultImageCPU
+	if p.Image != "" {
+		image = p.Image
+	}
+
+	// Parse the name to compute the on-disk manifest path. An unparsable name
+	// must never reach `ollaya pull`: use a script that refuses and exits 1
+	// (review E4). The controller also validates names, this is defence in depth.
+	parsed, perr := parseName(p.Model.Name)
+	script := prefetchScript
+	manifestPath := ""
+	switch {
+	case perr != nil:
+		script = unparsableNameScript
+	case p.StoreSubPath != "" && !revHashRE.MatchString(p.StoreSubPath):
+		// A non-empty sub-path that is not a revision hash: refuse.
+		script = invalidSubPathScript
+	default:
+		manifestPath = parsed.manifestDiskPath(e.defaultManifestHostDir())
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "MODEL", Value: p.Model.Name},
+		{Name: "EXPECT_DIGEST", Value: p.Model.Digest},
+		{Name: "OLLAYA_MODELS", Value: modelsMount},
+		{Name: "MANIFEST_PATH", Value: manifestPath},
+	}
+
+	// Point `ollaya pull` at the same registry the resolver used. The Ollaya
+	// 0.7.3 CLI selects its registry for a bare (host-less) name from the
+	// OLLAYA_REGISTRY env var, falling back to ollaya.dev; an explicit host in
+	// the name always overrides it (verified against the image; evidence in the
+	// the spike). The
+	// resolver uses the same precedence (parsedName.registryBase). Without this,
+	// --ollaya-registry / OLLAYA_REGISTRY reached only the resolver, so the Job
+	// still pulled from ollaya.dev — a digest mismatch, and air-gapped mode did
+	// not work. We set it only when the engine
+	// registry is non-default so the default case renders byte-identically.
+	if !registryIsDefault(e.registryURL) {
+		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: e.registryURL})
+	}
+
+	// Store-root pruning is fail-safe: enabled only when the caller gave a
+	// non-empty KeepStoreSubPaths in which EVERY entry is a valid revision hash,
+	// and this revision has a valid sub-path. Any invalid entry disables pruning
+	// entirely (the script logs why). The current sub-path is added to the keep
+	// set but does not by itself enable pruning (review fixes 1 & 2).
+	volumeMounts := []corev1.VolumeMount{
+		{Name: modelsVolume, MountPath: modelsMount, SubPath: p.StoreSubPath}, // RW: the Job writes the store
+		{Name: stateVolume, MountPath: stateMountPath},
+	}
+	keep, pruneEnabled := pruneKeepList(p)
+	if pruneEnabled && script == prefetchScript {
+		env = append(env,
+			corev1.EnvVar{Name: "STORE_ROOT", Value: storeRootMount},
+			corev1.EnvVar{Name: "KEEP_SUBPATHS", Value: strings.Join(keep, " ")},
+		)
+		// Second mount of the PVC root (no subPath) so the script can prune siblings.
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: modelsVolume, MountPath: storeRootMount})
+	}
+
+	return batchv1.JobSpec{
+		BackoffLimit:          ptr(prefetchBackoff),
+		ActiveDeadlineSeconds: ptr(prefetchDeadl),
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				RestartPolicy:                corev1.RestartPolicyOnFailure,
+				SecurityContext:              podSecurityContext(),
+				AutomountServiceAccountToken: ptr(false), // review E5
+				Containers: []corev1.Container{
+					{
+						Name:      prefetchName,
+						Image:     image,
+						Command:   []string{"/bin/sh", "-c"},
+						Args:      []string{script},
+						Env:       env,
+						Resources: prefetchResources(),
+						SecurityContext: &corev1.SecurityContext{
+							ReadOnlyRootFilesystem:   ptr(true), // review E5: writes only to mounts
+							AllowPrivilegeEscalation: ptr(false),
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+						},
+						VolumeMounts: volumeMounts,
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: modelsVolume,
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: p.CacheClaimName,
+							},
+						},
+					},
+					{
+						Name:         stateVolume,
+						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					},
+				},
+			},
+		},
+	}
+}
+
+// pruneKeepList decides whether store pruning is safe and returns the keep set.
+// Pruning is enabled only when the caller-provided KeepStoreSubPaths is
+// non-empty AND every entry is a valid revision hash AND this revision has a
+// valid sub-path. If any keep entry is invalid, pruning is DISABLED (returning
+// enabled=false) rather than silently dropping it — dropping would widen
+// deletion (review fix 2). The current sub-path is added to the keep set
+// (so we never delete what we just pulled) but does not by itself enable
+// pruning (fix 1).
+func pruneKeepList(p engine.Params) (keep []string, enabled bool) {
+	if len(p.KeepStoreSubPaths) == 0 {
+		return nil, false
+	}
+	if p.StoreSubPath == "" || !revHashRE.MatchString(p.StoreSubPath) {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	for _, k := range p.KeepStoreSubPaths {
+		if !revHashRE.MatchString(k) {
+			// Any invalid entry disables pruning entirely.
+			return nil, false
+		}
+		if !seen[k] {
+			keep = append(keep, k)
+			seen[k] = true
+		}
+	}
+	if !seen[p.StoreSubPath] {
+		keep = append(keep, p.StoreSubPath)
+	}
+	return keep, true
+}
+
+// normalizeDevice maps a runtime device string to an engine.Device* class.
+// Ollaya reports the concrete device ("cuda:0", "cuda:1") on GPU and "cpu" on
+// CPU; the readiness gate compares against the requested class ("cuda").
+//
+// Only the exact form "cuda:<ordinal>" is collapsed to "cuda". Anything else
+// (e.g. a mixed/partial-offload value like "cuda:0+cpu" or "cuda:0,cpu") is
+// returned unchanged so it fails the gate: loosening this check would hide the
+// silent CPU fallback the gate exists to catch.
+func normalizeDevice(d string) string {
+	d = strings.ToLower(strings.TrimSpace(d))
+	base, ord, ok := strings.Cut(d, ":")
+	if !ok || base != engine.DeviceCUDA || ord == "" {
+		return d
+	}
+	for _, c := range ord {
+		if c < '0' || c > '9' {
+			return d
+		}
+	}
+	return base
+}

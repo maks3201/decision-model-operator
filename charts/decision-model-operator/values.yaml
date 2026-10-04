@@ -1,0 +1,79 @@
+# Default values for decision-model-operator.
+
+image:
+  # -- Manager image repository.
+  repository: ghcr.io/maks3201/decision-model-operator
+  # -- Manager image tag. Empty defaults to `v<Chart.appVersion>` (release images are tagged `vX.Y.Z`).
+  tag: ""
+  # -- Image pull policy for the manager container.
+  pullPolicy: IfNotPresent
+
+# -- Secrets for pulling the manager image (e.g. `[{name: ghcr-pull}]` while the GHCR package is private).
+imagePullSecrets: []
+# -- Number of controller-manager replicas (leader election picks one active).
+replicaCount: 1
+
+# -- Resource requests/limits for the manager container.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+# -- Node selector for the manager Pod.
+nodeSelector: {}
+# -- Tolerations for the manager Pod.
+tolerations: []
+# -- Affinity for the manager Pod.
+affinity: {}
+
+# -- Enable leader election (recommended for HA / `replicaCount` > 1).
+leaderElection: true
+
+# Metrics endpoint. When enabled, a metrics Service (8443/HTTPS) is created.
+metrics:
+  # -- Expose the metrics endpoint and create a metrics Service (8443/HTTPS).
+  enabled: true
+  # -- Address the metrics server binds to.
+  bindAddress: ":8443"
+  # -- Serve metrics over HTTPS.
+  secure: true
+
+# -- Health/readiness probe bind address.
+healthProbeBindAddress: ":8081"
+
+# Manager policy flags (see cmd/main.go, docs/quickstart.md "Operator flags").
+# Security defaults are strict: only ollaya.dev, no http://, no image override.
+manager:
+  # -- `--allowed-registries`: comma-separated registry hosts a `spec.model` may resolve from (SSRF guard). Add your mirror here if you use one.
+  allowedRegistries: "ollaya.dev"
+  # -- `--allow-insecure-registries`: permit `http://` model registries (dev only).
+  allowInsecureRegistries: false
+  # -- `--allow-image-override`: permit `spec.image` to override the engine default image (lets DM editors run arbitrary images; keep false in multi-tenant).
+  allowImageOverride: false
+  # -- `--max-concurrent-reconciles`: max DecisionModels reconciled concurrently.
+  maxConcurrentReconciles: 4
+  # -- `--ollaya-registry`: default registry base URL for host-less model names. Empty = the operator default (`OLLAYA_REGISTRY` env, else `https://ollaya.dev`); not rendered when empty.
+  ollayaRegistry: ""
+
+# -- Namespaces to watch (`--watch-namespaces`). Empty = cluster-wide (manager ClusterRole/ClusterRoleBinding). When non-empty, the operator watches only these namespaces and the chart renders a namespaced Role+RoleBinding in each instead of the ClusterRole. The CRD stays cluster-scoped and must be installed by a cluster admin.
+watchNamespaces: []
+
+# HTTP(S) proxy for the operator's egress to the model registry. Rendered as
+# HTTP_PROXY / HTTPS_PROXY / NO_PROXY env on the manager container (nothing is
+# rendered when a value is empty). The controller also copies these into the
+# prefetch Job so it can pull weights through the proxy.
+proxy:
+  # -- `HTTP_PROXY` for the manager (and, via the operator, the prefetch Job). Empty = not set.
+  httpProxy: ""
+  # -- `HTTPS_PROXY` for the manager (and the prefetch Job). Empty = not set.
+  httpsProxy: ""
+  # -- `NO_PROXY` for the manager (and the prefetch Job). Set the service CIDR and `.svc,.cluster.local` so the operator's registry/API-server calls go direct, not via the proxy. Since v0.2.0-rc.1 the pod CIDR is NOT needed: the readiness prober and evaluator reach serving Pod IPs with a separate proxy-less client (the API-key header never traverses the proxy), so readiness does not depend on this value. Example: `10.96.0.0/12,.svc,.cluster.local`. Empty = not set.
+  noProxy: ""
+  # -- Name of an existing Secret to source the proxy URLs from (keys `httpProxy` / `httpsProxy` / `noProxy`, each optional) instead of the plaintext values above — use this when a proxy URL carries credentials. When set, the plaintext `proxy.httpProxy/httpsProxy/noProxy` values are ignored and the env is rendered with `valueFrom.secretKeyRef` (`optional: true` per key). This only keeps the credential out of the Helm values: a **credentialed** proxy URL is used by the operator for its own registry lookups but is NOT passed to the prefetch Jobs (a Job spec is readable by anyone with `get jobs` in that namespace), and the chart cannot change that. For the Job's egress use an IP-allowlisted or node-level proxy that needs no credentials. `NO_PROXY` is always passed. Empty = use the plaintext values.
+  existingSecret: ""
+
+# -- Install the CRD via Helm's `crds/` dir. Set false to manage the CRD out of band. NOTE: Helm never upgrades or deletes CRDs in `crds/` (see the CRD upgrade caveat in this README).
+installCRDs: true

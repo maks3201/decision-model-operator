@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a problem with the operator
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For **security** issues do not use this form —
+        see SECURITY.md and report privately.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected vs what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Operator image tag, Kubernetes version, and how you installed (release install.yaml / Helm / from source).
+      placeholder: |
+        operator: ghcr.io/maks3201/decision-model-operator:vX.Y.Z
+        kubernetes: v1.30.0
+        install: helm
+    validations:
+      required: true
+  - type: textarea
+    id: dm-yaml
+    attributes:
+      label: DecisionModel YAML
+      description: The DecisionModel manifest that reproduces the issue (redact secrets).
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: kubectl describe dm
+      description: Output of `kubectl describe dm <name>` (status, conditions, events).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Operator logs
+      description: Relevant controller-manager logs (`kubectl -n decision-model-operator-system logs deploy/decision-model-operator-controller-manager`).
+      render: text
+    validations:
+      required: false

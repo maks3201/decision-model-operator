@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Go modules. Group the Kubernetes client libraries so their lockstep updates
+  # land in one PR.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+
+  # GitHub Actions used in the workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Base images in the Dockerfile.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly

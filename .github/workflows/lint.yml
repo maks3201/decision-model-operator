@@ -1,0 +1,89 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run linter
+        run: make lint
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan history for secrets
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git /repo --redact --no-banner --verbose
+
+  helm:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+
+      - name: helm lint
+        run: helm lint charts/decision-model-operator
+
+      - name: helm template (default + custom values)
+        run: |
+          helm template dmo charts/decision-model-operator --namespace dmo-system >/dev/null
+          helm template dmo charts/decision-model-operator --namespace dmo-system \
+            --set replicaCount=3 \
+            --set image.tag=v9.9.9 \
+            --set manager.allowInsecureRegistries=true \
+            --set manager.allowImageOverride=true \
+            --set metrics.enabled=false >/dev/null
+
+      - name: Chart README is up to date (helm-docs, no drift)
+        run: |
+          GOBIN="$PWD/bin" go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+          "$PWD/bin/helm-docs" --chart-search-root=charts/decision-model-operator --sort-values-order=file
+          git diff --exit-code -- charts/decision-model-operator/README.md
+
+      - name: CRD is in sync with config/crd/bases (no drift)
+        run: |
+          diff -u config/crd/bases/decisionmodel.io_decisionmodels.yaml \
+                  charts/decision-model-operator/crds/decisionmodel.io_decisionmodels.yaml
+
+      - name: Manager RBAC is in sync with config/rbac/role.yaml (no drift)
+        run: |
+          diff -u config/rbac/role.yaml \
+                  charts/decision-model-operator/files/role.yaml
+

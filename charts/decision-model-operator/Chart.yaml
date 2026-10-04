@@ -1,0 +1,47 @@
+apiVersion: v2
+name: decision-model-operator
+description: >-
+  Kubernetes Operator for Ollaya-served System-1 decision models (DecisionModel
+  CRD).
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+kubeVersion: '>=1.29.0-0'
+home: https://github.com/maks3201/decision-model-operator
+sources:
+  - https://github.com/maks3201/decision-model-operator
+keywords:
+  - operator
+  - ollaya
+  - decision-model
+  - mlops
+  - model-serving
+  - inference
+maintainers:
+  - name: maks3201
+    url: https://github.com/maks3201
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: machine-learning
+  artifacthub.io/prerelease: 'false'
+  artifacthub.io/images: |
+    - name: manager
+      image: ghcr.io/maks3201/decision-model-operator:v0.1.0 # x-release-please-version
+      platforms:
+        - linux/amd64
+        - linux/arm64
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/maks3201/decision-model-operator/tree/main/docs
+    - name: Quickstart
+      url: https://github.com/maks3201/decision-model-operator/blob/main/docs/quickstart.md
+    - name: API reference
+      url: https://github.com/maks3201/decision-model-operator/blob/main/docs/api-reference.md
+  artifacthub.io/operator: 'true'
+  artifacthub.io/operatorCapabilities: Full Lifecycle
+  artifacthub.io/crds: |
+    - kind: DecisionModel
+      version: v1alpha1
+      name: decisionmodels.decisionmodel.io
+      displayName: Decision Model
+      description: A pinned, prefetched, model-aware System-1 decision model served by Ollaya.

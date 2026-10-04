@@ -1,0 +1,12 @@
+processor:
+  # Ignore boilerplate/embedded fields that add no user value to the reference.
+  ignoreFields:
+    - "status.$"
+    - "TypeMeta$"
+  ignoreTypes:
+    - "DecisionModelList$"
+
+render:
+  # Render Kubernetes core types as links to the upstream API reference rather
+  # than expanding them inline.
+  kubernetesVersion: "1.33"

@@ -1,0 +1,96 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+
+{{ template "chart.homepageLine" . }}
+
+An open-source Kubernetes Operator for Ollaya-served System-1 decision models
+(Laya, Kev, JevK5, …). It pins a model to an immutable digest, prefetches the
+weights into a PVC, and gates Pod readiness on the runtime actually serving the
+expected digest on the expected device (catching a silent CPU fallback). See the
+[project docs](https://github.com/maks3201/decision-model-operator/tree/main/docs)
+for the DecisionModel CRD and a quickstart.
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+## Install
+
+The chart is published as an OCI artifact on GHCR:
+
+```sh
+helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
+  --version <version> \
+  --namespace decision-model-operator-system --create-namespace
+```
+
+The operator image tag defaults to `v<appVersion>`; override it with `--set image.tag=vX.Y.Z`.
+From a source checkout use `charts/decision-model-operator` instead of the OCI reference.
+
+The chart installs the CRD (from its `crds/` directory), RBAC, the manager
+Deployment and — when `metrics.enabled` — the metrics Service.
+
+## Upgrade
+
+```sh
+helm upgrade dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
+  --version <version> \
+  --namespace decision-model-operator-system
+```
+
+### CRD upgrade caveat
+
+Helm installs the CRD in `crds/` on first install but **never upgrades or
+deletes it** on `helm upgrade`/`helm uninstall`. To pick up a CRD change, apply
+it out of band:
+
+```sh
+kubectl apply -f charts/decision-model-operator/crds/decisionmodel.io_decisionmodels.yaml
+```
+
+Set `installCRDs: false` if you manage the CRD entirely out of band.
+
+## Uninstall
+
+```sh
+helm uninstall dmo --namespace decision-model-operator-system
+```
+
+The CRD is intentionally left in place (see the caveat above); remove it
+explicitly if you no longer need any DecisionModel resources:
+
+```sh
+kubectl delete crd decisionmodels.decisionmodel.io
+```
+
+## Namespace-scoped install
+
+By default the operator runs cluster-wide: it is granted a ClusterRole and
+watches DecisionModels in every namespace. To restrict it to a fixed set of
+namespaces, set `watchNamespaces`:
+
+```sh
+helm install dmo charts/decision-model-operator \
+  --namespace decision-model-operator-system --create-namespace \
+  --set 'watchNamespaces={team-a,team-b}'
+```
+
+In this mode the chart passes `--watch-namespaces=team-a,team-b` to the manager
+and, instead of the cluster-wide ClusterRole/ClusterRoleBinding, renders a
+namespaced `Role` + `RoleBinding` in each listed namespace (with identical
+rules). The leader-election Role stays in the release namespace.
+
+The DecisionModel CRD is **cluster-scoped** regardless of this setting, so it is
+not covered by the namespaced Roles and must be installed once by a cluster
+admin (via the chart's `crds/` dir on first install, or out of band — see the
+CRD upgrade caveat above). The listed namespaces must already exist.
+
+{{ template "chart.valuesHeader" . }}
+
+{{ template "chart.valuesTable" . }}
+
+{{ template "helm-docs.versionFooter" . }}

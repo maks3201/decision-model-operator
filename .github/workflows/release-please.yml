@@ -1,0 +1,121 @@
+name: Release Please
+
+# Maintains a release PR from conventional commits; on merge it tags + creates
+# the GitHub Release, then calls the reusable release.yml to build/push the
+# image and upload install.yaml + the Helm chart to that Release.
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Gate: assets (image, install.yaml, chart) are published only after the E2E
+  # run on the release commit finished green. Pushes no longer cancel main E2E
+  # (test-e2e.yml), so that run always completes.
+  wait-for-e2e:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a successful E2E run on the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 100); do
+            runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow "E2E Tests" --commit "$SHA" \
+              --event push --json databaseId,status,conclusion)
+            if echo "$runs" | jq -e 'length>0 and all(.[]; .status=="completed")' >/dev/null; then
+              if echo "$runs" | jq -e 'any(.[]; .conclusion!="success")' >/dev/null; then
+                echo "E2E for $SHA did not succeed: $runs"; exit 1
+              fi
+              echo "E2E green for $SHA"; exit 0
+            fi
+            echo "waiting for E2E on $SHA ($i/100)"; sleep 30
+          done
+          echo "timed out waiting for E2E on $SHA"; exit 1
+
+  # Gate: upgrade from the previous published release to the release commit must
+  # not re-roll a running DecisionModel (RELEASING.md §3). The new Release
+  # already exists here (release-please created it), so the previous tag is
+  # resolved explicitly instead of "latest". The very first release has no
+  # previous one: the upgrade gate is then skipped (nothing to upgrade from).
+  prev-release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.prev.outputs.tag }}
+    steps:
+      - name: Resolve the previous release tag
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          prev=$(gh release list -R "$GITHUB_REPOSITORY" --limit 20 --json tagName,isDraft \
+            | jq -r --arg t "$NEW" '[.[] | select(.tagName != $t and (.isDraft | not))][0].tagName // ""')
+          if [ -z "$prev" ]; then echo "no previous release before $NEW: upgrade gate skipped"; fi
+          echo "previous release: ${prev:-<none>}"
+          echo "tag=$prev" >> "$GITHUB_OUTPUT"
+
+  upgrade-e2e:
+    needs: [release-please, prev-release]
+    if: needs.release-please.outputs.release_created == 'true' && needs.prev-release.outputs.tag != ''
+    uses: ./.github/workflows/test-e2e-upgrade.yml
+    with:
+      from: ${{ needs.prev-release.outputs.tag }}
+      tag: ${{ needs.prev-release.outputs.tag }}
+    permissions:
+      contents: read
+      packages: read
+
+  # Build + push the image and upload release assets only when a Release was
+  # just created (a GITHUB_TOKEN-created tag does not trigger release.yml's push
+  # event, so we call it explicitly here).
+  publish-assets:
+    needs: [release-please, wait-for-e2e, prev-release, upgrade-e2e]
+    # upgrade-e2e is skipped (not failed) only for the first release.
+    if: >-
+      always() && needs.release-please.outputs.release_created == 'true' &&
+      needs.wait-for-e2e.result == 'success' && needs.prev-release.result == 'success' &&
+      (needs.upgrade-e2e.result == 'success' || needs.upgrade-e2e.result == 'skipped')
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+    permissions:
+      contents: write
+      packages: write
+    secrets: inherit

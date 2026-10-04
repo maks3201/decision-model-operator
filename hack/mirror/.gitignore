@@ -1,0 +1,3 @@
+# The model store is pulled fresh by hack/mirror-build.sh at e2e time and baked
+# into the mirror image; it is large (~850 MiB) and must never be committed.
+store/

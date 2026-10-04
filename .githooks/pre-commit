@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Block commits that contain secrets. Scans only staged changes.
+# Install: ./hack/install-git-hooks.sh
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed (brew install gitleaks); refusing to commit." >&2
+  exit 1
+fi
+
+if ! gitleaks git --pre-commit --staged --redact --no-banner --verbose; then
+  echo >&2
+  echo "pre-commit: gitleaks found a possible secret in staged changes. Commit blocked." >&2
+  echo "Remove it (and rotate it if it was real). For a false positive add an allowlist entry" >&2
+  echo "to .gitleaks.toml or append '# gitleaks:allow' to the line." >&2
+  exit 1
+fi

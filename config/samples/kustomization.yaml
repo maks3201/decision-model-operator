@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- decisionmodel_v1alpha1_decisionmodel.yaml
+- decisionmodel_v1alpha1_decisionmodel_eval.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

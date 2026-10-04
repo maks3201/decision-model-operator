@@ -1,0 +1,100 @@
+{{- if .Values.watchNamespaces }}
+{{- /*
+Namespace-scoped mode: no manager ClusterRole/ClusterRoleBinding. Instead a
+Role + RoleBinding is rendered in each watched namespace, with exactly the rules
+of the cluster-wide ClusterRole (shared "dmo.managerRules" helper so they cannot
+diverge). The CRD itself is cluster-scoped and must be installed separately by a
+cluster admin.
+*/ -}}
+{{- range $ns := .Values.watchNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dmo.fullname" $ }}-manager-role
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dmo.labels" $ | nindent 4 }}
+rules:
+  {{- include "dmo.managerRules" $ | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dmo.fullname" $ }}-manager-rolebinding
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dmo.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dmo.fullname" $ }}-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dmo.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- else }}
+---
+# Manager ClusterRole — rules are rendered from the shared "dmo.managerRules"
+# helper (files/role.yaml), which `make manifests` keeps in sync with
+# config/rbac/role.yaml (no hand-mirrored drift). CI diffs the two files.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dmo.fullname" . }}-manager-role
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+rules:
+  {{- include "dmo.managerRules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dmo.fullname" . }}-manager-rolebinding
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "dmo.fullname" . }}-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dmo.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+---
+# Leader-election Role (namespaced).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dmo.fullname" . }}-leader-election-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dmo.fullname" . }}-leader-election-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dmo.fullname" . }}-leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dmo.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

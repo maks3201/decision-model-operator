@@ -1,0 +1,32 @@
+{
+  "release-type": "go",
+  "packages": {
+    ".": {
+      "component": "decision-model-operator",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "yaml",
+          "path": "charts/decision-model-operator/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "charts/decision-model-operator/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        },
+        {
+          "type": "generic",
+          "path": "Makefile"
+        },
+        {
+          "type": "generic",
+          "path": "charts/decision-model-operator/Chart.yaml"
+        }
+      ]
+    }
+  },
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "include-component-in-tag": false
+}
