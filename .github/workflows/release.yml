@@ -89,6 +89,7 @@ jobs:
       contents: write
       packages: write
       id-token: write # keyless cosign signing (Sigstore OIDC)
+      attestations: write # SLSA build provenance for the release files
     env:
       # inputs.tag is set on workflow_call; github.ref_name is the tag on push.
       TAG: ${{ inputs.tag || github.ref_name }}
@@ -165,6 +166,19 @@ jobs:
             cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
           done
 
+      - name: SLSA build provenance for the release files
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/install.yaml
+            dist/decision-model-operator-*.tgz
+
+      - name: Add the provenance bundle to the release files
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/decision-model-operator-${TAG#v}.intoto.jsonl"
+
       - name: Upload install.yaml + chart to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -172,4 +186,5 @@ jobs:
           gh release upload "${{ env.TAG }}" \
             dist/install.yaml dist/install.yaml.sigstore.json \
             dist/decision-model-operator-*.tgz dist/decision-model-operator-*.tgz.sigstore.json \
+            dist/decision-model-operator-*.intoto.jsonl \
             --clobber
