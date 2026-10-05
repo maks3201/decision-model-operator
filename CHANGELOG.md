@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1](https://github.com/maks3201/decision-model-operator/compare/v0.2.0...v0.2.1) (2026-10-05)
+
+
+### Features
+
+* **olm:** describe DecisionModel fields and owned resources in the CSV ([e370f06](https://github.com/maks3201/decision-model-operator/commit/e370f0671211b77361959a7bd224d40544573a79))
+* **release:** attach SLSA build provenance to the release files ([7a551e9](https://github.com/maks3201/decision-model-operator/commit/7a551e9db6a6317e747931c5eb2c59db4e1353d5))
+
+
+### Bug Fixes
+
+* **olm:** keep the sample dataset ConfigMap out of the bundle ([9439859](https://github.com/maks3201/decision-model-operator/commit/9439859df561f1003a4cbd6a8436e1ca3e5763bd))
+
+
+### Documentation
+
+* keep install versions current and describe the roadmap by stage ([#6](https://github.com/maks3201/decision-model-operator/issues/6)) ([cc19c3b](https://github.com/maks3201/decision-model-operator/commit/cc19c3b8db66305c471680228ec28ffe8d6e5c32))
+
 ## [0.2.0](https://github.com/maks3201/decision-model-operator/compare/v0.1.1...v0.2.0) (2026-10-05)
 
 
