@@ -26,3 +26,16 @@ resources:
 #    # Update the indices in this path if adding or removing volumes in the manager's Deployment.
 #    - op: remove
 #      path: /spec/template/spec/volumes/0
+
+# The eval sample ships a golden-dataset ConfigMap for `kubectl apply`; it is an
+# example input, not part of the operator install, so keep it out of the bundle.
+patches:
+- target:
+    kind: ConfigMap
+    name: support-router-golden
+  patch: |-
+    $patch: delete
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: support-router-golden
