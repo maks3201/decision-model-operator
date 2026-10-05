@@ -442,7 +442,7 @@ func parseName(name string) (parsedName, error) {
 	case strings.HasPrefix(lower, "https://"):
 		scheme = "https://"
 	case strings.HasPrefix(lower, "http://"):
-		scheme = "http://"
+		scheme = "http://" // NOSONAR: only with --allow-insecure-registries
 	}
 	rest := strings.TrimPrefix(lower, scheme)
 

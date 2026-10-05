@@ -111,7 +111,7 @@ func canonicalName(eng engine.Engine, name string) string {
 // podBaseURL builds the http base URL for a Pod IP and port. net.JoinHostPort
 // brackets IPv6 literals (fd00::123 -> [fd00::123]:11435).
 func podBaseURL(ip string, port int32) string {
-	return "http://" + net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	return "http://" + net.JoinHostPort(ip, strconv.Itoa(int(port))) // NOSONAR: Ollaya serves plain HTTP in-cluster (no TLS)
 }
 
 // Probe ensures a background warmup for the Pod, then (once warmup completed)

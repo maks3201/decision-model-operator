@@ -258,7 +258,7 @@ var proxyEnvKeys = []string{
 // "successfully" with the credentials buried in the path.
 func parseProxySetting(v string) (*url.URL, error) {
 	if !strings.Contains(v, "://") {
-		v = "http://" + v
+		v = "http://" + v // NOSONAR: scheme-less proxy value, same default as net/http
 	}
 	return url.Parse(v)
 }

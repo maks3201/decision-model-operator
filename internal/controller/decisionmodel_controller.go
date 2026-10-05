@@ -3333,7 +3333,7 @@ func (r *DecisionModelReconciler) endpoint(dm *decisionmodelv1alpha1.DecisionMod
 	if eng, ok := r.Engines[engineOrDefault(dm.Spec.Engine)]; ok {
 		port = eng.ServicePort()
 	}
-	return fmt.Sprintf("http://%s.%s.svc:%d/v1/systemone", dm.Name, dm.Namespace, port)
+	return fmt.Sprintf("http://%s.%s.svc:%d/v1/systemone", dm.Name, dm.Namespace, port) // NOSONAR: Ollaya serves plain HTTP in-cluster (no TLS)
 }
 
 func (r *DecisionModelReconciler) now() time.Time {

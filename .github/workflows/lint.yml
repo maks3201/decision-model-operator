@@ -73,7 +73,7 @@ jobs:
 
       - name: Chart README is up to date (helm-docs, no drift)
         run: |
-          GOBIN="$PWD/bin" go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+          GOBIN="$PWD/bin" go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2 # NOSONAR: pinned, verified by sum.golang.org
           "$PWD/bin/helm-docs" --chart-search-root=charts/decision-model-operator --sort-values-order=file
           git diff --exit-code -- charts/decision-model-operator/README.md
 
