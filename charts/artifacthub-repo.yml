@@ -5,3 +5,7 @@ repositoryID: 021a053b-8228-4ccf-9825-0886da750168
 owners:
   - name: maks3201
     email: eumaxpl@gmail.com
+# 0.1.0 shipped an invalid artifacthub.io/category; 0.1.1 is the same release with it fixed.
+ignore:
+  - name: decision-model-operator
+    version: ^0\.1\.0$
