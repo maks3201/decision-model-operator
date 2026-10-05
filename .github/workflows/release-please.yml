@@ -118,4 +118,5 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write # keyless cosign signing in release.yml
     secrets: inherit

@@ -88,6 +88,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write # keyless cosign signing (Sigstore OIDC)
     env:
       # inputs.tag is set on workflow_call; github.ref_name is the tag on push.
       TAG: ${{ inputs.tag || github.ref_name }}
@@ -114,15 +115,28 @@ jobs:
         with:
           version: v3.16.2
 
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
       - name: Build and push multi-arch image
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/maks3201/decision-model-operator:${{ env.TAG }}
+          # SPDX SBOM and SLSA provenance attached to the image index.
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Sign the image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/maks3201/decision-model-operator@${DIGEST}"
 
       - name: Build installer manifest
         run: make build-installer IMG=ghcr.io/maks3201/decision-model-operator:${{ env.TAG }}
@@ -137,12 +151,25 @@ jobs:
           HELM_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$HELM_PASSWORD" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm push dist/decision-model-operator-*.tgz oci://ghcr.io/maks3201/charts
+          helm push dist/decision-model-operator-*.tgz oci://ghcr.io/maks3201/charts 2>&1 | tee dist/helm-push.log
+          digest=$(sed -n 's/^Digest: //p' dist/helm-push.log)
+          test -n "$digest"
+          echo "CHART_DIGEST=$digest" >>"$GITHUB_ENV"
+
+      - name: Sign the chart (keyless)
+        run: cosign sign --yes "ghcr.io/maks3201/charts/decision-model-operator@${CHART_DIGEST}"
+
+      - name: Sign the release files
+        run: |
+          for f in dist/install.yaml dist/decision-model-operator-*.tgz; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
 
       - name: Upload install.yaml + chart to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ env.TAG }}" \
-            dist/install.yaml dist/*.tgz \
+            dist/install.yaml dist/install.yaml.sigstore.json \
+            dist/decision-model-operator-*.tgz dist/decision-model-operator-*.tgz.sigstore.json \
             --clobber
