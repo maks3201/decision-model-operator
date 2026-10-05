@@ -11,3 +11,11 @@ coverage:
 comment:
   layout: "reach, diff, files"
   require_changes: true
+
+# Not unit-testable logic: generated deepcopy code, scheme registration, the
+# manager entrypoint wiring (exercised by the e2e suite) and e2e test helpers.
+ignore:
+  - "api/**/zz_generated.deepcopy.go"
+  - "api/**/groupversion_info.go"
+  - "cmd/main.go"
+  - "test/**"
