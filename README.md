@@ -83,7 +83,7 @@ Both install the CRD, RBAC and the controller into `decision-model-operator-syst
 ### Verify the release
 
 From v0.2.0 the image, the Helm chart and the release files are signed with
-[cosign](https://github.com/sigstore/cosign) (keyless, GitHub OIDC), and the image carries an
+[cosign](https://github.com/sigstore/cosign) v3+ (keyless, GitHub OIDC), and the image carries an
 SPDX SBOM and SLSA provenance. Releases after v0.2.0 also attach SLSA build provenance for
 the release files (`gh attestation verify`):
 
