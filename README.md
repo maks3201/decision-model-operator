@@ -59,20 +59,24 @@ for the full design.
 
 ### Helm (recommended)
 
+<!-- x-release-please-start-version -->
 ```sh
 helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace decision-model-operator-system --create-namespace
 ```
+<!-- x-release-please-end -->
 
 Chart values are documented in the [chart README](charts/decision-model-operator/README.md)
 and on [Artifact Hub](https://artifacthub.io/packages/search?repo=decision-model-operator).
 
 ### kubectl
 
+<!-- x-release-please-start-version -->
 ```sh
-kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.1.0/install.yaml
+kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.2.0/install.yaml
 ```
+<!-- x-release-please-end -->
 
 Both install the CRD, RBAC and the controller into `decision-model-operator-system`.
 
@@ -80,8 +84,10 @@ Both install the CRD, RBAC and the controller into `decision-model-operator-syst
 
 From v0.2.0 the image, the Helm chart and the release files are signed with
 [cosign](https://github.com/sigstore/cosign) (keyless, GitHub OIDC), and the image carries an
-SPDX SBOM and SLSA provenance:
+SPDX SBOM and SLSA provenance. Releases after v0.2.0 also attach SLSA build provenance for
+the release files (`gh attestation verify`):
 
+<!-- x-release-please-start-version -->
 ```sh
 ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
 ISSUER=https://token.actions.githubusercontent.com
@@ -92,10 +98,11 @@ cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.2.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
-gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance (from v0.3.0)
+gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance
 
 docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.2.0 --format '{{json .SBOM}}'
 ```
+<!-- x-release-please-end -->
 
 ## Usage
 
@@ -141,11 +148,13 @@ An eval-gated example is in
 
 ## Roadmap
 
-| Version | Scope |
+| Stage | Scope |
 |---|---|
-| v0.1 | Digest pinning, prefetch, model-aware readiness, blue-green, eval-gated promotion, security guards; signed releases with SBOM and provenance (v0.2.0) |
-| v0.2 | Per-revision API key, autoscaling (KEDA on in-flight / queue), runtime metrics, node-local cache, GPU E2E in CI |
-| v0.3 | Shadow traffic, confidence cascade with LLM fallback |
+| Released | Digest pinning, prefetch, model-aware readiness, blue-green rollout, eval-gated promotion, security guards, namespace-scoped mode; signed releases with SBOM and provenance |
+| Next | Per-revision API key, autoscaling (KEDA on in-flight / queue), runtime metrics, node-local cache, GPU E2E in CI |
+| Later | Shadow traffic, confidence cascade with LLM fallback |
+
+See [CHANGELOG.md](CHANGELOG.md) for what each release contains.
 
 ## Development
 

@@ -34,8 +34,8 @@ Verified against code, docs and local runs on 2026-09-27 (details in `docs/spike
 | A bare name (`laya`) resolves to `latest`, a different, heavier artifact | spike 001 | the API requires an explicit tag |
 | `OLLAYA_DEVICE=cuda` on the CPU image fails at model load, not at startup; the port is open | spike 001 | a port/HTTP probe is not enough; gate on `/api/ps` |
 | Sizes (CPU, F32, cgroup `anon`, re-measured 2026-10-02): `laya:en` 3.09 GiB, `laya:multilingual` 1.85 GiB, `nli` 3.62 GiB, `gliclass` 2.42 GiB | spike 002 (corrected), `docs/sizing.md` | built-in default requests per measured `name:tag` |
-| Ollama 0.35 and llama.cpp also serve `/v1/systemone`. Ollama: `/api/ps` digest = sha256 of the registry manifest, no pull by digest, RO store works; but no `device` field (only `size_vram`), no server-side API key, different request schema | spike 004 | second engine possible, not before v0.3 |
-| OCI image volumes (KEP-4639, GA in k8s 1.36) can carry an Ollaya store; gate unaffected; Ollaya registry is not OCI, so the model must be repackaged | spike 005 | opt-in cache backend candidate for v0.3+ |
+| Ollama 0.35 and llama.cpp also serve `/v1/systemone`. Ollama: `/api/ps` digest = sha256 of the registry manifest, no pull by digest, RO store works; but no `device` field (only `size_vram`), no server-side API key, different request schema | spike 004 | second engine possible later, not in the next stage |
+| OCI image volumes (KEP-4639, GA in k8s 1.36) can carry an Ollaya store; gate unaffected; Ollaya registry is not OCI, so the model must be repackaged | spike 005 | opt-in cache backend candidate (later) |
 | No existing Kubernetes operator for Laya / Ollaya / Jev-style models found | GitHub + web search | the niche is open (re-check before release) |
 
 ## 3. Positioning
@@ -280,11 +280,13 @@ cluster-scoped and is installed by a cluster admin.
 
 ## 12. Roadmap
 
-| Version | Scope |
+Stages, not version numbers; the [CHANGELOG](https://github.com/maks3201/decision-model-operator/blob/main/CHANGELOG.md) records what each release ships.
+
+| Stage | Scope |
 |---|---|
-| **v0.1** | `DecisionModel`, `ollaya` engine, CPU + CUDA, per-revision PVC store + prefetch Job, readiness gate (digest + device + pinned), blue-green switch, eval-gated and manual promotion (accuracy, ECE/Brier), security guards, namespace-scoped mode, conditions, Events, e2e on kind |
-| v0.2 | per-revision API key, autoscaling (KEDA on in-flight / queue), metrics, node-local cache, GPU e2e |
-| v0.3 | shadow traffic (agreement rate), confidence cascade / fallback to an LLM |
+| **Released** | `DecisionModel`, `ollaya` engine, CPU + CUDA, per-revision PVC store + prefetch Job, readiness gate (digest + device + pinned), blue-green switch, eval-gated and manual promotion (accuracy, ECE/Brier), security guards, namespace-scoped mode, conditions, Events, e2e on kind |
+| Next | per-revision API key, autoscaling (KEDA on in-flight / queue), metrics, node-local cache, GPU e2e |
+| Later | shadow traffic (agreement rate), confidence cascade / fallback to an LLM |
 
 ## 13. Open questions
 
