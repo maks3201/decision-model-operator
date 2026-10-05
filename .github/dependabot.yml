@@ -13,6 +13,15 @@ updates:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
 
+  # Pinned dev tools (helm-docs) in hack/tools.
+  - package-ecosystem: gomod
+    directory: "/hack/tools"
+    schedule:
+      interval: weekly
+    groups:
+      tools:
+        patterns: ["*"]
+
   # GitHub Actions used in the workflows.
   - package-ecosystem: github-actions
     directory: "/"
