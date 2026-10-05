@@ -26,6 +26,14 @@
         {
           "type": "generic",
           "path": "config/manifests/bases/decision-model-operator.clusterserviceversion.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/quickstart.md"
         }
       ]
     }
