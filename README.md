@@ -92,7 +92,7 @@ cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.2.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
-gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance (v0.2.1+)
+gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance (from v0.3.0)
 
 docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.2.0 --format '{{json .SBOM}}'
 ```
