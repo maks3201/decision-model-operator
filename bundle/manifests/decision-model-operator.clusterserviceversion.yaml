@@ -75,7 +75,7 @@ metadata:
     capabilities: Full Lifecycle
     categories: AI/Machine Learning
     containerImage: ghcr.io/maks3201/decision-model-operator:v0.2.0
-    createdAt: "2026-10-05T12:38:26Z"
+    createdAt: "2026-10-05T12:40:37Z"
     description: 'Run open-source System-1 decision models served by Ollaya on Kubernetes
       and manage their full model lifecycle: pin, prefetch, verify, evaluate, promote
       and roll back.'
@@ -137,6 +137,33 @@ spec:
     (Service switch) → Ready. Any failure rolls back to the stable revision or
     ends in Failed. The operator owns everything it creates through owner
     references, so deleting the `DecisionModel` cleans up.
+
+    ## Usage
+
+    ```yaml
+    apiVersion: decisionmodel.io/v1alpha1
+    kind: DecisionModel
+    metadata:
+      name: support-router
+    spec:
+      model: laya:en   # explicit tag required
+      device: cpu      # cpu | cuda
+      replicas: 2
+    ```
+
+    The model is served at `http://<name>.<namespace>.svc:11435/v1/systemone`.
+    See the [quickstart](https://maks3201.github.io/decision-model-operator/quickstart/)
+    and the [API reference](https://maks3201.github.io/decision-model-operator/api-reference/).
+
+    ## Prerequisites
+
+    * A default StorageClass with `ReadWriteOnce` (`ReadWriteMany` for
+      `replicas > 1` across nodes).
+    * Egress from the cluster to `https://ollaya.dev`, or an internal mirror set
+      with the operator's `--ollaya-registry` flag.
+    * For `device: cuda`: amd64 nodes with the NVIDIA device plugin.
+    * API-key Secrets referenced by a `DecisionModel` must carry the label
+      `decisionmodel.io/api-key: "true"`.
 
     **Status: alpha.** The API is `decisionmodel.io/v1alpha1` and may change
     between minor versions. Not affiliated with TypeSafe, Convai Innovations or
