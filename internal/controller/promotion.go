@@ -19,11 +19,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
@@ -143,4 +145,146 @@ func (r *DecisionModelReconciler) consumePromoteApproval(
 	base := dm.DeepCopy()
 	delete(dm.Annotations, decisionmodelv1alpha1.AnnotationPromote)
 	return r.Patch(ctx, dm, client.MergeFrom(base))
+}
+
+// promote marks the candidate as the stable revision and moves the Service to it.
+//
+// Order matters and is the crash-safety invariant: status.stableRevision
+// is persisted FIRST, and only when that write is durable is the Service switched.
+// The Service selector therefore only ever names a revision that the persisted
+// status already records as stable. If the process dies, or the status write
+// conflicts or fails, before the switch, the Service still points at the previous
+// stable (which is still recorded as stable), and the next reconcile simply
+// promotes again. The opposite order left a window in which the Service pointed at
+// a revision that status did not know about; a spec change in that window started
+// a new candidate whose garbage collection deleted the revision the Service was
+// selecting, leaving it with no endpoints.
+func (r *DecisionModelReconciler) promote(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	candidate *decisionmodelv1alpha1.RevisionStatus,
+	precision string,
+	cacheDegraded bool,
+) (ctrl.Result, error) {
+	rev := candidate.Hash
+	prevStable := dm.Status.StableRevision
+	// Do not promote onto a foreign Service: traffic would go to someone else's
+	// Service, not our Pods. Check through the uncached APIReader (a foreign
+	// unlabelled Service is invisible to the cache) BEFORE persisting Ready.
+	// The candidate keeps running; this is not a rollout failure.
+	if blocked, berr := r.foreignServiceBlocks(ctx, dm); berr != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, berr)
+	} else if blocked {
+		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil)
+	}
+	switching := prevStable == nil || prevStable.Hash != rev
+	fromRev := "<none>"
+	if prevStable != nil {
+		fromRev = prevStable.Hash
+	}
+	candidate.Precision = precision
+	dm.Status.StableRevision = candidate
+	dm.Status.CandidateRevision = nil
+	dm.Status.FailedRevision = nil // successful rollout clears any prior failure
+
+	if switching {
+		// Record the demoted revision so its workloads linger for promoteGrace
+		// (endpoints of the new revision must populate first), then emit Promoted
+		// exactly once for this transition.
+		if prevStable != nil {
+			now := metav1.NewTime(r.now())
+			dm.Status.PreviousRevision = &decisionmodelv1alpha1.PreviousRevisionStatus{
+				Hash: prevStable.Hash, PromotedAt: &now,
+			}
+		}
+		r.event(ctx, dm, corev1.EventTypeNormal, eventPromoted, "promoted revision %s -> %s", fromRev, rev)
+		bufferRollout(ctx, rolloutPromoted)
+	}
+	// GC now: everything except the new stable, the just-demoted previous revision
+	// (protected within its grace window) and whichever revision the live Service
+	// still selects (see gcRevisions): the Service has not moved yet.
+	if err := r.gcRevisions(ctx, dm); err != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseReady)
+	setReadyConditions(dm, cacheDegraded)
+
+	// Persist first. Events and metrics are flushed by this write, only on success.
+	persisted, conflict, err := r.persistStatus(ctx, dm)
+	if conflict {
+		// Lost an optimistic-lock race: nothing was stored and the Service was not
+		// touched. The next reconcile promotes again from fresh state.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !persisted {
+		return ctrl.Result{}, nil
+	}
+	// Only now, with the new stable durably recorded, move the Service. If this
+	// fails the error requeues; every reconcile path that has a stable re-asserts
+	// the Service to it, so it converges.
+	if err := r.ensureService(ctx, dm, eng, rev); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Requeue after the grace so the previous revision is collected even if
+	// nothing else triggers a reconcile.
+	if dm.Status.PreviousRevision != nil {
+		return ctrl.Result{RequeueAfter: promoteGrace}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+// rollbackOrFail handles a failed candidate: RolledBack if a stable revision
+// exists (which keeps serving), else Failed. The failed revision is recorded so
+// it is not automatically retried; a spec change (new hash) clears it.
+func (r *DecisionModelReconciler) rollbackOrFail(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	failed *decisionmodelv1alpha1.RevisionStatus,
+	reason, message string,
+) (ctrl.Result, error) {
+	if err := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); err != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	dm.Status.CandidateRevision = nil
+	dm.Status.FailedRevision = failed
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: message,
+	})
+	if dm.Status.StableRevision != nil {
+		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseRolledBack)
+		r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
+			"revision %s rolled back (%s): %s", failed.Hash, reason, message)
+		bufferRollout(ctx, rolloutRolledBack)
+	} else {
+		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseFailed)
+		r.event(ctx, dm, corev1.EventTypeWarning, eventFailed,
+			"revision %s failed (%s): %s", failed.Hash, reason, message)
+		bufferRollout(ctx, rolloutFailed)
+	}
+	return r.finish(ctx, dm, ctrl.Result{}, nil)
+}
+
+// rollbackOrFailPermanent is rollbackOrFail for a permanent failure: after the
+// status write it returns a TerminalError so the workqueue stops retrying.
+func (r *DecisionModelReconciler) rollbackOrFailPermanent(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	failed *decisionmodelv1alpha1.RevisionStatus,
+	reason, message string,
+) (ctrl.Result, error) {
+	res, err := r.rollbackOrFail(ctx, dm, failed, reason, message)
+	if err != nil {
+		return res, err // status write failed; let the caller requeue
+	}
+	if _, ok := permanentReasons[reason]; ok {
+		return res, reconcile.TerminalError(fmt.Errorf("%s: %s", reason, message))
+	}
+	return res, nil
 }

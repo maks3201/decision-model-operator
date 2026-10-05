@@ -21,8 +21,12 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -130,4 +134,37 @@ func (r *DecisionModelReconciler) guardSecurity(
 			"spec.image override is not allowed (set --allow-image-override)")
 	}
 	return ctrl.Result{}, nil, false
+}
+
+// apiKey reads the engine API key from the referenced Secret, if any.
+func (r *DecisionModelReconciler) apiKey(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel) (string, error) {
+	if dm.Spec.Auth == nil || dm.Spec.Auth.APIKeySecretRef == nil {
+		return "", nil
+	}
+	ref := dm.Spec.Auth.APIKeySecretRef
+	rdr, err := r.reader()
+	if err != nil {
+		return "", err
+	}
+	var secret corev1.Secret
+	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
+		if apierrors.IsNotFound(err) && ref.Optional != nil && *ref.Optional {
+			return "", nil
+		}
+		return "", err
+	}
+	if err := requireAPIKeyLabel(secret.Labels); err != nil {
+		return "", err
+	}
+	return string(secret.Data[ref.Key]), nil
+}
+
+// reader returns the uncached APIReader for Secrets/ConfigMaps. It is a hard
+// error to use it unset: the manager must inject mgr.GetAPIReader() so the
+// operator never starts cluster-wide Secret/ConfigMap informers.
+func (r *DecisionModelReconciler) reader() (client.Reader, error) {
+	if r.APIReader == nil {
+		return nil, fmt.Errorf("APIReader is not configured")
+	}
+	return r.APIReader, nil
 }
