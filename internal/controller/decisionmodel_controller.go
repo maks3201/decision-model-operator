@@ -1609,8 +1609,8 @@ func (r *DecisionModelReconciler) conflictIfNotOwned(
 
 // foreignServiceBlocks reports whether the Service named <dm> is occupied by an
 // object this DM does not own. It reads through the uncached APIReader because a
-// foreign unlabelled Service is invisible to the label-filtered cache
-// §1). When blocked it sets Degraded=ResourceConflict (Event on transition) and
+// foreign unlabelled Service is invisible to the label-filtered cache.
+// When blocked it sets Degraded=ResourceConflict (Event on transition) and
 // Ready=False/ResourceConflict so the model is never advertised Ready while
 // traffic would flow to a foreign Service, and returns resourceConflictRequeue.
 // A missing Service, our own Service, or an APIReader error that is not NotFound

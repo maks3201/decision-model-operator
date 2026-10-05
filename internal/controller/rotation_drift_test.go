@@ -34,7 +34,7 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
-// §1 checksum, §2 drift, §3 cache size.
+// checksum, drift, cache size.
 var _ = Describe("rotation / drift / cache", func() {
 	var (
 		ctx       context.Context
@@ -67,7 +67,7 @@ var _ = Describe("rotation / drift / cache", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	// §1 — the API key checksum is recorded on the Deployment and only mirrored
+	// the API key checksum is recorded on the Deployment and only mirrored
 	// into the Pod template (rolling the Pods) on a rotation. The first
 	// observation of a legacy Deployment records without rolling.
 	It("records the API key checksum and rolls the Pod template only on rotation", func() {
@@ -95,7 +95,7 @@ var _ = Describe("rotation / drift / cache", func() {
 		Expect(dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]).To(Equal(dep.Annotations[apiKeyChecksumAnnotation]))
 	})
 
-	// §1 r1 — a stable Deployment created before this feature (no recorded
+	// a stable Deployment created before this feature (no recorded
 	// checksum, no template checksum) must NOT roll on the first observation:
 	// the operator records the checksum but leaves the template untouched.
 	It("adopts a legacy stable without rolling, then rolls on a later rotation", func() {
@@ -129,7 +129,7 @@ var _ = Describe("rotation / drift / cache", func() {
 		Expect(dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]).To(Equal(dep.Annotations[apiKeyChecksumAnnotation]))
 	})
 
-	// §2 — an injected sidecar container in the live Deployment is drift and is
+	// an injected sidecar container in the live Deployment is drift and is
 	// reverted (deploymentMatchesDesired returns false, so ensureDeployment writes).
 	It("reverts an injected sidecar container (drift)", func() {
 		rr := r()
@@ -189,7 +189,7 @@ var _ = Describe("rotation / drift / cache", func() {
 		Expect(dep.ResourceVersion).To(Equal(rvBefore), "restartedAt alone does not trigger an update loop")
 	})
 
-	// §3 — cache size shrink / storageClass change are CacheSpecImmutable;
+	// cache size shrink / storageClass change are CacheSpecImmutable;
 	// a grow with a non-expandable class is CacheSpecImmutable.
 	It("reports CacheSpecImmutable for a shrink and a storageClass change", func() {
 		rr := r()
@@ -222,7 +222,7 @@ var _ = Describe("rotation / drift / cache", func() {
 		Expect(deg.Reason).To(Equal(reasonCacheSpecImmutable))
 	})
 
-	// §3 r1 — a grow is attempted as an expansion patch WITHOUT reading the
+	// a grow is attempted as an expansion patch WITHOUT reading the
 	// (cluster-scoped) StorageClass. The API server itself rejects an expansion
 	// it does not allow (here: a PVC with no expandable StorageClass), and the
 	// guard surfaces that rejection as CacheSpecImmutable rather than consulting

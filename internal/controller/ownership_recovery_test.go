@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -41,9 +42,9 @@ import (
 )
 
 // close the ownership hole the label-filtered manager cache opens
-// (createOrAdopt on AlreadyExists, §1); make stable-store recovery reachable
-// from Reconcile (§2); and keep the stable serving behind Degraded=StoreTerminating
-// while its store PVC is deleted-but-still-mounted (§3).
+// (createOrAdopt on AlreadyExists); make stable-store recovery reachable
+// from Reconcile; and keep the stable serving behind Degraded=StoreTerminating
+// while its store PVC is deleted-but-still-mounted.
 var _ = Describe("ownership through the cache and stable-store recovery", func() {
 	var (
 		ctx       context.Context
@@ -138,7 +139,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	// --- §1: ownership on an AlreadyExists the cache could not see. ---
+	// --- ownership on an AlreadyExists the cache could not see. ---
 
 	// hideGet returns a client whose Get reports NotFound for one name/type,
 	// simulating the label-filtered cache missing a foreign/unlabelled object
@@ -156,7 +157,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		})
 	}
 
-	It("§1 refuses to adopt a foreign unlabelled Service hidden from the cache", func() {
+	It("refuses to adopt a foreign unlabelled Service hidden from the cache", func() {
 		createDM("adopt-svc")
 		// A foreign Service with our name and no decisionmodel.io/name label: the
 		// cached Get would miss it, so createOrAdopt must catch it on AlreadyExists.
@@ -181,7 +182,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(degradedReason(dm)).To(Equal(reasonResourceConflict))
 	})
 
-	It("§1 re-labels an owned Deployment whose cache-selector label was stripped", func() {
+	It("re-labels an owned Deployment whose cache-selector label was stripped", func() {
 		createDM("adopt-dep")
 		dm := getDM("adopt-dep")
 		// An owned Deployment (controller ref = dm) but WITHOUT decisionmodel.io/name:
@@ -211,9 +212,9 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 			"cache-selector label patched back onto the owned Deployment")
 	})
 
-	// --- §2: lost stable store recovered through Reconcile (not recoverStableStore). ---
+	// --- lost stable store recovered through Reconcile (not recoverStableStore). ---
 
-	It("§2 recovers a lost per-revision stable store through Reconcile", func() {
+	It("recovers a lost per-revision stable store through Reconcile", func() {
 		r := newRec(k8sClient, newProber())
 		rev := driveToStable(r, "lost-rev")
 		pvcKey := types.NamespacedName{Namespace: namespace, Name: "lost-rev-store-" + rev}
@@ -221,6 +222,12 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 
 		depBefore := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, depKey, depBefore)).To(Succeed())
+
+		// creationTimestamp has one-second resolution and a Job counts as stale only
+		// when it is strictly older than the store PVC. Let a second pass so the
+		// recreated PVC is newer than the first rollout's Job and the stale path
+		// (delete, then a fresh recovery Job) is always taken.
+		time.Sleep(1100 * time.Millisecond)
 
 		// Delete the stable store PVC (drop the pvc-protection finalizer so it
 		// actually disappears).
@@ -251,10 +258,16 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(k8sClient.Get(ctx, depKey, depDuring)).To(Succeed())
 		Expect(depDuring.Spec.Template).To(Equal(depBefore.Spec.Template))
 
-		// Drive the recovery prefetch to completion.
+		// Drive the recovery prefetch to completion. Wait for the fresh recovery Job:
+		// the stale Complete Job from the first rollout has the same name and is
+		// deleted first, and re-marking it would hit the immutable status times.
 		Eventually(func() bool {
 			rec()
-			return k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "lost-rev-prefetch-" + rev}, &batchv1.Job{}) == nil
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "lost-rev-prefetch-" + rev}, job); err != nil {
+				return false
+			}
+			return job.Status.CompletionTime == nil
 		}, "3s", "20ms").Should(BeTrue())
 		markJobComplete("lost-rev-prefetch-" + rev)
 		rec() // observe Complete -> clear the annotation
@@ -266,7 +279,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(getDM("lost-rev").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseReady))
 	})
 
-	It("§2 recovers a lost legacy shared store through Reconcile", func() {
+	It("recovers a lost legacy shared store through Reconcile", func() {
 		r := newRec(k8sClient, newProber())
 		rev := driveToStable(r, "lost-leg")
 		dm := getDM("lost-leg")
@@ -296,9 +309,9 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(degradedReason(getDM("lost-leg"))).To(Equal(reasonStoreLost))
 	})
 
-	// --- §3: terminating-but-mounted stable store. ---
+	// --- terminating-but-mounted stable store. ---
 
-	It("§3 keeps the stable serving behind Degraded=StoreTerminating while its store is deleted-but-mounted", func() {
+	It("keeps the stable serving behind Degraded=StoreTerminating while its store is deleted-but-mounted", func() {
 		r := newRec(k8sClient, newProber())
 		rev := driveToStable(r, "term")
 		pvcKey := types.NamespacedName{Namespace: namespace, Name: "term-store-" + rev}
@@ -475,7 +488,7 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	It("§1 never reports Ready while a foreign Service occupies the name; promotes once it is removed", func() {
+	It("never reports Ready while a foreign Service occupies the name; promotes once it is removed", func() {
 		r := newRec(newProber())
 		// A pre-existing foreign (unlabelled, not owned) Service named like the DM.
 		foreign := &corev1.Service{
@@ -520,7 +533,7 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 		}, "3s", "20ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 	})
 
-	It("§2 does not change the stable Pod template while the store PVC is Terminating", func() {
+	It("does not change the stable Pod template while the store PVC is Terminating", func() {
 		r := newRec(newProber())
 		dm := &decisionmodelv1alpha1.DecisionModel{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "frz"},

@@ -33,7 +33,7 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
-// §1 behaviour (transport errors invalidate a run) is covered end-to-end by the
+// behaviour (transport errors invalidate a run) is covered end-to-end by the
 // "eval blip does not promote" spec below.
 
 // Integration: a transport blip during the candidate eval must not promote; once
@@ -140,7 +140,7 @@ var _ = Describe("eval blip does not promote", func() {
 		Expect(getDM("blip").Status.StableRevision.Hash).To(Equal(rev))
 	})
 
-	// §5 — every condition carries ObservedGeneration, updated on a spec change.
+	// every condition carries ObservedGeneration, updated on a spec change.
 	It("stamps ObservedGeneration on conditions and updates it on a spec change", func() {
 		eng := newFakeEngine()
 		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
@@ -172,7 +172,7 @@ var _ = Describe("eval blip does not promote", func() {
 	})
 })
 
-// §2 — evalStore.get returns a snapshot; mutating the returned copy does not
+// evalStore.get returns a snapshot; mutating the returned copy does not
 // affect the stored entry, and a concurrent finish is race-free (also proven by
 // go test -race).
 var _ = Describe("evalStore snapshot", func() {

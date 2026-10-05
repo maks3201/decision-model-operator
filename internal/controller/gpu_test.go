@@ -158,8 +158,8 @@ var _ = Describe("GPU usability", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	// §1: prefetch must not use the resolved serving (CUDA) image.
-	Describe("prefetch image (§1)", func() {
+	// prefetch must not use the resolved serving (CUDA) image.
+	Describe("prefetch image", func() {
 		It("prefetches a cuda DM with the CPU default, not the CUDA serving image", func() {
 			eng := newFakeEngine()
 			r := newReconciler(eng, &fakeProber{})
@@ -198,8 +198,8 @@ var _ = Describe("GPU usability", func() {
 		})
 	})
 
-	// §2: GPU taint toleration for serving Pods only.
-	Describe("GPU taint toleration (§2)", func() {
+	// GPU taint toleration for serving Pods only.
+	Describe("GPU taint toleration", func() {
 		It("adds the nvidia.com/gpu toleration to serving Pods for cuda, not the Job", func() {
 			eng := newFakeEngine()
 			r := newReconciler(eng, &fakeProber{})
@@ -259,8 +259,8 @@ var _ = Describe("GPU usability", func() {
 		})
 	})
 
-	// §3: PodDisruptionBudget per stable revision for replicas > 1.
-	Describe("PodDisruptionBudget (§3)", func() {
+	// PodDisruptionBudget per stable revision for replicas > 1.
+	Describe("PodDisruptionBudget", func() {
 		getPDB := func(dmName, rev string) (*policyv1.PodDisruptionBudget, error) {
 			pdb := &policyv1.PodDisruptionBudget{}
 			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-" + rev}, pdb)

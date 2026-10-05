@@ -407,7 +407,7 @@ var _ = Describe("robustness", func() {
 	})
 
 	// ------------------------------------------------------------- item 1
-	Describe("re-inspecting gated Pods (§1)", func() {
+	Describe("re-inspecting gated Pods", func() {
 		loaded := engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}
 
 		// stableWithPod drives a DM to Ready with one gated Pod and a
@@ -530,7 +530,7 @@ var _ = Describe("robustness", func() {
 	})
 
 	// ------------------------------------------------------------- item 2
-	Describe("CUDA arch nodeSelector (§2)", func() {
+	Describe("CUDA arch nodeSelector", func() {
 		drive := func(name string, mutate func(*decisionmodelv1alpha1.DecisionModel)) (*appsv1.Deployment, *batchv1.Job) {
 			r := newR(newFakeEngine(), &fakeProber{})
 			newDM(name, mutate)
@@ -573,7 +573,7 @@ var _ = Describe("robustness", func() {
 	})
 
 	// ------------------------------------------------------------- item 3
-	Describe("configurable timeouts (§3)", func() {
+	Describe("configurable timeouts", func() {
 		It("sets the prefetch Job deadline from an explicit caching timeout, and leaves it alone otherwise", func() {
 			r := newR(newFakeEngine(), &fakeProber{})
 			newDM("to1", func(dm *decisionmodelv1alpha1.DecisionModel) {

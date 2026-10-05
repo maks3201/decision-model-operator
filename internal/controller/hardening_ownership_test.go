@@ -41,7 +41,7 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
-// --- §3 IPv6 URL building (pure) -----------------------------------------
+// --- IPv6 URL building (pure) -----------------------------------------
 
 var _ = Describe("podBaseURL IPv6", func() {
 	It("brackets an IPv6 literal and leaves IPv4 unbracketed", func() {
@@ -50,7 +50,7 @@ var _ = Describe("podBaseURL IPv6", func() {
 	})
 })
 
-// --- §4 ownership (defence in depth) -------------------------------------
+// --- ownership (defence in depth) -------------------------------------
 
 var _ = Describe("ownership checks", func() {
 	var (
@@ -254,7 +254,7 @@ var _ = Describe("ownership checks", func() {
 	})
 })
 
-// --- §1 baseline fail-closed ---------------------------------------------
+// --- baseline fail-closed ---------------------------------------------
 
 var _ = Describe("baseline fail-closed", func() {
 	const model = "laya:en"

@@ -127,7 +127,7 @@ var _ = Describe("ownership and store recovery", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	// §1 — a foreign Service with the DM's name is never modified; Degraded=ResourceConflict.
+	// a foreign Service with the DM's name is never modified; Degraded=ResourceConflict.
 	It("refuses to modify a foreign Service and reports ResourceConflict", func() {
 		createDM("conflict-svc")
 		foreign := &corev1.Service{
@@ -154,7 +154,7 @@ var _ = Describe("ownership and store recovery", func() {
 		Expect(deg.Reason).To(Equal(reasonResourceConflict))
 	})
 
-	// §1 — gcLegacyStore never deletes a <dm>-store PVC the DM does not own.
+	// gcLegacyStore never deletes a <dm>-store PVC the DM does not own.
 	It("never deletes a foreign <dm>-store legacy PVC", func() {
 		createDM("conflict-store")
 		foreign := &corev1.PersistentVolumeClaim{
@@ -171,7 +171,7 @@ var _ = Describe("ownership and store recovery", func() {
 			&corev1.PersistentVolumeClaim{})).To(Succeed(), "foreign legacy store survives GC")
 	})
 
-	// §2 — a lost per-revision stable store is recreated and prefetched; stable
+	// a lost per-revision stable store is recreated and prefetched; stable
 	// stays Degraded (StoreLost) and does not serve on an empty store.
 	It("recreates and reprefetches a lost stable store before serving", func() {
 		r := newReconciler(k8sClient, newFakeEngine(), &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}})
@@ -213,7 +213,7 @@ var _ = Describe("ownership and store recovery", func() {
 			&batchv1.Job{})).To(Succeed(), "prefetch re-run for the recovered store")
 	})
 
-	// §3 — a Pod List failure aborts the reconcile (error returned) rather than
+	// a Pod List failure aborts the reconcile (error returned) rather than
 	// being scored as "0 ready" (which would wrongly roll back / degrade).
 	It("aborts the reconcile on a Pod List error instead of reporting 0 ready", func() {
 		var fail atomic.Bool
@@ -238,7 +238,7 @@ var _ = Describe("ownership and store recovery", func() {
 		Expect(getDM("listerr").Status.FailedRevision).To(BeNil())
 	})
 
-	// §4 — a steady-state stable issues no Service write (desired port carries TCP).
+	// a steady-state stable issues no Service write (desired port carries TCP).
 	It("issues no Service write in steady state", func() {
 		var svcWrites atomic.Int32
 		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})

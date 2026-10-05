@@ -254,7 +254,7 @@ func (r *DecisionModelReconciler) ensureEval(
 	if e, ok := store.get(key); ok {
 		if e.result.done {
 			// A run invalidated by a transport blip is not a verdict: forget it so
-			// the next reconcile retries rather than rolling back on a flake (§1).
+			// the next reconcile retries rather than rolling back on a flake.
 			if e.result.transport > 0 {
 				store.forget(key)
 				return evalResult{}, true, nil
