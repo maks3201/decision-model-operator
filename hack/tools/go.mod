@@ -1,6 +1,6 @@
 module github.com/maks3201/decision-model-operator/hack/tools
 
-go 1.26.0
+go 1.26.8
 
 tool github.com/norwoodj/helm-docs/cmd/helm-docs
 
