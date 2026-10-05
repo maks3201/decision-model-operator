@@ -27,6 +27,7 @@ type DecisionModelSpec struct {
 	// Engine is the serving runtime for the model.
 	// +kubebuilder:validation:Enum=ollaya
 	// +kubebuilder:default=ollaya
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Engine",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Engine string `json:"engine,omitempty"`
 
@@ -36,11 +37,13 @@ type DecisionModelSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self.split('/')[size(self.split('/')) - 1].contains(':')",message="model must include an explicit tag, e.g. laya:en"
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Model",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	Model string `json:"model"`
 
 	// Digest optionally pins the model to an immutable digest (bare hex sha256).
 	// When empty, the operator resolves the tag and records the digest in status.
 	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Digest",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Digest string `json:"digest,omitempty"`
 
@@ -50,6 +53,7 @@ type DecisionModelSpec struct {
 	// (CacheNotShareable).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Replicas",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:podCount"}
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
 
@@ -57,32 +61,39 @@ type DecisionModelSpec struct {
 	// an nvidia.com/gpu and uses the engine's CUDA image.
 	// +kubebuilder:validation:Enum=cpu;cuda
 	// +kubebuilder:default=cpu
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Device",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:select:cpu","urn:alm:descriptor:com.tectonic.ui:select:cuda"}
 	// +optional
 	Device string `json:"device,omitempty"`
 
 	// Image overrides the engine's default container image. Rejected unless the
 	// operator is started with --allow-image-override (a DecisionModel editor
 	// could otherwise run an arbitrary image under the operator's Pod template).
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Image Override",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Image string `json:"image,omitempty"`
 
 	// Resources are the compute resource requirements for the serving container.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Resources",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:resourceRequirements"}
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
 	// Scheduling is a passthrough of nodeSelector/tolerations/affinity for serving Pods.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Scheduling",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Scheduling *SchedulingSpec `json:"scheduling,omitempty"`
 
 	// Cache configures the model store PVC.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Cache",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Cache *CacheSpec `json:"cache,omitempty"`
 
 	// Auth configures the engine API key.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Auth",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Auth *AuthSpec `json:"auth,omitempty"`
 
 	// Rollout configures rollout behaviour, including eval-gated promotion.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Rollout",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Rollout *RolloutSpec `json:"rollout,omitempty"`
 }
@@ -149,6 +160,7 @@ type AuthSpec struct {
 type RolloutSpec struct {
 	// Evaluation gates promotion on a golden-dataset accuracy check. When unset,
 	// a candidate is promoted as soon as all its Pods are model-ready.
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Evaluation",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Evaluation *EvaluationSpec `json:"evaluation,omitempty"`
 
@@ -370,6 +382,7 @@ type EvaluationStatus struct {
 // DecisionModelStatus defines the observed state of DecisionModel.
 type DecisionModelStatus struct {
 	// Phase is the high-level lifecycle phase.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Phase",xDescriptors={"urn:alm:descriptor:io.kubernetes.phase"}
 	// +optional
 	Phase DecisionModelPhase `json:"phase,omitempty"`
 
@@ -382,14 +395,17 @@ type DecisionModelStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// Endpoint is the in-cluster serving endpoint URL.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Endpoint",xDescriptors={"urn:alm:descriptor:org.w3:link"}
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
 	// StableRevision is the revision currently receiving traffic.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Stable Revision",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	StableRevision *RevisionStatus `json:"stableRevision,omitempty"`
 
 	// CandidateRevision is the revision being rolled out, if any.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Candidate Revision",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	CandidateRevision *RevisionStatus `json:"candidateRevision,omitempty"`
 
@@ -397,6 +413,7 @@ type DecisionModelStatus struct {
 	// not automatically retry it; a spec change (new revision) is required, or
 	// setting the decisionmodel.io/retry annotation to a new token re-attempts
 	// the same revision.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Failed Revision",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	FailedRevision *RevisionStatus `json:"failedRevision,omitempty"`
 
@@ -412,16 +429,19 @@ type DecisionModelStatus struct {
 	LastRetryToken string `json:"lastRetryToken,omitempty"`
 
 	// Replicas reports desired and model-ready replica counts.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Replicas",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Replicas ReplicaStatus `json:"replicas,omitempty"`
 
 	// Evaluation records the most recent eval-gated rollout result.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Evaluation",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Evaluation *EvaluationStatus `json:"evaluation,omitempty"`
 
 	// Conditions represent the latest available observations of the object's state.
 	// +listType=map
 	// +listMapKey=type
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Conditions",xDescriptors={"urn:alm:descriptor:io.kubernetes.conditions"}
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
@@ -443,6 +463,7 @@ type DecisionModelStatus struct {
 // Job/PVC names that must stay within 63 characters.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must be a DNS-1035 label: lowercase letters, digits and '-', starting with a letter and ending with a letter or digit (no dots)"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 43",message="metadata.name must be at most 43 characters (derived Job and PVC names must fit in 63)"
+// +operator-sdk:csv:customresourcedefinitions:displayName="Decision Model",resources={{Deployment,v1,""},{Service,v1,""},{Job,v1,""},{PersistentVolumeClaim,v1,""},{PodDisruptionBudget,v1,""}}
 type DecisionModel struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

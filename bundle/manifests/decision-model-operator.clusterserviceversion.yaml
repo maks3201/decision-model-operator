@@ -75,7 +75,7 @@ metadata:
     capabilities: Full Lifecycle
     categories: AI/Machine Learning
     containerImage: ghcr.io/maks3201/decision-model-operator:v0.2.0
-    createdAt: "2026-10-05T12:40:37Z"
+    createdAt: "2026-10-05T13:34:26Z"
     description: 'Run open-source System-1 decision models served by Ollaya on Kubernetes
       and manage their full model lifecycle: pin, prefetch, verify, evaluate, promote
       and roll back.'
@@ -98,6 +98,148 @@ spec:
       displayName: Decision Model
       kind: DecisionModel
       name: decisionmodels.decisionmodel.io
+      resources:
+      - kind: Deployment
+        name: ""
+        version: v1
+      - kind: Job
+        name: ""
+        version: v1
+      - kind: PersistentVolumeClaim
+        name: ""
+        version: v1
+      - kind: PodDisruptionBudget
+        name: ""
+        version: v1
+      - kind: Service
+        name: ""
+        version: v1
+      specDescriptors:
+      - description: Auth configures the engine API key.
+        displayName: Auth
+        path: auth
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:advanced
+      - description: Cache configures the model store PVC.
+        displayName: Cache
+        path: cache
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:advanced
+      - description: |-
+          Device selects the target compute device for serving. "cuda" also requests
+          an nvidia.com/gpu and uses the engine's CUDA image.
+        displayName: Device
+        path: device
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:select:cpu
+        - urn:alm:descriptor:com.tectonic.ui:select:cuda
+      - description: |-
+          Digest optionally pins the model to an immutable digest (bare hex sha256).
+          When empty, the operator resolves the tag and records the digest in status.
+        displayName: Digest
+        path: digest
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: Engine is the serving runtime for the model.
+        displayName: Engine
+        path: engine
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          Image overrides the engine's default container image. Rejected unless the
+          operator is started with --allow-image-override (a DecisionModel editor
+          could otherwise run an arbitrary image under the operator's Pod template).
+        displayName: Image Override
+        path: image
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          Model is the model name in engine terms, e.g. "laya:en". The last path
+          segment must include an explicit ":tag" (a bare name resolves to :latest,
+          a different and heavier artifact — see spike 001 §9).
+        displayName: Model
+        path: model
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          Replicas is the number of serving Pods for the stable revision (default 1).
+          With replicas > 1 spread across nodes the model store must be shareable —
+          see cache.accessModes; otherwise the operator reports Degraded
+          (CacheNotShareable).
+        displayName: Replicas
+        path: replicas
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:podCount
+      - description: Resources are the compute resource requirements for the serving
+          container.
+        displayName: Resources
+        path: resources
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:resourceRequirements
+      - description: Rollout configures rollout behaviour, including eval-gated promotion.
+        displayName: Rollout
+        path: rollout
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:advanced
+      - description: |-
+          Evaluation gates promotion on a golden-dataset accuracy check. When unset,
+          a candidate is promoted as soon as all its Pods are model-ready.
+        displayName: Evaluation
+        path: rollout.evaluation
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:advanced
+      - description: Scheduling is a passthrough of nodeSelector/tolerations/affinity
+          for serving Pods.
+        displayName: Scheduling
+        path: scheduling
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:advanced
+      statusDescriptors:
+      - description: CandidateRevision is the revision being rolled out, if any.
+        displayName: Candidate Revision
+        path: candidateRevision
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: Conditions represent the latest available observations of the
+          object's state.
+        displayName: Conditions
+        path: conditions
+        x-descriptors:
+        - urn:alm:descriptor:io.kubernetes.conditions
+      - description: Endpoint is the in-cluster serving endpoint URL.
+        displayName: Endpoint
+        path: endpoint
+        x-descriptors:
+        - urn:alm:descriptor:org.w3:link
+      - description: Evaluation records the most recent eval-gated rollout result.
+        displayName: Evaluation
+        path: evaluation
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: |-
+          FailedRevision is a revision that failed to roll out. The controller does
+          not automatically retry it; a spec change (new revision) is required, or
+          setting the decisionmodel.io/retry annotation to a new token re-attempts
+          the same revision.
+        displayName: Failed Revision
+        path: failedRevision
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: Phase is the high-level lifecycle phase.
+        displayName: Phase
+        path: phase
+        x-descriptors:
+        - urn:alm:descriptor:io.kubernetes.phase
+      - description: Replicas reports desired and model-ready replica counts.
+        displayName: Replicas
+        path: replicas
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
+      - description: StableRevision is the revision currently receiving traffic.
+        displayName: Stable Revision
+        path: stableRevision
+        x-descriptors:
+        - urn:alm:descriptor:com.tectonic.ui:text
       version: v1alpha1
   description: |-
     The Decision Model Operator runs open-source System-1 decision models (Laya,
