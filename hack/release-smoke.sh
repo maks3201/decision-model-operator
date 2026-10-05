@@ -26,7 +26,7 @@ work="$(mktemp -d)"
 kctx="kind-${CLUSTER}"
 
 cleanup() {
-  if [ -z "${KEEP_CLUSTER:-}" ]; then
+  if [[ -z "${KEEP_CLUSTER:-}" ]]; then
     kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
   fi
   rm -rf "${work}" || true
@@ -54,10 +54,10 @@ YAML
   local phase=""
   for i in $(seq 1 96); do
     phase="$(kc get decisionmodel smoke -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)"
-    [ "${phase}" = "Ready" ] && break
+    [[ "${phase}" = "Ready" ]] && break
     sleep 5
   done
-  if [ "${phase}" != "Ready" ]; then
+  if [[ "${phase}" != "Ready" ]]; then
     echo "FAIL (${label}): DecisionModel never reached Ready (phase=${phase:-<none>})"
     kc describe decisionmodel smoke -n "${NS}" | tail -40
     exit 1
@@ -75,7 +75,7 @@ note "kind up (cluster=${CLUSTER} node=${KIND_NODE_IMAGE:-<default>})"
 KIND_CLUSTER="${CLUSTER}" KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}" ./hack/kind-up.sh
 
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [ -n "${token}" ]; then
+if [[ -n "${token}" ]]; then
   echo "${token}" | docker login ghcr.io -u "${GITHUB_ACTOR:-token}" --password-stdin >/dev/null 2>&1 || \
     echo "warning: docker login ghcr.io failed; assuming the image is already pullable" >&2
 fi

@@ -50,7 +50,7 @@ work="$(mktemp -d)"
 kctx="kind-${CLUSTER}"
 
 cleanup() {
-  if [ -z "${KEEP_CLUSTER:-}" ]; then
+  if [[ -z "${KEEP_CLUSTER:-}" ]]; then
     kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
   fi
   rm -rf "${work}" || true
@@ -67,7 +67,7 @@ wait_ready() {
   local dm="$1" phase=""
   for _ in $(seq 1 96); do
     phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
-    [ "${phase}" = "Ready" ] && return 0
+    [[ "${phase}" = "Ready" ]] && return 0
     sleep 5
   done
   echo "FAIL: DecisionModel ${dm} never reached Ready on ${from_tag} (phase=${phase:-<none>})"
@@ -82,8 +82,8 @@ record_before() {
   dep="${dm}-${stable}"
   spechash="$(jp deploy "${dep}" '{.metadata.annotations.decisionmodel\.io/spec-hash}')"
   res="$(jp deploy "${dep}" '{.spec.template.spec.containers[0].resources}')"
-  [ -n "${stable}" ] || { echo "FAIL: no stableRevision.hash recorded for ${dm} on ${from_tag}"; exit 1; }
-  [ -n "${spechash}" ] || { echo "FAIL: no spec-hash on the stable Deployment ${dep}"; exit 1; }
+  [[ -n "${stable}" ]] || { echo "FAIL: no stableRevision.hash recorded for ${dm} on ${from_tag}"; exit 1; }
+  [[ -n "${spechash}" ]] || { echo "FAIL: no spec-hash on the stable Deployment ${dep}"; exit 1; }
   printf '%s\n%s\n%s\n%s\n' "${stable}" "${dep}" "${spechash}" "${res}" >"${work}/${dm}.before"
   echo "pre-upgrade  ${dm}: stable=${stable} deploy=${dep} spec-hash=${spechash} resources=${res:-<empty>}"
 }
@@ -98,7 +98,7 @@ assert_not_rerolled() {
     phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
     stable_now="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
     cand_now="$(jp decisionmodel "${dm}" '{.status.candidateRevision.hash}')"
-    if [ "${phase}" = "Ready" ] && [ "${stable_now}" = "${stable_before}" ] && [ -z "${cand_now}" ]; then
+    if [[ "${phase}" = "Ready" ]] && [[ "${stable_now}" = "${stable_before}" ]] && [[ -z "${cand_now}" ]]; then
       ok="yes"; break
     fi
     sleep 5
@@ -110,13 +110,13 @@ assert_not_rerolled() {
   echo "post-upgrade ${dm}: phase=${phase:-} stable=${stable_now:-} candidate=${cand_now:-<none>} spec-hash=${spechash_after:-} resources=${res_after:-<empty>}"
 
   local fail=""
-  [ "${ok}" = "yes" ] || fail="phase=${phase:-}, stable ${stable_before} -> ${stable_now:-}, candidate=${cand_now:-}"
-  [ "${stable_now:-}" = "${stable_before}" ] || fail="stableRevision.hash changed ${stable_before} -> ${stable_now:-} (upgrade re-rolled ${dm})"
-  [ -z "${cand_now:-}" ] || fail="a candidate was created by the upgrade: ${cand_now}"
-  [ "${spechash_after:-}" = "${spechash_before}" ] || fail="stable spec-hash changed ${spechash_before} -> ${spechash_after:-} (pod template rewritten)"
-  [ "${res_after:-}" = "${res_before:-}" ] || fail="stable pod-template resources changed on a no-op upgrade: '${res_before:-}' -> '${res_after:-}' (resource freeze violated — new engine defaults leaked onto a running stable)"
+  [[ "${ok}" = "yes" ]] || fail="phase=${phase:-}, stable ${stable_before} -> ${stable_now:-}, candidate=${cand_now:-}"
+  [[ "${stable_now:-}" = "${stable_before}" ]] || fail="stableRevision.hash changed ${stable_before} -> ${stable_now:-} (upgrade re-rolled ${dm})"
+  [[ -z "${cand_now:-}" ]] || fail="a candidate was created by the upgrade: ${cand_now}"
+  [[ "${spechash_after:-}" = "${spechash_before}" ]] || fail="stable spec-hash changed ${spechash_before} -> ${spechash_after:-} (pod template rewritten)"
+  [[ "${res_after:-}" = "${res_before:-}" ]] || fail="stable pod-template resources changed on a no-op upgrade: '${res_before:-}' -> '${res_after:-}' (resource freeze violated — new engine defaults leaked onto a running stable)"
 
-  if [ -n "${fail}" ]; then
+  if [[ -n "${fail}" ]]; then
     echo "FAIL (upgrade ${from_tag} -> source, ${dm}): ${fail}"
     kc describe decisionmodel "${dm}" -n "${NS}" | tail -40
     return 1
@@ -137,7 +137,7 @@ gh release download "${from_tag}" -R "${REPO}" -p install.yaml -O "${work}/insta
 # alternative — an in-cluster imagePullSecret — needs patching every ServiceAccount
 # the manifest creates; kind-load is simpler and keeps install.yaml unmodified.)
 token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [ -n "${token}" ]; then
+if [[ -n "${token}" ]]; then
   echo "${token}" | docker login ghcr.io -u "${GITHUB_ACTOR:-token}" --password-stdin >/dev/null 2>&1 || \
     echo "warning: docker login ghcr.io failed; assuming the image is already pullable" >&2
 fi
@@ -200,6 +200,6 @@ note "asserting neither DecisionModel is re-rolled by the upgrade"
 rc=0
 assert_not_rerolled "${DM_RES}" || rc=1
 assert_not_rerolled "${DM_NORES}" || rc=1
-[ "${rc}" -eq 0 ] || { echo "FAIL: upgrade ${from_tag} -> source re-rolled at least one DecisionModel"; exit 1; }
+[[ "${rc}" -eq 0 ]] || { echo "FAIL: upgrade ${from_tag} -> source re-rolled at least one DecisionModel"; exit 1; }
 
 echo "PASS: upgrade ${from_tag} -> source kept both DecisionModels Ready and un-rerolled."

@@ -36,7 +36,7 @@ CLUSTER="${KIND_CLUSTER:-dmo}"
 
 MODEL_NAME="${MIRROR_MODEL%%:*}"
 MODEL_TAG="${MIRROR_MODEL##*:}"
-if [ "${MODEL_NAME}" = "${MODEL_TAG}" ]; then
+if [[ "${MODEL_NAME}" = "${MODEL_TAG}" ]]; then
   echo "mirror-build: MIRROR_MODEL must be <model>:<tag> (got '${MIRROR_MODEL}')" >&2
   exit 1
 fi
@@ -77,20 +77,20 @@ fi
 # the content hashes to that digest.
 blob_count=0
 while read -r digest url; do
-  [ -n "${digest}" ] || continue
+  [[ -n "${digest}" ]] || continue
   hex="${digest#sha256:}"
   out="${BLOB_DIR}/sha256-${hex}"
   echo "mirror-build: GET blob ${hex:0:12}... <- ${url}"
   curl -fsSL --retry 3 --retry-delay 5 "${url}" -o "${out}"
   got="$(shasum -a 256 "${out}" 2>/dev/null | cut -d' ' -f1 || sha256sum "${out}" | cut -d' ' -f1)"
-  if [ "${got}" != "${hex}" ]; then
+  if [[ "${got}" != "${hex}" ]]; then
     echo "mirror-build: blob digest mismatch for ${hex}: got ${got}" >&2
     exit 1
   fi
   blob_count=$((blob_count + 1))
 done < <(jq -r '([.config] + .layers) | .[] | "\(.digest) \(.urls[0])"' "${MANIFEST_FILE}")
 
-if [ "${blob_count}" -eq 0 ]; then
+if [[ "${blob_count}" -eq 0 ]]; then
   echo "mirror-build: no blobs fetched (manifest had no config/layers?)" >&2
   exit 1
 fi

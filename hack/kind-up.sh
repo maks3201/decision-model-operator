@@ -32,7 +32,7 @@ if kind get clusters 2>/dev/null | grep -qx "${CLUSTER}"; then
   echo "kind cluster '${CLUSTER}' already exists; reusing it."
 else
   echo "creating kind cluster '${CLUSTER}'..."
-  if [ -n "${KIND_NODE_IMAGE}" ]; then
+  if [[ -n "${KIND_NODE_IMAGE}" ]]; then
     echo "  pinning node image: ${KIND_NODE_IMAGE}"
     kind create cluster --name "${CLUSTER}" --image "${KIND_NODE_IMAGE}"
   else

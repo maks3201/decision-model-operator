@@ -4,6 +4,8 @@
 [![E2E](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml)
 [![Release](https://img.shields.io/github/v/release/maks3201/decision-model-operator?sort=semver)](https://github.com/maks3201/decision-model-operator/releases)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/decision-model-operator)](https://artifacthub.io/packages/search?repo=decision-model-operator)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=maks3201_decision-model-operator&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=maks3201_decision-model-operator)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/maks3201/decision-model-operator/badge)](https://scorecard.dev/viewer/?uri=github.com/maks3201/decision-model-operator)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A Kubernetes operator that runs open-source System-1 decision models (Laya, Kev, JevK5, …)
