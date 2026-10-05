@@ -280,7 +280,7 @@ cluster-scoped and is installed by a cluster admin.
 
 ## 12. Roadmap
 
-Stages, not version numbers; the [CHANGELOG](../CHANGELOG.md) records what each release ships.
+Stages, not version numbers; the [CHANGELOG](https://github.com/maks3201/decision-model-operator/blob/main/CHANGELOG.md) records what each release ships.
 
 | Stage | Scope |
 |---|---|
