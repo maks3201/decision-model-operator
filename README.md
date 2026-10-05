@@ -76,6 +76,26 @@ kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/do
 
 Both install the CRD, RBAC and the controller into `decision-model-operator-system`.
 
+### Verify the release
+
+From v0.2.0 the image, the Helm chart and the release files are signed with
+[cosign](https://github.com/sigstore/cosign) (keyless, GitHub OIDC), and the image carries an
+SPDX SBOM and SLSA provenance:
+
+```sh
+ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
+ISSUER=https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/maks3201/decision-model-operator:v0.2.0 \
+  --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.2.0 \
+  --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
+cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
+  --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
+
+docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.2.0 --format '{{json .SBOM}}'
+```
+
 ## Usage
 
 ```yaml
@@ -122,7 +142,7 @@ An eval-gated example is in
 
 | Version | Scope |
 |---|---|
-| v0.1 | Digest pinning, prefetch, model-aware readiness, blue-green, eval-gated promotion, security guards |
+| v0.1 | Digest pinning, prefetch, model-aware readiness, blue-green, eval-gated promotion, security guards; signed releases with SBOM and provenance (v0.2.0) |
 | v0.2 | Per-revision API key, autoscaling (KEDA on in-flight / queue), runtime metrics, node-local cache, GPU E2E in CI |
 | v0.3 | Shadow traffic, confidence cascade with LLM fallback |
 
