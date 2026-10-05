@@ -49,11 +49,14 @@ Manual (the maintainer ticks them in the release PR description):
 
 - Release Please keeps a release PR open on `main`. **Merge it only when §3 is complete.** It is fine for it
   to stay open for days.
+- `main` is protected: changes land only through pull requests with green Tests and Lint. The release PR is
+  opened by the GitHub Actions bot, so its workflow runs wait for approval: approve them (Actions → run →
+  "Approve and run", or `gh api -X POST repos/<owner>/<repo>/actions/runs/<id>/approve`), then merge with squash.
 - On merge: tag + GitHub Release, then `publish-assets` builds the multi-arch image and uploads
   `install.yaml` and the chart — only after E2E on that commit is green.
-- Once the repository is public: images are signed keyless with cosign (GitHub OIDC), with an SBOM and
-  build provenance attached, and `checksums.txt` for release assets. Verification commands go in the
-  release notes. (Not done while the repo is private: keyless signing writes to the public Rekor log.)
+- The image, the OCI chart and the release files are signed keyless with cosign (GitHub OIDC); the image carries
+  an SPDX SBOM and SLSA provenance, and the release files get a SLSA provenance attestation
+  (`*.intoto.jsonl`). Verification commands are in the README ("Verify the release").
 
 ## 5. Support policy
 
