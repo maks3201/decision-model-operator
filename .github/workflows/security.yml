@@ -36,14 +36,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-
+      # govulncheck is pinned in hack/tools/go.mod (go.sum is the lock file).
+      # hack/tools itself has no packages to scan; its dependencies are covered
+      # by Dependabot alerts.
       - name: Scan main module
-        run: govulncheck ./...
-
-      - name: Scan hack/tools
-        run: govulncheck -C hack/tools ./...
+        run: go -C hack/tools tool govulncheck -C ../.. ./...
 
   trivy:
     name: Trivy image scan
@@ -71,7 +68,7 @@ jobs:
           set -euo pipefail
           tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
           url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
-          curl -fsSL -o "$tarball" "$url"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$tarball" "$url"
           echo "${TRIVY_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "$tarball" trivy
           install -m 0755 trivy /usr/local/bin/trivy

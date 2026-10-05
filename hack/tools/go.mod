@@ -2,7 +2,10 @@ module github.com/maks3201/decision-model-operator/hack/tools
 
 go 1.26.8
 
-tool github.com/norwoodj/helm-docs/cmd/helm-docs
+tool (
+	github.com/norwoodj/helm-docs/cmd/helm-docs
+	golang.org/x/vuln/cmd/govulncheck
+)
 
 require (
 	dario.cat/mergo v1.0.1 // indirect
@@ -32,8 +35,13 @@ require (
 	github.com/spf13/viper v1.16.0 // indirect
 	github.com/subosito/gotenv v1.4.2 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
 	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.50.0 // indirect
+	golang.org/x/vuln v1.8.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	helm.sh/helm/v3 v3.22.0 // indirect

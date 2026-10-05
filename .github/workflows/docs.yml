@@ -40,7 +40,8 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: pip install --require-hashes -r docs/requirements.txt
+        # Wheels only: no package build scripts run during installation.
+        run: pip install --require-hashes --only-binary=':all:' -r docs/requirements.txt
 
       - name: Build (strict)
         run: mkdocs build --strict
