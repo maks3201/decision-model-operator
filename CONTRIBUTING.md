@@ -50,6 +50,8 @@ A GPU e2e path exists as a manual workflow — see `docs/gpu-ci.md`.
 ## Pull requests
 
 - Keep PRs focused; update docs when behaviour changes.
+- New functionality and bug fixes must come with automated tests (unit or envtest;
+  an e2e case in `test/e2e/` for user-visible rollout behaviour).
 - Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
   messages and the PR title, e.g. `feat: add eval-gated rollout`,
   `fix(engine): honour Retry-After on 429`.
