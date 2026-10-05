@@ -1,0 +1,2 @@
+go test fuzz v1
+string("ollAYA.dev/0./0")

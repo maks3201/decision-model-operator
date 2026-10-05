@@ -485,6 +485,14 @@ func parseName(name string) (parsedName, error) {
 	if !namePartRE.MatchString(p.namespace) {
 		return parsedName{}, fmt.Errorf("ollaya: invalid namespace in model name %q", name)
 	}
+	// With the default registry, a namespace that looks like a registry host
+	// (contains ".", ":" or is "localhost") is rejected: CanonicalName drops the
+	// default host, so the namespace would be read back as a host
+	// (e.g. "ollaya.dev/0./0" -> "0./0:latest", where "0." then reads as a host).
+	// A non-default host is kept in the canonical form, so it stays unambiguous.
+	if hostIsDefault(p.host) && p.namespace != defaultNamespace && looksLikeHost(p.namespace) {
+		return parsedName{}, fmt.Errorf("ollaya: namespace %q in model name %q must not look like a host", p.namespace, name)
+	}
 	if !namePartRE.MatchString(p.model) {
 		return parsedName{}, fmt.Errorf("ollaya: invalid model in model name %q", name)
 	}

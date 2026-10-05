@@ -236,6 +236,18 @@ func TestCanonicalName(t *testing.T) {
 		{"acme/triage", "acme/triage:latest", false},
 		{"localhost:5000/ns/m:t", "localhost:5000/ns/m:t", false},
 		{"registry.example.com/ns/laya:en", "registry.example.com/ns/laya:en", false},
+		// A namespace that looks like a host is ambiguous and must be rejected so
+		// every accepted name round-trips through CanonicalName (idempotence).
+		{"ollaya.dev/0./0", "", true},
+		{"0./0", "", true},
+		{"ollaya.dev/foo.bar/laya:en", "", true},
+		{"ollaya.dev/localhost/laya:en", "", true},
+		// A host-looking first segment of a two-segment name is the host, kept
+		// verbatim (non-default), and round-trips.
+		{"foo.bar/laya:en", "foo.bar/library/laya:en", false},
+		// With a non-default host the namespace may contain dots: the host is kept.
+		{"registry.example.com/my.team/laya:en", "registry.example.com/my.team/laya:en", false},
+		{"localhost/laya:en", "localhost/library/laya:en", false},
 		{"la*ya", "", true},
 		{"", "", true},
 	}
