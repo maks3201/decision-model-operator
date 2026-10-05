@@ -3,6 +3,10 @@
 Thanks for your interest in decision-model-operator. This is an open-source
 Kubernetes operator; contributions are welcome.
 
+By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+Questions go to [GitHub Discussions](https://github.com/maks3201/decision-model-operator/discussions);
+security issues are reported privately as described in [SECURITY.md](SECURITY.md).
+
 ## Development setup
 
 Requirements: Go (see `go.mod` for the version), Docker (OrbStack works on
