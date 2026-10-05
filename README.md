@@ -17,6 +17,8 @@ served by [Ollaya](https://github.com/ollaya-dev/ollaya), and manages their mode
 > **Status: alpha.** The API is `decisionmodel.io/v1alpha1` and may change between minor
 > versions. Not affiliated with TypeSafe, Convai Innovations or Ollaya.
 
+📖 **Documentation:** <https://maks3201.github.io/decision-model-operator/>
+
 ## Why
 
 A plain Deployment of a model server tells you the process is up. It does not tell you

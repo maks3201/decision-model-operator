@@ -1,0 +1,72 @@
+site_name: Decision Model Operator
+site_description: >-
+  Kubernetes operator for open-source System-1 decision models served by Ollaya:
+  pin, prefetch, verify, evaluate, promote and roll back.
+site_url: https://maks3201.github.io/decision-model-operator/
+repo_url: https://github.com/maks3201/decision-model-operator
+repo_name: maks3201/decision-model-operator
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# Spikes are historical research notes: built so cross-links resolve, but kept
+# out of the navigation.
+not_in_nav: |
+  /spikes/
+
+# requirements.txt lives in docs/ for the build but is not site content.
+exclude_docs: |
+  requirements.txt
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.details
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Evaluation: evaluation.md
+  - Sizing: sizing.md
+  - GitOps: gitops.md
+  - Metrics: metrics.md
+  - GPU CI: gpu-ci.md
+  - API reference: api-reference.md
+  - Architecture: ARCHITECTURE.md
