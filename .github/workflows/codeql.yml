@@ -15,7 +15,9 @@ permissions: {}
 
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancelling an analysis on main reports a "configuration error" in code
+  # scanning until the next run; only cancel superseded pull request runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
