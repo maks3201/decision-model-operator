@@ -260,6 +260,7 @@ var _ = Describe("rollout follow-ups", func() {
 			}).SetupWithManager(mgr)).To(Succeed())
 
 			mgrCtx, cancelMgr := context.WithCancel(ctx)
+			defer cancelMgr()
 			done := make(chan struct{})
 			go func() {
 				defer GinkgoRecover()

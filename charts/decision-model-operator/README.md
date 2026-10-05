@@ -105,7 +105,7 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the manager container. |
 | imagePullSecrets | list | `[]` | Secrets for pulling the manager image (e.g. `[{name: ghcr-pull}]` while the GHCR package is private). |
 | replicaCount | int | `1` | Number of controller-manager replicas (leader election picks one active). |
-| resources | object | `{"limits":{"cpu":"500m","memory":"128Mi"},"requests":{"cpu":"10m","memory":"64Mi"}}` | Resource requests/limits for the manager container. |
+| resources | object | `{"limits":{"cpu":"500m","memory":"128Mi"},"requests":{"cpu":"10m","ephemeral-storage":"64Mi","memory":"64Mi"}}` | Resource requests/limits for the manager container. |
 | nodeSelector | object | `{}` | Node selector for the manager Pod. |
 | tolerations | list | `[]` | Tolerations for the manager Pod. |
 | affinity | object | `{}` | Affinity for the manager Pod. |

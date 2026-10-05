@@ -65,6 +65,7 @@ var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
 	ctx, cancel = context.WithCancel(context.TODO())
+	DeferCleanup(cancel)
 
 	var err error
 	err = decisionmodelv1alpha1.AddToScheme(scheme.Scheme)
@@ -106,7 +107,7 @@ var _ = BeforeSuite(func() {
 
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")
-	cancel()
+	cancel() // stop managers before the API server goes away
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
