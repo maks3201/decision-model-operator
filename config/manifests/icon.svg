@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Decision Model Operator">
+  <rect width="128" height="128" rx="24" fill="#0b1f3a"/>
+  <circle cx="40" cy="40" r="12" fill="none" stroke="#4fc3f7" stroke-width="5"/>
+  <circle cx="40" cy="88" r="12" fill="none" stroke="#4fc3f7" stroke-width="5"/>
+  <circle cx="92" cy="64" r="14" fill="#4fc3f7"/>
+  <path d="M52 40 H78" fill="none" stroke="#80d8ff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M52 88 H78" fill="none" stroke="#80d8ff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M78 40 L82 58" fill="none" stroke="#80d8ff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M78 88 L82 70" fill="none" stroke="#80d8ff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M86 60 l5 6 10 -14" fill="none" stroke="#0b1f3a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

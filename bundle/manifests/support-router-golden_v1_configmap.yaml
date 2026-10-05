@@ -1,0 +1,14 @@
+apiVersion: v1
+data:
+  cases.jsonl: |
+    {"state":{"ticket":"card declined at checkout"},"questions":{"q1":{"type":"choice","options":["billing","technical","account"]}},"expected":{"q1":"billing"}}
+    {"state":{"ticket":"app crashes on login"},"questions":{"q1":{"type":"choice","options":["billing","technical","account"]}},"expected":{"q1":"technical"}}
+    {"state":{"ticket":"reset my password"},"questions":{"q1":{"type":"choice","options":["billing","technical","account"]}},"expected":{"q1":"account"}}
+    {"state":{"ticket":"is this refund urgent?"},"questions":{"q1":{"type":"noul"}},"expected":{"q1":true}}
+    {"state":{"ticket":"just saying thanks"},"questions":{"q1":{"type":"noul"}},"expected":{"q1":false}}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: decision-model-operator
+  name: support-router-golden
