@@ -22,6 +22,10 @@
         {
           "type": "generic",
           "path": "charts/decision-model-operator/Chart.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "config/manifests/bases/decision-model-operator.clusterserviceversion.yaml"
         }
       ]
     }

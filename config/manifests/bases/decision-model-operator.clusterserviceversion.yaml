@@ -5,7 +5,7 @@ metadata:
     alm-examples: '[]'
     capabilities: Full Lifecycle
     categories: AI/Machine Learning
-    containerImage: ghcr.io/maks3201/decision-model-operator:v0.1.1
+    containerImage: ghcr.io/maks3201/decision-model-operator:v0.2.0 # x-release-please-version
     description: 'Run open-source System-1 decision models served by Ollaya on Kubernetes
       and manage their full model lifecycle: pin, prefetch, verify, evaluate, promote
       and roll back.'
