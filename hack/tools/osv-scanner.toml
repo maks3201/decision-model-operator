@@ -1,0 +1,6 @@
+# hack/tools only builds developer tools (helm-docs, govulncheck); nothing here
+# ships in the operator image or binary.
+
+[[IgnoredVulns]]
+id = "GO-2026-5932"
+reason = "golang.org/x/crypto/openpgp is deprecated and has no fixed version. It is required only as a module by helm (a helm-docs dependency); the openpgp package is not imported (go mod why: not needed), so it is never built into any tool."
