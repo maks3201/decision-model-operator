@@ -26,7 +26,7 @@ maintainers:
     url: https://github.com/maks3201
 annotations:
   artifacthub.io/license: Apache-2.0
-  artifacthub.io/category: machine-learning
+  artifacthub.io/category: ai-machine-learning
   artifacthub.io/prerelease: 'false'
   artifacthub.io/images: |
     - name: manager
@@ -41,8 +41,10 @@ annotations:
       url: https://github.com/maks3201/decision-model-operator/blob/main/docs/quickstart.md
     - name: API reference
       url: https://github.com/maks3201/decision-model-operator/blob/main/docs/api-reference.md
+    - name: support
+      url: https://github.com/maks3201/decision-model-operator/issues
   artifacthub.io/operator: 'true'
-  artifacthub.io/operatorCapabilities: Full Lifecycle
+  artifacthub.io/operatorCapabilities: full lifecycle
   artifacthub.io/crds: |
     - kind: DecisionModel
       version: v1alpha1
