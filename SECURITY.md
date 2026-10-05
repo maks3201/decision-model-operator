@@ -9,8 +9,8 @@ Do not open a public issue for a suspected vulnerability.
 
 Include, where possible: affected version, a description and impact, and steps
 to reproduce (a minimal `DecisionModel` manifest and operator logs help). You
-will get an acknowledgement, and a fix or mitigation will be coordinated before
-any public disclosure.
+will get an acknowledgement within 14 days, and a fix or mitigation will be
+coordinated before any public disclosure.
 
 ## Supported versions
 
