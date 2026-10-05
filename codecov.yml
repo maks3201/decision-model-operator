@@ -1,0 +1,13 @@
+# Coverage reporting is informational: it never fails CI or blocks a PR.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true

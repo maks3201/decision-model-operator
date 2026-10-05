@@ -1,0 +1,129 @@
+name: Security
+
+# Supply-chain and vulnerability scanning: govulncheck on every push/PR,
+# a weekly Trivy image scan and a weekly fuzz smoke run.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "**.md"]
+  schedule:
+    - cron: "41 5 * * 1" # weekly, Monday 05:41 UTC
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Scan main module
+        run: govulncheck ./...
+
+      - name: Scan hack/tools
+        run: govulncheck -C hack/tools ./...
+
+  trivy:
+    name: Trivy image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Weekly and manual only: scanning the published image on every PR adds no signal.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to code scanning
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The aquasecurity/trivy-action tags were force-pushed to malicious commits
+      # in the March 2026 supply-chain compromise, so we install a pinned trivy
+      # binary and verify its sha256 instead of using the action.
+      - name: Install trivy (pinned, checksum-verified)
+        env:
+          TRIVY_VERSION: "0.75.0"
+          TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+        run: |
+          set -euo pipefail
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          curl -fsSL -o "$tarball" "$url"
+          echo "${TRIVY_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" trivy
+          install -m 0755 trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Scan latest released image
+        env:
+          IMAGE: "ghcr.io/maks3201/decision-model-operator:v0.1.1"
+        run: |
+          set -euo pipefail
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-results.sarif \
+            "$IMAGE"
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Fuzzing is slow and non-deterministic; run it weekly and on demand, not per PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run every Fuzz* target for 30s
+        run: |
+          set -euo pipefail
+          # One fuzz target may be run per `go test` invocation, so discover each
+          # Fuzz* function and its package and run them one at a time.
+          grep -rEl '^func Fuzz[A-Za-z0-9_]*\(' --include='*_test.go' . | while read -r file; do
+            pkg="./$(dirname "$file")"
+            grep -oE '^func (Fuzz[A-Za-z0-9_]*)\(' "$file" | sed -E 's/^func (Fuzz[A-Za-z0-9_]*)\(/\1/' | while read -r fn; do
+              echo "::group::$pkg $fn"
+              go test "$pkg" -run '^$' -fuzz "^${fn}$" -fuzztime 30s
+              echo "::endgroup::"
+            done
+          done

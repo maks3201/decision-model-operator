@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml)
 [![E2E](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml)
+[![codecov](https://codecov.io/gh/maks3201/decision-model-operator/branch/main/graph/badge.svg)](https://codecov.io/gh/maks3201/decision-model-operator)
 [![Release](https://img.shields.io/github/v/release/maks3201/decision-model-operator?sort=semver)](https://github.com/maks3201/decision-model-operator/releases)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/decision-model-operator)](https://artifacthub.io/packages/search?repo=decision-model-operator)
 [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=maks3201_decision-model-operator&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=maks3201_decision-model-operator)
