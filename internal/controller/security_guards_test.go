@@ -25,13 +25,12 @@ import (
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
-	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
 )
 
 // checkRegistryAllowed uses the engine's own parser (RegistryHoster)
 // and fails closed. Mixed-case hosts must not bypass the allow-list.
 func TestE2CheckRegistryAllowed(t *testing.T) {
-	eng := ollaya.New() // real engine implements engine.RegistryHoster
+	eng := newFakeEngine() // fake engine implements engine.RegistryHoster
 
 	cases := []struct {
 		name       string

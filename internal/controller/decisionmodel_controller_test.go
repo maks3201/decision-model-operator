@@ -41,17 +41,23 @@ import (
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
-	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
 )
 
 // --- fake engine ---------------------------------------------------------
 
 const (
-	fakeImage       = "ghcr.io/ollaya-dev/ollaya:test"
-	fakeImageCUDA   = "ghcr.io/ollaya-dev/ollaya:test-cuda"
+	fakeImage       = "ghcr.io/ollaya-dev/ollaya:0.10.0"
+	fakeImageCUDA   = "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda"
 	fakeServingPort = int32(11435)
 	// defaultDigest is the digest the fake engine resolves to by default.
 	defaultDigest = "abc1230000000000000000000000000000000000000000000000000000000000"
+	// fakeDefaultRuntimeVersion / fakeMinRuntimeVersion mirror the real engine's
+	// defaults so the controller's runtime-version logic can be exercised through
+	// the fake engine's RuntimeVersioner capability without importing the engine
+	// package. fakeImagePrefix is the default-image tag prefix the fake uses.
+	fakeDefaultRuntimeVersion = "0.10.0"
+	fakeMinRuntimeVersion     = "0.7.3"
+	fakeImagePrefix           = "ghcr.io/ollaya-dev/ollaya:"
 )
 
 // fakeEngine is a test double implementing engine.Engine without any network.
@@ -60,11 +66,23 @@ type fakeEngine struct {
 	digest       string
 	resolveErr   error
 	resolveCalls int
+	// defaultVersion overrides the engine's default runtime version, to simulate
+	// an operator upgrade that ships a newer default (a fresh reconciler with a
+	// new build). Empty means fakeDefaultRuntimeVersion.
+	defaultVersion string
 }
 
 // newFakeEngine builds a fake engine seeded with the default test digest;
 // tests that need a second digest set eng.digest directly.
 func newFakeEngine() *fakeEngine { return &fakeEngine{digest: defaultDigest} }
+
+// effectiveDefaultVersion is the engine's current default runtime version.
+func (f *fakeEngine) effectiveDefaultVersion() string {
+	if f.defaultVersion != "" {
+		return f.defaultVersion
+	}
+	return fakeDefaultRuntimeVersion
+}
 
 func (f *fakeEngine) Name() string { return "ollaya" }
 
@@ -98,40 +116,138 @@ func (f *fakeEngine) CanonicalName(name string) (string, error) {
 // RegistryHost reports the registry host a model name targets, delegating to the
 // real ollaya parser so the fake engine matches production host resolution and
 // satisfies engine.RegistryHoster (engines without it are denied).
+// RegistryHost reports the registry host a model name targets and whether plain
+// http:// is used. It mirrors the real engine's parser closely enough for
+// controller tests without importing the engine package: an http:// or https://
+// scheme is stripped (http -> insecure); the first slash-segment of the
+// remainder is the host when it contains a '.' or ':' (or is "localhost"),
+// otherwise the name is host-less and resolves against the engine default
+// "ollaya.dev". The host is lower-cased.
 func (f *fakeEngine) RegistryHost(name string) (string, bool, error) {
-	return ollaya.New().RegistryHost(name)
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return "", false, fmt.Errorf("empty model name")
+	}
+	insecure := false
+	switch {
+	case len(n) >= 7 && strings.EqualFold(n[:7], "http://"):
+		insecure = true
+		n = n[7:]
+	case len(n) >= 8 && strings.EqualFold(n[:8], "https://"):
+		n = n[8:]
+	}
+	if i := strings.IndexByte(n, '/'); i > 0 {
+		seg := n[:i]
+		if strings.ContainsAny(seg, ".:") || strings.EqualFold(seg, "localhost") {
+			return strings.ToLower(seg), insecure, nil
+		}
+	}
+	return "ollaya.dev", insecure, nil
 }
 
-// fakeImageFor mirrors the real engine's imageFor: an explicit p.Image override
-// wins; otherwise, when a runtime version is set, a version-specific tag
-// (so a pinned spec.runtimeVersion yields a distinct serving image and the
-// revision hash reflects it); otherwise the device default (distinct CPU/CUDA
-// images). It lets the test assert that a cuda DM without spec.image prefetches
-// with the CPU default rather than the resolved serving (CUDA) image.
-func fakeImageFor(p engine.Params) string {
+// DefaultRuntimeVersion / ValidateRuntimeVersion / CompareRuntimeVersions /
+// RuntimeVersionFromImage implement engine.RuntimeVersioner so the controller's
+// runtime-version logic is exercised through the fake engine (no ollaya import).
+func (f *fakeEngine) DefaultRuntimeVersion() string { return f.effectiveDefaultVersion() }
+
+func (f *fakeEngine) ValidateRuntimeVersion(version string) error {
+	if version == "" {
+		return nil
+	}
+	v, ok := parseFakeVersion(version)
+	if !ok {
+		return fmt.Errorf("invalid runtime version %q", version)
+	}
+	if minV, _ := parseFakeVersion(fakeMinRuntimeVersion); compareFakeVersion(v, minV) < 0 {
+		return fmt.Errorf("runtime version %q below minimum %s", version, fakeMinRuntimeVersion)
+	}
+	return nil
+}
+
+func (f *fakeEngine) CompareRuntimeVersions(a, b string) int {
+	av, aok := parseFakeVersion(a)
+	bv, bok := parseFakeVersion(b)
+	if !aok || !bok {
+		return 0
+	}
+	return compareFakeVersion(av, bv)
+}
+
+func (f *fakeEngine) RuntimeVersionFromImage(image string) string {
+	if !strings.HasPrefix(image, fakeImagePrefix) {
+		return ""
+	}
+	tag := strings.TrimSuffix(strings.TrimPrefix(image, fakeImagePrefix), "-cuda")
+	if f.ValidateRuntimeVersion(tag) != nil {
+		return ""
+	}
+	return tag
+}
+
+func parseFakeVersion(v string) ([3]int, bool) {
+	var out [3]int
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i := 0; i < 3; i++ {
+		if parts[i] == "" {
+			return out, false
+		}
+		n := 0
+		for _, c := range parts[i] {
+			if c < '0' || c > '9' {
+				return out, false
+			}
+			n = n*10 + int(c-'0')
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func compareFakeVersion(a, b [3]int) int {
+	for i := 0; i < 3; i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// imageFor mirrors the real engine's imageFor: an explicit p.Image override
+// wins; otherwise the version is resolved (p.RuntimeVersion, or the engine's
+// current default when empty) and mapped to an image. The baseline default
+// version maps to the plain device-default image (fakeImage/fakeImageCUDA) so
+// existing tests keep their hashes; any other version (a pin, or a bumped engine
+// default simulating an operator upgrade) yields a version-specific tag, so the
+// revision hash reflects it.
+func (f *fakeEngine) imageFor(p engine.Params) string {
 	if p.Image != "" {
 		return p.Image
 	}
-	// A non-default pinned version yields a version-specific tag so the revision
-	// hash reflects it. The engine default version (or an unset version) maps to
-	// the plain device-default image, matching the real engine where the default
-	// version IS the default image — so recording and reusing the default version
-	// under Pinned never changes the resolved image or the hash.
-	if p.RuntimeVersion != "" && p.RuntimeVersion != ollaya.DefaultRuntimeVersion {
-		img := "ghcr.io/ollaya-dev/ollaya:" + p.RuntimeVersion
+	v := p.RuntimeVersion
+	if v == "" {
+		v = f.effectiveDefaultVersion()
+	}
+	if v == fakeDefaultRuntimeVersion {
 		if p.Device == engine.DeviceCUDA {
-			img += "-cuda"
+			return fakeImageCUDA
 		}
-		return img
+		return fakeImage
 	}
+	img := fakeImagePrefix + v
 	if p.Device == engine.DeviceCUDA {
-		return fakeImageCUDA
+		img += "-cuda"
 	}
-	return fakeImage
+	return img
 }
 
 func (f *fakeEngine) ServingPodSpec(p engine.Params) corev1.PodSpec {
-	img := fakeImageFor(p)
+	img := f.imageFor(p)
 	return corev1.PodSpec{
 		Containers: []corev1.Container{{
 			Name:      "ollaya",

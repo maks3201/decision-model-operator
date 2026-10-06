@@ -137,22 +137,23 @@ const (
 	reasonReplicasNotModelReady = "ReplicasNotModelReady"
 	reasonNoModelReadyPods      = "NoModelReadyPods"
 
-	reasonInvalidModelName        = "InvalidModelName"
-	reasonRegistryNotAllowed      = "RegistryNotAllowed"
-	reasonImageOverrideNotAllowed = "ImageOverrideNotAllowed"
-	reasonSecretNotAllowed        = "SecretNotAllowed"
-	reasonResourceConflict        = "ResourceConflict"
-	reasonStoreLost               = "StoreLost"
-	reasonStorePrefetchFailed     = "StorePrefetchFailed"
-	reasonStoreTerminating        = "StoreTerminating"
-	reasonDownloadTokenInvalid    = "DownloadTokenInvalid"
-	reasonInvalidRuntimeVersion   = "InvalidRuntimeVersion"
-	reasonRolloutQueued           = "RolloutQueued"
-	reasonRuntimeUpdateAvailable  = "RuntimeUpdateAvailable"
-	reasonAPIKeyInvalid           = "APIKeyInvalid"
-	reasonStabilizing             = "Stabilizing"
-	reasonStabilized              = "Stabilized"
-	reasonPostPromotionUnhealthy  = "PostPromotionUnhealthy"
+	reasonInvalidModelName          = "InvalidModelName"
+	reasonRegistryNotAllowed        = "RegistryNotAllowed"
+	reasonImageOverrideNotAllowed   = "ImageOverrideNotAllowed"
+	reasonSecretNotAllowed          = "SecretNotAllowed"
+	reasonResourceConflict          = "ResourceConflict"
+	reasonStoreLost                 = "StoreLost"
+	reasonStorePrefetchFailed       = "StorePrefetchFailed"
+	reasonStoreTerminating          = "StoreTerminating"
+	reasonDownloadTokenInvalid      = "DownloadTokenInvalid"
+	reasonInvalidRuntimeVersion     = "InvalidRuntimeVersion"
+	reasonRuntimeVersionUnsupported = "RuntimeVersionUnsupported"
+	reasonRolloutQueued             = "RolloutQueued"
+	reasonRuntimeUpdateAvailable    = "RuntimeUpdateAvailable"
+	reasonAPIKeyInvalid             = "APIKeyInvalid"
+	reasonStabilizing               = "Stabilizing"
+	reasonStabilized                = "Stabilized"
+	reasonPostPromotionUnhealthy    = "PostPromotionUnhealthy"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a
@@ -361,13 +362,18 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 3. Compute the revision and candidate identity.
 	stable := dm.Status.StableRevision
-	// Validate an explicit spec.runtimeVersion against the engine floor (CEL
-	// rejects malformed strings; this catches a too-old version). An invalid
-	// version is Degraded and changes no workloads.
-	if err := validateRuntimeVersion(dm.Spec.RuntimeVersion); err != nil {
-		return r.degradeSecretReason(ctx, &dm, reasonInvalidRuntimeVersion, err)
+	// Validate an explicit spec.runtimeVersion against the engine (CEL rejects
+	// malformed strings; this catches a too-old version or an engine that cannot
+	// pin versions). An invalid/unsupported version is Degraded and changes no
+	// workloads.
+	if err := validateRuntimeVersion(eng, dm.Spec.RuntimeVersion); err != nil {
+		reason := reasonInvalidRuntimeVersion
+		if errors.Is(err, errRuntimeVersionUnsupported) {
+			reason = reasonRuntimeVersionUnsupported
+		}
+		return r.degradeSecretReason(ctx, &dm, reason, err)
 	}
-	effVer := r.effectiveRuntimeVersion(&dm, stable)
+	effVer := r.effectiveRuntimeVersion(eng, &dm, stable)
 	image := servingImage(eng, r.paramsForVersion(&dm, digest, "", "", effVer))
 	rev := RevisionHash(dm.Spec, digest, image)
 	params := r.paramsForVersion(&dm, digest, image, rev, effVer)
@@ -380,7 +386,7 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Record the model-affecting render inputs so the stable revision is later
 		// rendered from its own state, not a (possibly newer) spec.
 		Image:          image,
-		RuntimeVersion: recordedCandidateRuntimeVersion(&dm, effVer),
+		RuntimeVersion: recordedCandidateRuntimeVersion(eng, &dm, effVer),
 		Resources:      dm.Spec.Resources,
 		Placement:      placementRecord(dm.Spec.Scheduling),
 	}
@@ -395,7 +401,7 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Surface whether a newer engine runtime default exists than the version this
 	// DecisionModel runs (informational; never blocks serving). An explicit
 	// spec.runtimeVersion or spec.image opts out of the nudge.
-	r.reconcileRuntimeUpdate(ctx, &dm, stable, candidate)
+	r.reconcileRuntimeUpdate(ctx, eng, &dm, stable, candidate)
 
 	// Cancel any evaluations running for a revision of this DM that is neither the
 	// current candidate nor the current stable (e.g. after a spec/model change).

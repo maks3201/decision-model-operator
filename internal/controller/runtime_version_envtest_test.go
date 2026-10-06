@@ -183,7 +183,7 @@ var _ = Describe("runtime version and rollout budget", func() {
 		cond := meta_Find(getDM("behind"), decisionmodelv1alpha1.ConditionRuntimeUpdateAvailable)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-		Expect(cond.Message).To(ContainSubstring(defaultRuntimeVersion()))
+		Expect(cond.Message).To(ContainSubstring(fakeDefaultRuntimeVersion))
 	})
 
 	// Pinned policy: a DM with no spec.runtimeVersion records the engine default on
@@ -194,7 +194,7 @@ var _ = Describe("runtime version and rollout budget", func() {
 		createDM("reuse", nil) // no spec.runtimeVersion -> follows policy
 		rev := RevisionHash(getDM("reuse").Spec, defaultDigest, fakeImage)
 		driveReady(r, "reuse", rev)
-		Expect(getDM("reuse").Status.StableRevision.RuntimeVersion).To(Equal(defaultRuntimeVersion()))
+		Expect(getDM("reuse").Status.StableRevision.RuntimeVersion).To(Equal(fakeDefaultRuntimeVersion))
 
 		// Change the model: under Pinned the candidate reuses the stable's recorded
 		// version (the engine default at promotion time), not a re-resolved default.
@@ -206,7 +206,7 @@ var _ = Describe("runtime version and rollout budget", func() {
 		rec(r, "reuse")
 		cand := getDM("reuse").Status.CandidateRevision
 		Expect(cand).NotTo(BeNil())
-		Expect(cand.RuntimeVersion).To(Equal(defaultRuntimeVersion()))
+		Expect(cand.RuntimeVersion).To(Equal(fakeDefaultRuntimeVersion))
 	})
 
 	// Fleet budget: with max 1 concurrent rollout, a second fresh candidate waits
@@ -245,4 +245,116 @@ var _ = Describe("runtime version and rollout budget", func() {
 		Expect(getDM("u1").Status.CandidateRevision).NotTo(BeNil())
 		Expect(getDM("u2").Status.CandidateRevision).NotTo(BeNil())
 	})
+
+	// newRv builds a reconciler whose engine advertises a specific default runtime
+	// version (empty = the baseline default), to simulate an operator upgrade that
+	// ships a newer default on a fresh build/restart.
+	newRv := func(policy, defaultVersion string) *DecisionModelReconciler {
+		r := newR(policy, 0)
+		r.Engines["ollaya"] = &fakeEngine{digest: defaultDigest, defaultVersion: defaultVersion}
+		return r
+	}
+
+	// The core promise: an operator upgrade that bumps the default runtime
+	// image does NOT start a rollout under Pinned; it only surfaces the update.
+	It("Pinned: an engine default bump starts no rollout and surfaces RuntimeUpdateAvailable", func() {
+		r := newRv(RuntimeVersionPinned, "") // baseline default 0.10.0
+		createDM("up-pin", nil)
+		rev := RevisionHash(getDM("up-pin").Spec, defaultDigest, fakeImage)
+		driveReady(r, "up-pin", rev)
+		Expect(getDM("up-pin").Status.StableRevision.RuntimeVersion).To(Equal(fakeDefaultRuntimeVersion))
+
+		// Operator upgrade: a fresh reconciler whose engine default is newer.
+		r2 := newRv(RuntimeVersionPinned, "0.11.0")
+		for i := 0; i < 3; i++ {
+			Expect(rec(r2, "up-pin")).To(Equal(decisionmodelv1alpha1.PhaseReady))
+		}
+		dm := getDM("up-pin")
+		Expect(dm.Status.CandidateRevision).To(BeNil(), "no rollout on an operator default bump under Pinned")
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev), "revision hash unchanged")
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "up-pin-" + rev}, dep)).To(Succeed())
+		Expect(dep.Spec.Template.Spec.Containers[0].Image).To(Equal(fakeImage), "Deployment template unchanged")
+		cond := meta_Find(dm, decisionmodelv1alpha1.ConditionRuntimeUpdateAvailable)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Message).To(ContainSubstring("0.11.0"))
+	})
+
+	// Under FollowOperator the same bump rolls the DecisionModel exactly once.
+	It("FollowOperator: an engine default bump starts exactly one candidate", func() {
+		r := newRv(RuntimeVersionFollowOperator, "")
+		createDM("up-follow", nil)
+		rev := RevisionHash(getDM("up-follow").Spec, defaultDigest, fakeImage)
+		driveReady(r, "up-follow", rev)
+
+		r2 := newRv(RuntimeVersionFollowOperator, "0.11.0")
+		rec(r2, "up-follow")
+		cand := getDM("up-follow").Status.CandidateRevision
+		Expect(cand).NotTo(BeNil(), "FollowOperator rolls onto the new default")
+		newRev := RevisionHash(getDM("up-follow").Spec, defaultDigest, "ghcr.io/ollaya-dev/ollaya:0.11.0")
+		Expect(cand.Hash).To(Equal(newRev))
+		Expect(cand.RuntimeVersion).To(Equal("0.11.0"))
+		// Steady state: no second candidate churned.
+		stable := getDM("up-follow").Status.StableRevision.Hash
+		for i := 0; i < 3; i++ {
+			rec(r2, "up-follow")
+		}
+		Expect(getDM("up-follow").Status.CandidateRevision.Hash).To(Equal(newRev), "exactly one candidate")
+		Expect(getDM("up-follow").Status.StableRevision.Hash).To(Equal(stable))
+	})
+
+	// A pre-change stable (no runtimeVersion in status, a default image recorded)
+	// must not roll under Pinned when the engine default bumps.
+	It("Pinned: a pre-existing stable without a recorded runtimeVersion does not roll", func() {
+		r := newRv(RuntimeVersionPinned, "")
+		createDM("up-legacy", nil)
+		rev := RevisionHash(getDM("up-legacy").Spec, defaultDigest, fakeImage)
+		driveReady(r, "up-legacy", rev)
+		// Simulate a stable recorded by an older operator: clear the version field,
+		// leaving only the default image recorded.
+		Expect(updateDMStatus(ctx, namespace, "up-legacy", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Status.StableRevision.RuntimeVersion = ""
+		})).To(Succeed())
+
+		r2 := newRv(RuntimeVersionPinned, "0.11.0")
+		for i := 0; i < 3; i++ {
+			Expect(rec(r2, "up-legacy")).To(Equal(decisionmodelv1alpha1.PhaseReady))
+		}
+		Expect(getDM("up-legacy").Status.CandidateRevision).To(BeNil(),
+			"a legacy stable's runtime version is derived from its image and pinned")
+		Expect(getDM("up-legacy").Status.StableRevision.Hash).To(Equal(rev))
+	})
+
+	// Without the RuntimeVersioner capability a set spec.runtimeVersion is Degraded.
+	It("engine without the capability: runtimeVersion is RuntimeVersionUnsupported", func() {
+		r := newR(RuntimeVersionPinned, 0)
+		r.Engines["ollaya"] = newNoRuntimeVersionEngine()
+		createDM("no-cap", func(s *decisionmodelv1alpha1.DecisionModelSpec) { s.RuntimeVersion = "0.10.0" })
+		rec(r, "no-cap")
+		dm := getDM("no-cap")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded))
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionReady).Reason).To(Equal(reasonRuntimeVersionUnsupported))
+	})
 })
+
+// noRuntimeVersionEngine wraps a fakeEngine but hides the RuntimeVersioner
+// capability. It embeds the engine.Engine *interface* (so RuntimeVersioner's
+// concrete methods are not promoted) and re-adds RegistryHost + CanonicalName so
+// the controller still passes the registry/name guards and reaches the
+// runtime-version validation with an engine that cannot pin versions.
+type noRuntimeVersionEngine struct {
+	engine.Engine
+	f *fakeEngine
+}
+
+func newNoRuntimeVersionEngine() noRuntimeVersionEngine {
+	f := newFakeEngine()
+	return noRuntimeVersionEngine{Engine: f, f: f}
+}
+func (e noRuntimeVersionEngine) RegistryHost(name string) (string, bool, error) {
+	return e.f.RegistryHost(name)
+}
+func (e noRuntimeVersionEngine) CanonicalName(name string) (string, error) {
+	return e.f.CanonicalName(name)
+}
