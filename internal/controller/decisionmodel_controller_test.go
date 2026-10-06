@@ -184,6 +184,21 @@ func (f *fakeEngine) RuntimeVersionFromImage(image string) string {
 	return tag
 }
 
+// ClassifyPrefetchFailure implements engine.PrefetchFailureClassifier: it maps a
+// failed prefetch Pod's termination message to a classified reason, mirroring the
+// real engine's classes. ModelNotFound and DigestMismatch are permanent; anything
+// else (including an unrecognised message) is Transient.
+func (f *fakeEngine) ClassifyPrefetchFailure(terminationMessage string, _ int32) (string, bool) {
+	switch {
+	case strings.Contains(terminationMessage, "ModelNotFound"):
+		return "ModelNotFound", true
+	case strings.Contains(terminationMessage, "DigestMismatch"):
+		return "DigestMismatch", true
+	default:
+		return "Transient", false
+	}
+}
+
 func parseFakeVersion(v string) ([3]int, bool) {
 	var out [3]int
 	parts := strings.SplitN(v, ".", 3)
