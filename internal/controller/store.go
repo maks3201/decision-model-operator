@@ -864,7 +864,7 @@ func (r *DecisionModelReconciler) ensurePrefetchJob(
 
 	// Prefetch only needs to pull weights, never to run inference, so it must not
 	// use the resolved serving image. For device: cuda that image is the ~1.7 GB
-	// :0.7.3-cuda tag, which forces the prefetch Pod onto a CUDA-capable node and
+	// :<version>-cuda tag, which forces the prefetch Pod onto a CUDA-capable node and
 	// adds a long pull (seen on EKS). Pass only the user's explicit spec.image
 	// override; with none, the engine picks its CPU default. The
 	// serving Deployment still renders from the resolved image in params.

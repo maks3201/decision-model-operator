@@ -420,6 +420,11 @@ func podConditionHasStatus(pod *corev1.Pod, status corev1.ConditionStatus) bool 
 // opt-in label (confused-deputy guard).
 var errSecretNotAllowed = errors.New("secret not allowed")
 
+// errDownloadTokenInvalid is returned when the download-token Secret exists and
+// is labelled but is missing the referenced key, so the prefetch Job cannot
+// start.
+var errDownloadTokenInvalid = errors.New("download token invalid")
+
 // errResourceConflict reports that an object with the name this DM wants to
 // manage exists but is NOT controlled by this DM (different/absent controller
 // owner UID). The reconciler must never update or delete such an object; it
@@ -464,6 +469,15 @@ func setStatusCondition(dm *decisionmodelv1alpha1.DecisionModel, cond metav1.Con
 func requireAPIKeyLabel(labels map[string]string) error {
 	if labels[decisionmodelv1alpha1.LabelAPIKey] != annotationTrue {
 		return fmt.Errorf("%w: missing label %s=true", errSecretNotAllowed, decisionmodelv1alpha1.LabelAPIKey)
+	}
+	return nil
+}
+
+// requireDownloadTokenLabel returns errSecretNotAllowed unless the Secret carries
+// the decisionmodel.io/download-token=true label.
+func requireDownloadTokenLabel(labels map[string]string) error {
+	if labels[decisionmodelv1alpha1.LabelDownloadToken] != annotationTrue {
+		return fmt.Errorf("%w: missing label %s=true", errSecretNotAllowed, decisionmodelv1alpha1.LabelDownloadToken)
 	}
 	return nil
 }

@@ -106,3 +106,12 @@ func TestSecretAPIKeyLabel(t *testing.T) {
 		t.Fatal("unlabelled secret should be rejected")
 	}
 }
+
+func TestSecretDownloadTokenLabel(t *testing.T) {
+	if err := requireDownloadTokenLabel(map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"}); err != nil {
+		t.Fatalf("labelled secret rejected: %v", err)
+	}
+	if err := requireDownloadTokenLabel(nil); err == nil {
+		t.Fatal("unlabelled secret should be rejected")
+	}
+}

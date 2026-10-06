@@ -144,6 +144,18 @@ type CacheSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(m, m != 'ReadOnlyMany')",message="ReadOnlyMany is not allowed: the prefetch Job writes the model store"
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// DownloadTokenSecretRef references a Secret key holding a credential for
+	// weight downloads (e.g. a Hugging Face token for private or gated repositories,
+	// or a mirror). It is injected into the prefetch Job only, never into serving
+	// Pods. The Secret must carry the label decisionmodel.io/download-token: "true"
+	// (opt-in guard), or the operator reports Degraded (SecretNotAllowed) and does
+	// not create a prefetch Job. The optional field is not supported: when a ref is
+	// set the Secret must exist and contain the referenced key, or the operator
+	// reports Degraded (DownloadTokenInvalid).
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Download Token Secret",xDescriptors={"urn:alm:descriptor:io.kubernetes:Secret"}
+	// +optional
+	DownloadTokenSecretRef *corev1.SecretKeySelector `json:"downloadTokenSecretRef,omitempty"`
 }
 
 // AuthSpec configures the engine API key.

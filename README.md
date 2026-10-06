@@ -52,7 +52,8 @@ for the full design.
 
 - Kubernetes **1.29+**
 - A default StorageClass with `ReadWriteOnce` (`ReadWriteMany` for `replicas > 1` across nodes)
-- Egress from the cluster to `https://ollaya.dev`, or an [internal mirror](docs/quickstart.md)
+- Egress from the prefetch Job to `https://ollaya.dev` (manifests) and `https://huggingface.co` plus the
+  Hugging Face CDN it redirects to (`*.hf.co`, weights), or [internal mirrors](docs/quickstart.md) for both
 - For `device: cuda`: amd64 nodes with the NVIDIA device plugin
 
 ## Installation

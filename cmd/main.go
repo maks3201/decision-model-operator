@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,36 @@ func warnSkippedProxyEnv(info func(msg string, keysAndValues ...any), skipped []
 		"variables", skipped)
 }
 
+// validateHFEndpoint checks that the Hugging Face endpoint URL is well-formed,
+// absolute with a host, has no userinfo/query/fragment, and is https (or http
+// when allowInsecure is true). Called at startup so a bad flag fails early.
+func validateHFEndpoint(raw string, allowInsecure bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("cannot parse URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("must be an absolute URL with a host (got %q)", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("must not contain credentials (userinfo); use the download-token Secret")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("must not contain a query or fragment")
+	}
+	switch u.Scheme {
+	case "https":
+		// ok
+	case "http":
+		if !allowInsecure {
+			return fmt.Errorf("http:// requires --allow-insecure-registries")
+		}
+	default:
+		return fmt.Errorf("unsupported scheme %q (only https or http)", u.Scheme)
+	}
+	return nil
+}
+
 // watchNamespacesCacheDefaults builds the cache.Options.DefaultNamespaces map
 // for the given watched namespaces. It returns nil when the set is empty, which
 // leaves the manager cache cluster-wide (the default). Extracted for testing.
@@ -162,6 +193,10 @@ func main() {
 	flag.StringVar(&ollayaRegistry, "ollaya-registry", "",
 		"Base URL of the Ollaya model registry. If unset, OLLAYA_REGISTRY is used, "+
 			"otherwise https://ollaya.dev.")
+	var ollayaHFEndpoint string
+	flag.StringVar(&ollayaHFEndpoint, "ollaya-hf-endpoint", "",
+		"Base URL Ollaya downloads model weights from (Hugging Face mirror). If unset, "+
+			"OLLAYA_HF_ENDPOINT is used.")
 	var allowedRegistries string
 	flag.StringVar(&allowedRegistries, "allowed-registries", "ollaya.dev",
 		"Comma-separated registry hosts a model may resolve from.")
@@ -346,9 +381,19 @@ func main() {
 	if ollayaRegistry == "" {
 		ollayaRegistry = os.Getenv("OLLAYA_REGISTRY")
 	}
+	if ollayaHFEndpoint == "" {
+		ollayaHFEndpoint = os.Getenv("OLLAYA_HF_ENDPOINT")
+	}
 	var ollayaOpts []ollaya.Option
 	if ollayaRegistry != "" {
 		ollayaOpts = append(ollayaOpts, ollaya.WithRegistryURL(ollayaRegistry))
+	}
+	if ollayaHFEndpoint != "" {
+		if err := validateHFEndpoint(ollayaHFEndpoint, allowInsecureRegistries); err != nil {
+			setupLog.Error(err, "invalid --ollaya-hf-endpoint")
+			os.Exit(1)
+		}
+		ollayaOpts = append(ollayaOpts, ollaya.WithHFEndpoint(ollayaHFEndpoint))
 	}
 
 	signalCtx := ctrl.SetupSignalHandler()

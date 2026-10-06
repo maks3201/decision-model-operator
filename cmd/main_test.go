@@ -85,6 +85,45 @@ func TestWatchNamespacesCacheDefaults(t *testing.T) {
 	}
 }
 
+func TestValidateHFEndpoint(t *testing.T) {
+	tests := []struct {
+		name          string
+		raw           string
+		allowInsecure bool
+		wantErr       bool
+	}{
+		{name: "valid https", raw: "https://hf-mirror.example.com"},
+		{name: "valid https with path", raw: "https://mirror.example.com/models"},
+		{name: "valid https with port", raw: "https://mirror.example.com:8443"},
+		{name: "http rejected by default", raw: "http://mirror.example.com", wantErr: true},
+		{name: "http allowed with insecure flag", raw: "http://mirror.example.com", allowInsecure: true},
+		{name: "empty rejected", raw: "", wantErr: true},
+		{name: "not a URL rejected", raw: "::::", wantErr: true},
+		{name: "relative rejected", raw: "mirror.example.com/models", wantErr: true},
+		{name: "no host rejected", raw: "https://", wantErr: true},
+		{name: "userinfo rejected", raw: "https://user:pass@mirror.example.com", wantErr: true},
+		{
+			name: "userinfo rejected even with insecure", raw: "http://user@mirror.example.com",
+			allowInsecure: true, wantErr: true,
+		},
+		{name: "query rejected", raw: "https://mirror.example.com/?token=x", wantErr: true},
+		{name: "fragment rejected", raw: "https://mirror.example.com/#frag", wantErr: true},
+		{name: "ftp scheme rejected", raw: "ftp://mirror.example.com", wantErr: true},
+		{name: "scheme-only rejected", raw: "https:///models", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHFEndpoint(tt.raw, tt.allowInsecure)
+			if tt.wantErr && err == nil {
+				t.Fatalf("validateHFEndpoint(%q, %v) = nil, want error", tt.raw, tt.allowInsecure)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateHFEndpoint(%q, %v) unexpected error: %v", tt.raw, tt.allowInsecure, err)
+			}
+		})
+	}
+}
+
 func TestWarnSkippedProxyEnv(t *testing.T) {
 	type call struct {
 		msg string

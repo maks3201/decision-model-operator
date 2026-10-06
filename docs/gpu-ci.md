@@ -54,9 +54,16 @@ a kind node [[3]](#refs). Two established options:
   plugin" steps with `nvkind cluster create` and its device-plugin install. It is
   the cleaner path when a runner has multiple GPUs.
 
-The operator selects the CUDA runtime image (`ghcr.io/ollaya-dev/ollaya:0.7.3-cuda`)
+The operator selects the CUDA runtime image (`ghcr.io/ollaya-dev/ollaya:0.10.0-cuda`)
 automatically from `device: cuda` (see the engine `imageFor`), so the workflow
 only needs to **load that image into kind** and set `E2E_DEVICE=cuda`.
+
+> **Pascal / Volta GPUs (compute capability < 7.5):** the default `:0.10.0-cuda`
+> image targets newer CUDA runtimes. On older cards (e.g. GTX 10-series Pascal, or
+> some Volta setups) use the `:0.10.0-cuda12` image instead, set explicitly via
+> `spec.image` with the operator run with `--allow-image-override`. The operator
+> does **not** pick the `-cuda12` variant automatically — there is no device-level
+> GPU-architecture detection; choose it yourself when your GPU needs it.
 
 ## 3. Register the runner (private repo)
 

@@ -119,6 +119,7 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | manager.allowImageOverride | bool | `false` | `--allow-image-override`: permit `spec.image` to override the engine default image (lets DM editors run arbitrary images; keep false in multi-tenant). |
 | manager.maxConcurrentReconciles | int | `4` | `--max-concurrent-reconciles`: max DecisionModels reconciled concurrently. |
 | manager.ollayaRegistry | string | `""` | `--ollaya-registry`: default registry base URL for host-less model names. Empty = the operator default (`OLLAYA_REGISTRY` env, else `https://ollaya.dev`); not rendered when empty. |
+| manager.ollayaHFEndpoint | string | `""` | `--ollaya-hf-endpoint`: base URL for model-weight downloads (a Hugging Face mirror or enterprise endpoint; the model registry still serves manifests). Empty = the runtime default (`OLLAYA_HF_ENDPOINT` env, else Hugging Face); not rendered when empty. Needs the 0.10.0+ runtime; older runtimes ignore it. |
 | watchNamespaces | list | `[]` | Namespaces to watch (`--watch-namespaces`). Empty = cluster-wide (manager ClusterRole/ClusterRoleBinding). When non-empty, the operator watches only these namespaces and the chart renders a namespaced Role+RoleBinding in each instead of the ClusterRole. The CRD stays cluster-scoped and must be installed by a cluster admin. |
 | proxy.httpProxy | string | `""` | `HTTP_PROXY` for the manager (and, via the operator, the prefetch Job). Empty = not set. |
 | proxy.httpsProxy | string | `""` | `HTTPS_PROXY` for the manager (and the prefetch Job). Empty = not set. |

@@ -809,3 +809,105 @@ func TestPruneKeepList(t *testing.T) {
 		})
 	}
 }
+
+// downloadTokenRef is a sample Secret reference for the weight-download token.
+func downloadTokenRef() *corev1.SecretKeySelector {
+	return &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "hf-token"},
+		Key:                  "token",
+	}
+}
+
+// TestPrefetchJobSpecHFEndpoint checks that a configured weight-download
+// endpoint is passed to the prefetch Job as OLLAYA_HF_ENDPOINT, and that an
+// unset endpoint renders no such env (byte-identical to today).
+func TestPrefetchJobSpecHFEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string // "" -> no WithHFEndpoint
+		wantEnv  string // "" -> OLLAYA_HF_ENDPOINT must be absent
+	}{
+		{name: "unset has no OLLAYA_HF_ENDPOINT", endpoint: "", wantEnv: ""},
+		{name: "mirror sets OLLAYA_HF_ENDPOINT", endpoint: "https://hf-mirror.internal", wantEnv: "https://hf-mirror.internal"},
+		{name: "trailing slash trimmed", endpoint: "https://hf-mirror.internal/", wantEnv: "https://hf-mirror.internal"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var e *Engine
+			if tt.endpoint == "" {
+				e = New()
+			} else {
+				e = New(WithHFEndpoint(tt.endpoint))
+			}
+			c := e.PrefetchJobSpec(baseParams()).Template.Spec.Containers[0]
+			got, ok := envMap(c.Env)["OLLAYA_HF_ENDPOINT"]
+			if tt.wantEnv == "" {
+				if ok {
+					t.Errorf("OLLAYA_HF_ENDPOINT must be absent for %q, got %q", tt.endpoint, got.Value)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("OLLAYA_HF_ENDPOINT must be present for %q", tt.endpoint)
+			}
+			if got.Value != tt.wantEnv {
+				t.Errorf("OLLAYA_HF_ENDPOINT = %q, want %q", got.Value, tt.wantEnv)
+			}
+		})
+	}
+}
+
+// TestPrefetchJobSpecDownloadToken checks that a download-token Secret ref is
+// injected into the prefetch Job as OLLAYA_HF_TOKEN (via secretKeyRef,
+// optional:false), and is absent when no token is set.
+func TestPrefetchJobSpecDownloadToken(t *testing.T) {
+	t.Run("token set", func(t *testing.T) {
+		p := baseParams()
+		p.DownloadToken = downloadTokenRef()
+		c := New().PrefetchJobSpec(p).Template.Spec.Containers[0]
+		tok, ok := envMap(c.Env)["OLLAYA_HF_TOKEN"]
+		if !ok || tok.ValueFrom == nil || tok.ValueFrom.SecretKeyRef == nil {
+			t.Fatalf("OLLAYA_HF_TOKEN must be sourced from a secretKeyRef, got %+v", tok)
+		}
+		ref := tok.ValueFrom.SecretKeyRef
+		if ref.Name != "hf-token" || ref.Key != "token" {
+			t.Errorf("secretKeyRef = %s/%s, want hf-token/token", ref.Name, ref.Key)
+		}
+		if ref.Optional == nil || *ref.Optional {
+			t.Errorf("OLLAYA_HF_TOKEN secretKeyRef must be optional:false, got %v", ref.Optional)
+		}
+	})
+	t.Run("token unset", func(t *testing.T) {
+		c := New().PrefetchJobSpec(baseParams()).Template.Spec.Containers[0]
+		if _, ok := envMap(c.Env)["OLLAYA_HF_TOKEN"]; ok {
+			t.Errorf("OLLAYA_HF_TOKEN must be absent when DownloadToken is nil")
+		}
+	})
+}
+
+// TestServingPodNeverHasDownloadVars pins that the weight-download endpoint and
+// token never reach serving Pods: those Pods mount the store read-only and
+// never download, so leaking either would be both useless and a wider exposure
+// of the token than necessary.
+func TestServingPodNeverHasDownloadVars(t *testing.T) {
+	p := baseParams()
+	p.DownloadToken = downloadTokenRef()
+	e := New(WithHFEndpoint("https://hf-mirror.internal"))
+	c := e.ServingPodSpec(p).Containers[0]
+	for _, name := range []string{"OLLAYA_HF_ENDPOINT", "OLLAYA_HF_TOKEN"} {
+		if _, ok := envMap(c.Env)[name]; ok {
+			t.Errorf("serving Pod must not have %s", name)
+		}
+	}
+}
+
+// TestPrefetchDefaultNoDownloadVars pins the byte-identical default: with no HF
+// endpoint and no token, the prefetch Job carries neither variable.
+func TestPrefetchDefaultNoDownloadVars(t *testing.T) {
+	c := New().PrefetchJobSpec(baseParams()).Template.Spec.Containers[0]
+	for _, ev := range c.Env {
+		if ev.Name == "OLLAYA_HF_ENDPOINT" || ev.Name == "OLLAYA_HF_TOKEN" {
+			t.Fatalf("default prefetch Job must not set %s", ev.Name)
+		}
+	}
+}

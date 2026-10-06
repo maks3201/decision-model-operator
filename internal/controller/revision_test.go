@@ -56,7 +56,7 @@ func baseSpec() decisionmodelv1alpha1.DecisionModelSpec {
 func TestRevisionHash(t *testing.T) {
 	const (
 		digest = "ab00000000000000000000000000000000000000000000000000000000000000"
-		image  = "ghcr.io/ollaya-dev/ollaya:v0.7.3"
+		image  = "ghcr.io/ollaya-dev/ollaya:0.10.0"
 	)
 
 	baseline := RevisionHash(baseSpec(), digest, image)
@@ -230,7 +230,7 @@ func TestRevisionHashNoSchedulingIsBackwardCompatible(t *testing.T) {
 	}
 	const (
 		digest = "ab00000000000000000000000000000000000000000000000000000000000000"
-		image  = "ghcr.io/ollaya-dev/ollaya:v0.7.3"
+		image  = "ghcr.io/ollaya-dev/ollaya:0.10.0"
 	)
 	previous := func(s decisionmodelv1alpha1.DecisionModelSpec) string {
 		b, err := json.Marshal(previousInputs{s.Engine, s.Model, digest, s.Device, image, s.Resources})

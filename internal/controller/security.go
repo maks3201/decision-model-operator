@@ -159,6 +159,41 @@ func (r *DecisionModelReconciler) apiKey(ctx context.Context, dm *decisionmodelv
 	return string(secret.Data[ref.Key]), nil
 }
 
+// validateDownloadToken checks the download-token Secret referenced by
+// spec.cache.downloadTokenSecretRef (if any): it must exist, carry the
+// decisionmodel.io/download-token=true opt-in label, and contain the referenced
+// key. optional is not supported: the engine renders optional=false on the Job
+// env var, so a missing Secret always fails the Job. Returns
+// errSecretNotAllowed on a missing label and errDownloadTokenInvalid on a
+// missing key. The token value is not read here: the engine injects it into the
+// prefetch Job from the Secret ref.
+func (r *DecisionModelReconciler) validateDownloadToken(
+	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel,
+) error {
+	if dm.Spec.Cache == nil || dm.Spec.Cache.DownloadTokenSecretRef == nil {
+		return nil
+	}
+	ref := dm.Spec.Cache.DownloadTokenSecretRef
+	rdr, err := r.reader()
+	if err != nil {
+		return err
+	}
+	var secret corev1.Secret
+	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
+		// optional is not supported; treat a missing Secret the same as a missing
+		// label so the operator never creates a Job that cannot start.
+		return err
+	}
+	if err := requireDownloadTokenLabel(secret.Labels); err != nil {
+		return err
+	}
+	if _, ok := secret.Data[ref.Key]; !ok {
+		return fmt.Errorf("%w: Secret %s/%s has no key %q",
+			errDownloadTokenInvalid, dm.Namespace, ref.Name, ref.Key)
+	}
+	return nil
+}
+
 // reader returns the uncached APIReader for Secrets/ConfigMaps. It is a hard
 // error to use it unset: the manager must inject mgr.GetAPIReader() so the
 // operator never starts cluster-wide Secret/ConfigMap informers.
