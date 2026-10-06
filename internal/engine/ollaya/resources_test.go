@@ -90,6 +90,20 @@ func TestApplyModelDefaults(t *testing.T) {
 			wantMem: "2560Mi",
 		},
 		{
+			name:    "known jevk5:latest CPU (GGUF) fills measured anon",
+			model:   "jevk5:latest",
+			device:  engine.DeviceCPU,
+			wantCPU: "1",
+			wantMem: "5Gi",
+		},
+		{
+			name:    "known jevk5:latest CUDA: cpu only, memory unset",
+			model:   "jevk5:latest",
+			device:  engine.DeviceCUDA,
+			wantCPU: "1",
+			wantMem: "",
+		},
+		{
 			name:    "known laya:en CUDA: cpu only, memory unset (unmeasured)",
 			model:   "laya:en",
 			device:  engine.DeviceCUDA,
