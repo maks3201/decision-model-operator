@@ -63,7 +63,7 @@ for the full design.
 <!-- x-release-please-start-version -->
 ```sh
 helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
-  --version 0.2.1 \
+  --version 0.3.0 \
   --namespace decision-model-operator-system --create-namespace
 ```
 <!-- x-release-please-end -->
@@ -75,7 +75,7 @@ and on [Artifact Hub](https://artifacthub.io/packages/search?repo=decision-model
 
 <!-- x-release-please-start-version -->
 ```sh
-kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.2.1/install.yaml
+kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.3.0/install.yaml
 ```
 <!-- x-release-please-end -->
 
@@ -93,15 +93,15 @@ the release files (`gh attestation verify`):
 ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
 ISSUER=https://token.actions.githubusercontent.com
 
-cosign verify ghcr.io/maks3201/decision-model-operator:v0.2.1 \
+cosign verify ghcr.io/maks3201/decision-model-operator:v0.3.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
-cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.2.1 \
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.3.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance
 
-docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.2.1 --format '{{json .SBOM}}'
+docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.3.0 --format '{{json .SBOM}}'
 ```
 <!-- x-release-please-end -->
 
