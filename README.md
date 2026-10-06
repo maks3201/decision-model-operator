@@ -1,3 +1,5 @@
+<img src="docs/assets/logo.png" alt="" width="96" align="right">
+
 # decision-model-operator
 
 [![Tests](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml)

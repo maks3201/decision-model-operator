@@ -15,7 +15,7 @@ for the DecisionModel CRD and a quickstart.
 
 | Name | Email | Url |
 | ---- | ------ | --- |
-| maks3201 |  | <https://github.com/maks3201> |
+| maks3201 | <eumaxpl@gmail.com> | <https://github.com/maks3201> |
 
 ## Source Code
 
