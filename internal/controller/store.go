@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -322,6 +323,14 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	// A failed recovery prefetch: count it once per Job UID, then delete and
 	// requeue (recreate next reconcile). Past the bound, give up.
 	if st.jobFailedNow {
+		// A permanent failure (e.g. the tag does not exist, or the pulled digest
+		// does not match) cannot be fixed by retrying: give up at once without
+		// burning the bounded attempts, Degraded with the classified reason.
+		if permanent, detail := r.prefetchFailureReason(ctx, dm, eng, stable.Hash); permanent {
+			r.degradeStorePrefetchReason(ctx, dm, claim, detail)
+			res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+			return res, ferr
+		}
 		if r.countFailedRecovery(dm.UID, st.job.UID) {
 			r.degradeStorePrefetchFailed(ctx, dm, claim)
 			// Stop churning: slow requeue, no further counting or writes.
@@ -442,6 +451,34 @@ func (r *DecisionModelReconciler) degradeStorePrefetchFailed(
 	already := meta.IsStatusConditionPresentAndEqual(dm.Status.Conditions,
 		decisionmodelv1alpha1.ConditionDegraded, metav1.ConditionTrue) &&
 		meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded).Reason == reasonStorePrefetchFailed
+	if already {
+		return
+	}
+	r.event(ctx, dm, corev1.EventTypeWarning, eventStorePrefetchFail, "%s", msg)
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reasonStorePrefetchFailed,
+		Message: msg,
+	})
+}
+
+// degradeStorePrefetchReason marks a lost-store recovery as failed by a
+// permanent prefetch error (e.g. the tag does not exist, or the pulled digest
+// does not match) — given up at once, not after maxStoreRecoverAttempts. The
+// condition reason stays StorePrefetchFailed (API); the classified reason and
+// detail go in the message.
+func (r *DecisionModelReconciler) degradeStorePrefetchReason(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	claim, detail string,
+) {
+	msg := fmt.Sprintf("stable store %q recovery failed permanently: %s (manual intervention required)",
+		claim, detail)
+	already := meta.IsStatusConditionPresentAndEqual(dm.Status.Conditions,
+		decisionmodelv1alpha1.ConditionDegraded, metav1.ConditionTrue) &&
+		meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded).Reason == reasonStorePrefetchFailed &&
+		meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded).Message == msg
 	if already {
 		return
 	}
@@ -879,6 +916,19 @@ func (r *DecisionModelReconciler) ensurePrefetchJob(
 		},
 		Spec: eng.PrefetchJobSpec(prefetchParams),
 	}
+	// Label the prefetch Pods for the operator's name-scoped Pod cache (LabelName)
+	// so a failed prefetch's termination message can be read to classify the
+	// failure, plus a dedicated prefetch-revision label the newest-failed lookup
+	// keys on. We deliberately do NOT set LabelRevision here: that is the selector
+	// of the revision's Service/PDB/Deployment, so a prefetch Pod carrying it
+	// would be picked up as a (probe-less, so Ready) Service endpoint with nothing
+	// listening and would count against the PDB. The Job adds its own
+	// controller-uid/job-name labels on top; extra template labels are allowed.
+	if job.Spec.Template.Labels == nil {
+		job.Spec.Template.Labels = map[string]string{}
+	}
+	job.Spec.Template.Labels[decisionmodelv1alpha1.LabelName] = dm.Name
+	job.Spec.Template.Labels[decisionmodelv1alpha1.LabelPrefetchRevision] = rev
 	// The prefetch Pod must land where serving Pods may run: on tainted /
 	// dedicated (e.g. GPU) pools, and — with WaitForFirstConsumer storage — it
 	// is the first consumer that pins the PVC's zone.
@@ -899,6 +949,93 @@ func (r *DecisionModelReconciler) ensurePrefetchJob(
 		return false, false, false, err
 	}
 	return true, false, false, nil
+}
+
+// prefetchFailureReason classifies why a revision's prefetch Job failed by
+// reading the newest failed prefetch Pod's terminated container state and asking
+// the engine's PrefetchFailureClassifier capability. It returns whether the
+// failure is permanent (retrying cannot help) and a human-readable detail
+// beginning with the classified reason, for the condition message/Event. detail
+// is "" when nothing could be read (no classifier, no failed Pod/message), so
+// the caller keeps its generic message.
+func (r *DecisionModelReconciler) prefetchFailureReason(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	rev string,
+) (permanent bool, detail string) {
+	classifier, ok := eng.(engine.PrefetchFailureClassifier)
+	if !ok {
+		return false, ""
+	}
+	msg, exit, found := r.newestFailedPrefetchTermination(ctx, dm, rev)
+	if !found {
+		return false, ""
+	}
+	reason, permanent := classifier.ClassifyPrefetchFailure(msg, exit)
+	if reason == "" {
+		return permanent, ""
+	}
+	detail = reason
+	if msg != "" {
+		detail = fmt.Sprintf("%s (%s)", reason, strings.TrimSpace(msg))
+	}
+	return permanent, detail
+}
+
+// newestFailedPrefetchTermination returns the terminated-container message and
+// exit code of the most recently started failed Pod of a revision's prefetch
+// Job. Prefetch Pods carry LabelName + LabelPrefetchRevision (never
+// LabelRevision, which is a serving selector), so they are in the operator's
+// name-scoped Pod cache. found is false when no such Pod/termination is
+// available.
+func (r *DecisionModelReconciler) newestFailedPrefetchTermination(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) (message string, exitCode int32, found bool) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(dm.Namespace),
+		client.MatchingLabels{
+			decisionmodelv1alpha1.LabelName:             dm.Name,
+			decisionmodelv1alpha1.LabelPrefetchRevision: rev,
+		}); err != nil {
+		return "", 0, false
+	}
+	var newest *corev1.Pod
+	var newestStart time.Time
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		// Second guard: only the Job's own Pods (it sets job-name).
+		if p.Labels["job-name"] != prefetchName(dm, rev) {
+			continue
+		}
+		term := terminatedContainer(p)
+		if term == nil {
+			continue
+		}
+		start := p.CreationTimestamp.Time
+		if p.Status.StartTime != nil {
+			start = p.Status.StartTime.Time
+		}
+		if newest == nil || start.After(newestStart) {
+			newest, newestStart = p, start
+		}
+	}
+	if newest == nil {
+		return "", 0, false
+	}
+	t := terminatedContainer(newest)
+	return t.Message, t.ExitCode, true
+}
+
+// terminatedContainer returns the first container's terminated state for a Pod,
+// or nil when its first container has not terminated.
+func terminatedContainer(pod *corev1.Pod) *corev1.ContainerStateTerminated {
+	if len(pod.Status.ContainerStatuses) == 0 {
+		return nil
+	}
+	return pod.Status.ContainerStatuses[0].State.Terminated
 }
 
 // storeAccessModes returns the access modes of the store claim a Deployment

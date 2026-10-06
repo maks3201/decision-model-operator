@@ -897,7 +897,14 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 			"prefetching %q (%s) into store", dm.Spec.Model, digest)
 	}
 	if jobFailed {
-		return r.rollbackOrFail(ctx, dm, candidate, reasonPrefetchFailed, "prefetch Job failed")
+		msg := "prefetch Job failed"
+		if permanent, detail := r.prefetchFailureReason(ctx, dm, eng, rev); detail != "" {
+			msg = "prefetch failed: " + detail
+			if permanent {
+				msg += " (permanent)"
+			}
+		}
+		return r.rollbackOrFail(ctx, dm, candidate, reasonPrefetchFailed, msg)
 	}
 	if !jobDone {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseCaching)

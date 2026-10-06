@@ -67,8 +67,16 @@ const ModelReadyGate = "decisionmodel.io/model-ready"
 const (
 	// LabelName identifies the owning DecisionModel by name.
 	LabelName = "decisionmodel.io/name"
-	// LabelRevision identifies the revision hash of an owned object.
+	// LabelRevision identifies the revision hash of an owned object. It is the
+	// selector of a revision's Service, PDB and Deployment, so it is applied only
+	// to serving Pods — never to a prefetch or other non-serving Pod, which would
+	// otherwise be selected as a Service endpoint with nothing listening.
 	LabelRevision = "decisionmodel.io/revision"
+	// LabelPrefetchRevision identifies the revision whose store a prefetch Pod is
+	// populating. It deliberately differs from LabelRevision so prefetch Pods stay
+	// out of every serving selector while remaining in the operator's
+	// name-scoped Pod cache (via LabelName) for failure classification.
+	LabelPrefetchRevision = "decisionmodel.io/prefetch-revision"
 	// LabelAPIKey must be set to "true" on a Secret before the operator will read
 	// it as the engine API key, guarding against confused-deputy use.
 	LabelAPIKey = "decisionmodel.io/api-key"

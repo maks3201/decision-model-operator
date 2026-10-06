@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -224,6 +225,54 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		}, "3s", "20ms").Should(BeTrue(), "a fresh (incomplete) prefetch replaces the stale Complete Job")
 	})
 
+	// A permanent classified prefetch failure gives up at once, without burning
+	// maxStoreRecoverAttempts, Degraded=StorePrefetchFailed with the reason.
+	It("gives up at once on a permanent prefetch reason", func() {
+		dm := mkDM("perm")
+		stable := stableRev()
+		claim := storeNameRev(dm, stable.Hash)
+		rr := newRec(k8sClient)
+
+		driveToJob(rr, dm, stable, claim)
+		job := getJob(dm)
+		markFailed(job)
+		// A failed prefetch Pod carrying a permanent (DigestMismatch) message.
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: prefetchName(dm, "r1") + "-xyz",
+				Labels: map[string]string{
+					decisionmodelv1alpha1.LabelName:             dm.Name,
+					decisionmodelv1alpha1.LabelPrefetchRevision: "r1",
+					"job-name": prefetchName(dm, "r1"),
+				},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		now := metav1.Now()
+		pod.Status.StartTime = &now
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "prefetch",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, Message: "DigestMismatch: pulled digest differs from the pin",
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		handled, _, res, err := rr.recoverStableStore(ctx, dm, rr.Engines["ollaya"], stable, claim, false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(handled).To(BeTrue())
+		Expect(res.RequeueAfter).To(Equal(regateInterval))
+		Expect(degradedReason(dm)).To(Equal(reasonStorePrefetchFailed))
+		deg := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg.Message).To(ContainSubstring("DigestMismatch"))
+		Expect(deg.Message).To(ContainSubstring("permanently"))
+		// It did NOT burn an attempt: the counter is still at zero (a later
+		// transient failure would still get its full budget).
+		Expect(rr.countFailedRecovery(dm.UID, types.UID("probe"))).To(BeFalse(),
+			"the permanent give-up did not consume the bounded attempts")
+	})
+
 	// The same failed Job UID counts once (idempotent across stale cache reads).
 	It("counts the same failed Job UID only once", func() {
 		dm := mkDM("once")
@@ -320,5 +369,47 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		handled, _, _, err = rr.recoverStableStore(ctx, dm, rr.Engines["ollaya"], stable, claim, false)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(handled).To(BeTrue(), "a stale read of the deleted failed Job never resumes serving")
+	})
+
+	// Safety invariant: a prefetch Pod must never be selected by any serving
+	// selector. The rendered prefetch Job's Pod template must not match the
+	// revision's Service / PDB / Deployment selector (all revisionLabels), and a
+	// Pod created from that template must not satisfy the serving Service's
+	// label selector — otherwise a stable-store recovery prefetch Pod (no
+	// readiness probe, so Ready) would become a Service endpoint with nothing
+	// listening and would count against the PDB.
+	It("renders a prefetch Pod template disjoint from every serving selector", func() {
+		dm := mkDM("disjoint")
+		stable := stableRev()
+		claim := storeNameRev(dm, stable.Hash)
+		rr := newRec(k8sClient)
+
+		driveToJob(rr, dm, stable, claim)
+		tmplLabels := getJob(dm).Spec.Template.Labels
+
+		// The prefetch Pod carries the name-scoped cache label and a dedicated
+		// prefetch-revision label, but never the serving revision label.
+		Expect(tmplLabels).To(HaveKeyWithValue(decisionmodelv1alpha1.LabelName, dm.Name))
+		Expect(tmplLabels).To(HaveKeyWithValue(decisionmodelv1alpha1.LabelPrefetchRevision, stable.Hash))
+		Expect(tmplLabels).NotTo(HaveKey(decisionmodelv1alpha1.LabelRevision))
+
+		// Every serving selector of this revision = revisionLabels; the Service,
+		// PDB and Deployment all use it. A selector matches a Pod only if every
+		// selector key/value is present on the Pod, so the prefetch template must
+		// fail at least one key of the serving selector.
+		servingSelector := revisionLabels(dm, stable.Hash)
+		sel := labels.SelectorFromSet(servingSelector)
+		Expect(sel.Matches(labels.Set(tmplLabels))).To(BeFalse(),
+			"prefetch Pod template must not match the serving selector")
+
+		// And concretely against the running Service: create the serving Service
+		// for this revision and confirm its selector would not pick the prefetch
+		// Pod (envtest has no endpoints controller, so assert selector vs labels).
+		Expect(rr.ensureService(ctx, dm, rr.Engines["ollaya"], stable.Hash)).To(Succeed())
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dm.Name}, svc)).To(Succeed())
+		svcSel := labels.SelectorFromSet(svc.Spec.Selector)
+		Expect(svcSel.Matches(labels.Set(tmplLabels))).To(BeFalse(),
+			"the serving Service must not select the prefetch Pod")
 	})
 })
