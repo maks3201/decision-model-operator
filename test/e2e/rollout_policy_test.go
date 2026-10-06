@@ -146,18 +146,24 @@ spec:
 		}, 30*time.Second, 10*time.Second).Should(Equal("AwaitingPromotion"),
 			"a Manual candidate must not promote itself")
 
-		By("approving by setting decisionmodel.io/promote to the candidate revision hash -> promoted")
-		// The approval value is the candidate revision hash, read from
-		// status.candidateRevision.hash so the test tracks the status contract rather
-		// than hard-coding a token.
+		By("approving by setting decisionmodel.io/promote to the evaluation approvalId -> promoted")
+		// With evaluation configured the approval value is status.evaluation.approvalId
+		// (a bare revision hash is ignored once eval is set); read it from status so the
+		// test tracks the contract rather than hard-coding a token. Fall back to the
+		// candidate revision hash only if approvalId is not yet populated.
+		approval, err := utils.KubectlJSONPath(rolloutNS, "decisionmodel", dm, "{.status.evaluation.approvalId}")
+		Expect(err).NotTo(HaveOccurred())
+		if approval == "" {
+			approval = candHash
+		}
 		_, err = utils.Kubectl("annotate", "decisionmodel", dm, "-n", rolloutNS,
-			"decisionmodel.io/promote="+candHash, "--overwrite")
+			"decisionmodel.io/promote="+approval, "--overwrite")
 		Expect(err).NotTo(HaveOccurred())
 
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(rolloutNS, "decisionmodel", dm, "{.status.phase}")
 		}, 5*time.Minute, 5*time.Second).Should(Equal("Ready"),
-			"candidate should promote once the promote annotation names it")
+			"candidate should promote once the promote annotation names its approvalId")
 		stableNow, err := utils.KubectlJSONPath(rolloutNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stableNow).To(Equal(candHash), "the approved candidate should become the stable revision")
