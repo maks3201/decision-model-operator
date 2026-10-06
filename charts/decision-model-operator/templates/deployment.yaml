@@ -62,6 +62,12 @@ spec:
             {{- with .Values.manager.ollayaHFEndpoint }}
             - --ollaya-hf-endpoint={{ . }}
             {{- end }}
+            {{- with .Values.manager.runtimeVersionPolicy }}
+            - --runtime-version-policy={{ . }}
+            {{- end }}
+            {{- with .Values.manager.maxConcurrentRollouts }}
+            - --max-concurrent-rollouts={{ . }}
+            {{- end }}
             {{- with .Values.watchNamespaces }}
             - --watch-namespaces={{ join "," . }}
             {{- end }}

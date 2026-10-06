@@ -123,6 +123,16 @@
           "type": "string",
           "description": "--ollaya-hf-endpoint: base URL for model-weight downloads. Empty = runtime default. When set, must be an http:// or https:// URL.",
           "pattern": "^$|^https?://"
+        },
+        "runtimeVersionPolicy": {
+          "type": "string",
+          "description": "--runtime-version-policy: how an unset spec.runtimeVersion resolves. Empty = binary default (Pinned).",
+          "enum": ["", "Pinned", "FollowOperator"]
+        },
+        "maxConcurrentRollouts": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "--max-concurrent-rollouts: cap on simultaneous rollouts (0 = unlimited). null/unset = binary default (0)."
         }
       }
     },
