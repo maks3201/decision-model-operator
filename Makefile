@@ -144,6 +144,24 @@ test-e2e: kind-up manifests generate fmt vet ## Run the e2e tests on kind. Leave
 		$(MAKE) kind-down; \
 		exit $$status
 
+##@ Demo
+
+# The eval-gated rollout demo (hack/demo.sh): bring up kind, install the operator,
+# deploy an eval-gated DecisionModel, roll out a weak candidate (rolled back) and a
+# strong candidate (promoted). See examples/demo/README.md.
+
+.PHONY: demo-prepare
+demo-prepare: ## Create the demo kind cluster and install the operator (slow, one-time).
+	./hack/demo.sh prepare
+
+.PHONY: demo
+demo: ## Run the eval-gated rollout demo on kind (runs demo-prepare if needed).
+	./hack/demo.sh all
+
+.PHONY: demo-clean
+demo-clean: ## Delete the demo kind cluster.
+	./hack/demo.sh clean
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
