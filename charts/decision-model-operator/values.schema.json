@@ -1,0 +1,162 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "decision-model-operator Helm values",
+  "description": "Schema for the decision-model-operator chart values. Helm validates values against this on install/upgrade/template, so a typo in a known section fails fast.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Manager image repository."
+        },
+        "tag": {
+          "type": "string",
+          "description": "Manager image tag. Empty defaults to v<Chart.appVersion>."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"],
+          "description": "Image pull policy for the manager container."
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "description": "Secrets for pulling the manager image.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        },
+        "required": ["name"]
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of controller-manager replicas (leader election picks one active)."
+    },
+    "resources": {
+      "type": "object",
+      "description": "Resource requests/limits for the manager container (Kubernetes ResourceRequirements).",
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "type": "object", "additionalProperties": { "type": ["string", "integer"] } },
+        "limits": { "type": "object", "additionalProperties": { "type": ["string", "integer"] } },
+        "claims": { "type": "array" }
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "description": "Node selector for the manager Pod.",
+      "additionalProperties": { "type": "string" }
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Tolerations for the manager Pod.",
+      "items": { "type": "object" }
+    },
+    "affinity": {
+      "type": "object",
+      "description": "Affinity for the manager Pod."
+    },
+    "leaderElection": {
+      "type": "boolean",
+      "description": "Enable leader election (recommended for HA / replicaCount > 1)."
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Expose the metrics endpoint and create a metrics Service (8443/HTTPS)."
+        },
+        "bindAddress": {
+          "type": "string",
+          "description": "Address the metrics server binds to (e.g. \":8443\")."
+        },
+        "secure": {
+          "type": "boolean",
+          "description": "Serve metrics over HTTPS."
+        }
+      }
+    },
+    "healthProbeBindAddress": {
+      "type": "string",
+      "description": "Health/readiness probe bind address (e.g. \":8081\")."
+    },
+    "manager": {
+      "type": "object",
+      "description": "Manager policy flags.",
+      "additionalProperties": false,
+      "properties": {
+        "allowedRegistries": {
+          "type": "string",
+          "description": "--allowed-registries: comma-separated registry hosts a spec.model may resolve from (SSRF guard)."
+        },
+        "allowInsecureRegistries": {
+          "type": "boolean",
+          "description": "--allow-insecure-registries: permit http:// model registries (dev only)."
+        },
+        "allowImageOverride": {
+          "type": "boolean",
+          "description": "--allow-image-override: permit spec.image to override the engine default image."
+        },
+        "maxConcurrentReconciles": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "--max-concurrent-reconciles: max DecisionModels reconciled concurrently."
+        },
+        "ollayaRegistry": {
+          "type": "string",
+          "description": "--ollaya-registry: default registry base URL for host-less model names. Empty = operator default. When set, must be an http:// or https:// URL.",
+          "pattern": "^$|^https?://"
+        },
+        "ollayaHFEndpoint": {
+          "type": "string",
+          "description": "--ollaya-hf-endpoint: base URL for model-weight downloads. Empty = runtime default. When set, must be an http:// or https:// URL.",
+          "pattern": "^$|^https?://"
+        }
+      }
+    },
+    "watchNamespaces": {
+      "type": "array",
+      "description": "Namespaces to watch (--watch-namespaces). Empty = cluster-wide.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "proxy": {
+      "type": "object",
+      "description": "HTTP(S) proxy for the operator's egress to the model registry.",
+      "additionalProperties": false,
+      "properties": {
+        "httpProxy": {
+          "type": "string",
+          "description": "HTTP_PROXY for the manager (and the prefetch Job). Empty = not set."
+        },
+        "httpsProxy": {
+          "type": "string",
+          "description": "HTTPS_PROXY for the manager (and the prefetch Job). Empty = not set."
+        },
+        "noProxy": {
+          "type": "string",
+          "description": "NO_PROXY for the manager (and the prefetch Job). Empty = not set."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Name of an existing Secret to source the proxy URLs from. Empty = use the plaintext values."
+        }
+      }
+    },
+    "installCRDs": {
+      "type": "boolean",
+      "description": "Install the CRD via Helm's crds/ dir."
+    }
+  }
+}

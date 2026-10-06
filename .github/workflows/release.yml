@@ -142,6 +142,9 @@ jobs:
       - name: Build installer manifest
         run: make build-installer IMG=ghcr.io/maks3201/decision-model-operator:${{ env.TAG }}
 
+      - name: Add artifacthub.io/changes for this release
+        run: hack/chart-annotate-changes.sh "${TAG#v}" charts/decision-model-operator/Chart.yaml
+
       - name: Package Helm chart
         run: helm package charts/decision-model-operator --destination dist
 

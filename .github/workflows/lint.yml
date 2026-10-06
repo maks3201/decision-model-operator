@@ -68,7 +68,40 @@ jobs:
             --set image.tag=v9.9.9 \
             --set manager.allowInsecureRegistries=true \
             --set manager.allowImageOverride=true \
+            --set manager.ollayaRegistry=https://reg.internal \
+            --set manager.ollayaHFEndpoint=https://hf.internal \
             --set metrics.enabled=false >/dev/null
+
+      - name: values.schema.json rejects typos and bad values
+        run: |
+          # Each of these MUST fail schema validation; the step fails if any passes.
+          assert_fail() {
+            if helm template dmo charts/decision-model-operator "$@" >/dev/null 2>&1; then
+              echo "schema did NOT reject: helm template $*" >&2
+              exit 1
+            fi
+          }
+          assert_fail --set manager.ollayaRegistyr=https://x   # typo'd key under manager
+          assert_fail --set proxy.htpProxy=http://x            # typo'd key under proxy
+          assert_fail --set image.pullPolicy=Sometimes         # not in the enum
+          assert_fail --set manager.ollayaRegistry=ftp://x     # not an http(s) URL
+          assert_fail --set replicaCount=notanumber            # wrong type
+          echo "schema correctly rejected all negative cases"
+
+      - name: artifacthub.io/changes generator produces a packageable chart
+        run: |
+          # Smoke-test the release-time changelog generator against the current
+          # chart version: output must be non-empty, inject cleanly into a full
+          # chart copy, and still `helm package`.
+          ver="$(awk '/^version:/ { print $2; exit }' charts/decision-model-operator/Chart.yaml)"
+          out="$(hack/chart-changes.sh "$ver")"
+          test -n "$out" || { echo "no changes generated for $ver" >&2; exit 1; }
+          tmp="$(mktemp -d)"
+          cp -r charts/decision-model-operator "$tmp/chart"
+          hack/chart-annotate-changes.sh "$ver" "$tmp/chart/Chart.yaml"
+          helm package "$tmp/chart" --destination "$tmp/dist" >/dev/null
+          rm -rf "$tmp"
+          echo "changes generator OK for $ver"
 
       - name: Chart README is up to date (helm-docs, no drift)
         run: |
