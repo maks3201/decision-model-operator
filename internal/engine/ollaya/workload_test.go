@@ -210,8 +210,8 @@ func TestPrefetchJobSpec(t *testing.T) {
 	}
 
 	spec := js.Template.Spec
-	if spec.RestartPolicy != corev1.RestartPolicyOnFailure {
-		t.Errorf("restartPolicy = %q, want OnFailure", spec.RestartPolicy)
+	if spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("restartPolicy = %q, want Never (required by podFailurePolicy)", spec.RestartPolicy)
 	}
 	assertPodSecurity(t, spec.SecurityContext)
 

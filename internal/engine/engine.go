@@ -146,6 +146,15 @@ type RuntimeVersioner interface {
 	RuntimeVersionFromImage(image string) string
 }
 
+// PrefetchFailureClassifier is an optional capability: it maps a failed prefetch
+// Pod's termination message and exit code to a short reason and whether the
+// failure is permanent (retrying cannot help, e.g. the tag does not exist or the
+// downloaded digest does not match). Unknown failures must be reported as
+// transient.
+type PrefetchFailureClassifier interface {
+	ClassifyPrefetchFailure(terminationMessage string, exitCode int32) (reason string, permanent bool)
+}
+
 // DecideRequest is a TypeSafe /v1/systemone request. State and Questions are passed
 // through verbatim (any JSON), so the engine does not need to model the question schema.
 type DecideRequest struct {

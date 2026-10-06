@@ -1319,12 +1319,61 @@ func prefetchResources() corev1.ResourceRequirements {
 	}
 }
 
-// prefetchScript pulls the model and verifies its digest, then optionally
-// prunes sibling revision sub-paths from the store root. The manifest path is
+// Prefetch exit codes. A permanent code tells the controller (via the Job's
+// podFailurePolicy) to fail immediately without burning retries; a transient
+// failure (exit 1) is retried by the Job up to backoffLimit. These values are
+// also what classifyPrefetchFailure maps back to a reason.
+const (
+	prefetchExitTransient      = 1 // network / 5xx / timeout: retry
+	prefetchExitModelNotFound  = 3 // manifest 404 / tag not found: permanent
+	prefetchExitDigestMismatch = 4 // pulled digest != expected: permanent
+
+	// String forms for embedding in the shell script (const concatenation).
+	prefetchExitTransientStr      = "1"
+	prefetchExitModelNotFoundStr  = "3"
+	prefetchExitDigestMismatchStr = "4"
+)
+
+// Prefetch failure reasons written to the termination message (and the last log
+// line as a fallback) so the controller can surface them. Exported so the
+// controller maps a failed Job to the same strings without duplicating them.
+const (
+	PrefetchReasonModelNotFound  = "ModelNotFound"
+	PrefetchReasonDigestMismatch = "DigestMismatch"
+	PrefetchReasonTransient      = "Transient"
+)
+
+// prefetchScript pulls the model and verifies its digest, then optionally prunes
+// sibling revision sub-paths from the store root. It classifies a failure as
+// permanent (a 404/tag-not-found or a digest mismatch) or transient (network,
+// 5xx, timeout) and exits with a distinct code so the Job's podFailurePolicy can
+// fail fast on a permanent error instead of burning all retries. The reason is
+// written to the container termination message and as the final log line
+// (TerminationMessagePolicy: FallbackToLogsOnError). The manifest path is
 // computed in Go (MANIFEST_PATH); the model name uses the "--" separator so a
 // value starting with "-" cannot be read as a CLI flag (review E4).
-const prefetchScript = `set -eu
-ollaya pull -- "$MODEL"
+//
+// ollaya pull returns exit 1 for BOTH a missing tag and a network error (verified
+// in the image), so a missing tag is told apart by the message
+// ("not found in registry"); anything else that fails the pull is treated as
+// transient and retried.
+var prefetchScript = `set -eu
+fail() {
+  # $1 = reason, $2 = exit code. Record the reason for the controller.
+  printf 'reason: %s\n' "$1" > /dev/termination-log 2>/dev/null || true
+  echo "prefetch failed: $1" >&2
+  printf 'reason: %s\n' "$1"
+  exit "$2"
+}
+pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
+  echo "$pull_err" >&2
+  case "$pull_err" in
+    *"not found in registry"*|*"not found"*)
+      fail ` + PrefetchReasonModelNotFound + ` ` + prefetchExitModelNotFoundStr + ` ;;
+    *)
+      fail ` + PrefetchReasonTransient + ` ` + prefetchExitTransientStr + ` ;;
+  esac
+}
 if [ -z "${EXPECT_DIGEST:-}" ]; then
   echo "no expected digest; skipping verification"
 else
@@ -1332,7 +1381,7 @@ else
   echo "pulled digest: $got"
   if [ "$got" != "$EXPECT_DIGEST" ]; then
     echo "digest mismatch: got $got want $EXPECT_DIGEST" >&2
-    exit 1
+    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
   fi
   echo "digest ok: $got"
 fi
@@ -1376,6 +1425,57 @@ exit 1
 // storeRootMount is where the Job mounts the PVC root (no subPath) so it can
 // prune sibling revision sub-paths.
 const storeRootMount = "/store-root"
+
+// terminationMessagePath is where the prefetch container writes its one-line
+// "reason: <X>" classification; the kubelet mounts it writable even under
+// readOnlyRootFilesystem. TerminationMessageFallbackToLogsOnError makes the
+// controller fall back to the last log line (also "reason: <X>") if the file is
+// empty.
+const terminationMessagePath = "/dev/termination-log"
+
+// prefetchPodFailurePolicy fails the Job immediately on a permanent prefetch exit
+// code (a missing tag or a digest mismatch) and counts anything else toward the
+// normal retry budget. Requires RestartPolicy: Never.
+func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
+	return &batchv1.PodFailurePolicy{
+		Rules: []batchv1.PodFailurePolicyRule{
+			{
+				Action: batchv1.PodFailurePolicyActionFailJob,
+				OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+					Operator: batchv1.PodFailurePolicyOnExitCodesOpIn,
+					Values:   []int32{prefetchExitModelNotFound, prefetchExitDigestMismatch},
+				},
+			},
+		},
+	}
+}
+
+// classifyPrefetchFailure maps a failed prefetch pod's termination message and
+// exit code to a stable reason and whether the failure is permanent (never worth
+// retrying). The controller calls it to surface the reason in the PrefetchFailed
+// condition/Event. The termination message is matched first ("reason: <X>",
+// written by the script); the exit code is the fallback when the message is
+// absent (e.g. the container was killed before writing it). An unrecognised
+// failure is treated as transient so the operator does not permanently fail a
+// revision on an unknown error.
+func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason string, permanent bool) {
+	switch {
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonDigestMismatch):
+		return PrefetchReasonDigestMismatch, true
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonModelNotFound):
+		return PrefetchReasonModelNotFound, true
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonTransient):
+		return PrefetchReasonTransient, false
+	}
+	switch exitCode {
+	case prefetchExitDigestMismatch:
+		return PrefetchReasonDigestMismatch, true
+	case prefetchExitModelNotFound:
+		return PrefetchReasonModelNotFound, true
+	default:
+		return PrefetchReasonTransient, false
+	}
+}
 
 // revHashRE validates a store sub-path / keep-list entry: the controller's
 // revision hash is exactly 10 lowercase hex chars. Only entries matching this
@@ -1469,19 +1569,28 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	return batchv1.JobSpec{
 		BackoffLimit:          ptr(prefetchBackoff),
 		ActiveDeadlineSeconds: ptr(prefetchDeadl),
+		// Fail fast on a permanent error (a missing tag or a digest mismatch) so a
+		// corrupt/moved tag does not burn all backoffLimit retries; keep counting
+		// transient failures (network/5xx/timeout) toward the normal retry budget.
+		// podFailurePolicy requires RestartPolicy: Never (the kubelet rejects it
+		// with OnFailure), so the pod is replaced per failure rather than its
+		// container restarted in place — same retry budget via BackoffLimit.
+		PodFailurePolicy: prefetchPodFailurePolicy(),
 		Template: corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
-				RestartPolicy:                corev1.RestartPolicyOnFailure,
+				RestartPolicy:                corev1.RestartPolicyNever,
 				SecurityContext:              podSecurityContext(),
 				AutomountServiceAccountToken: ptr(false), // review E5
 				Containers: []corev1.Container{
 					{
-						Name:      prefetchName,
-						Image:     image,
-						Command:   []string{"/bin/sh", "-c"},
-						Args:      []string{script},
-						Env:       env,
-						Resources: prefetchResources(),
+						Name:                     prefetchName,
+						Image:                    image,
+						Command:                  []string{"/bin/sh", "-c"},
+						Args:                     []string{script},
+						Env:                      env,
+						Resources:                prefetchResources(),
+						TerminationMessagePath:   terminationMessagePath,
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						SecurityContext: &corev1.SecurityContext{
 							ReadOnlyRootFilesystem:   ptr(true), // review E5: writes only to mounts
 							AllowPrivilegeEscalation: ptr(false),
@@ -1561,4 +1670,12 @@ func normalizeDevice(d string) string {
 		}
 	}
 	return base
+}
+
+// Compile-time check that Engine implements the optional PrefetchFailureClassifier capability.
+var _ engine.PrefetchFailureClassifier = (*Engine)(nil)
+
+// ClassifyPrefetchFailure implements engine.PrefetchFailureClassifier.
+func (e *Engine) ClassifyPrefetchFailure(terminationMessage string, exitCode int32) (string, bool) {
+	return classifyPrefetchFailure(terminationMessage, exitCode)
 }

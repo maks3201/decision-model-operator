@@ -261,6 +261,25 @@ The controller clears the failed revision once when this value differs from the
 one it last consumed. Returning the spec to the last stable revision also clears
 it.
 
+### Prefetch failures: transient vs permanent
+
+The prefetch Job tells a **transient** download failure from a **permanent** one
+and reacts differently:
+
+- **Transient** (network error, registry/Hugging Face `5xx`, timeout): the Job
+  retries up to its `backoffLimit` (4) within the Caching deadline, so a short
+  outage recovers on its own.
+- **Permanent** — the Job fails **immediately** (no wasted retries):
+  - **`ModelNotFound`** — the registry has no such tag (`spec.model` is wrong, or
+    a bare name resolved to a different artifact). Fix the tag; a digest pin
+    (`spec.digest`) protects against a tag moving.
+  - **`DigestMismatch`** — the pulled manifest's sha256 does not match the pinned
+    digest (the tag moved upstream mid-rollout, or the content is corrupt).
+    Re-resolve by changing the spec, or pin `spec.digest`.
+
+The reason is shown on the failed revision's condition/Event. A permanent failure
+will not clear on its own — fix the cause, then retry as above.
+
 ### Secret capability labels
 
 A Secret the operator reads must carry the label for the capability it is used
