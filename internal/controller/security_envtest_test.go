@@ -38,7 +38,6 @@ import (
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
-	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
 )
 
 // countingReader wraps a client.Reader and counts Secret Gets, so a test can
@@ -201,7 +200,7 @@ var _ = Describe("security guards", func() {
 
 	// a model from a disallowed registry fails with RegistryNotAllowed.
 	It("E2: rejects a disallowed registry", func() {
-		eng := ollaya.New() // real engine implements RegistryHoster
+		eng := newFakeEngine() // fake engine implements RegistryHoster
 		r := newR(eng)
 		createDM("e2", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Model = "evil.com/ns/m:t" })
 

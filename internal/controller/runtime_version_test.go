@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
-	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
+	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
 func dmWith(runtimeVersion, image string) *decisionmodelv1alpha1.DecisionModel {
@@ -33,6 +33,7 @@ func dmWith(runtimeVersion, image string) *decisionmodelv1alpha1.DecisionModel {
 // Pinned an unset spec.runtimeVersion reuses the stable's recorded version so an
 // operator-default bump does not change a revision.
 func TestEffectiveRuntimeVersion(t *testing.T) {
+	eng := newFakeEngine()
 	stable := &decisionmodelv1alpha1.RevisionStatus{RuntimeVersion: "0.8.0"}
 	legacyStable := &decisionmodelv1alpha1.RevisionStatus{Image: "ghcr.io/ollaya-dev/ollaya:0.9.0"}
 	userImageStable := &decisionmodelv1alpha1.RevisionStatus{Image: "example.com/custom:1"}
@@ -55,7 +56,7 @@ func TestEffectiveRuntimeVersion(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &DecisionModelReconciler{RuntimeVersionPolicy: tc.policy}
-			if got := r.effectiveRuntimeVersion(tc.dm, tc.stable); got != tc.want {
+			if got := r.effectiveRuntimeVersion(eng, tc.dm, tc.stable); got != tc.want {
 				t.Errorf("effectiveRuntimeVersion = %q, want %q", got, tc.want)
 			}
 		})
@@ -63,7 +64,8 @@ func TestEffectiveRuntimeVersion(t *testing.T) {
 }
 
 func TestRuntimeUpdateAvailable(t *testing.T) {
-	def := ollaya.DefaultRuntimeVersion // "0.10.0"
+	eng := newFakeEngine()
+	def := eng.DefaultRuntimeVersion() // "0.10.0"
 	tests := []struct {
 		pinned string
 		want   bool
@@ -76,27 +78,55 @@ func TestRuntimeUpdateAvailable(t *testing.T) {
 		{"not-a-version", false},
 	}
 	for _, tc := range tests {
-		if got := runtimeUpdateAvailable(tc.pinned); got != tc.want {
+		if got := runtimeUpdateAvailable(eng, tc.pinned); got != tc.want {
 			t.Errorf("runtimeUpdateAvailable(%q) = %v, want %v", tc.pinned, got, tc.want)
 		}
 	}
 }
 
-func TestRuntimeVersionFromImage(t *testing.T) {
+// recordedRuntimeVersion derives the version from a recorded revision via the
+// engine capability (image tag) or the explicit field.
+func TestRecordedRuntimeVersion(t *testing.T) {
+	eng := newFakeEngine()
 	tests := []struct {
-		image string
-		want  string
+		name string
+		rev  *decisionmodelv1alpha1.RevisionStatus
+		want string
 	}{
-		{"ghcr.io/ollaya-dev/ollaya:0.10.0", "0.10.0"},
-		{"ghcr.io/ollaya-dev/ollaya:0.10.0-cuda", "0.10.0"},
-		{"ghcr.io/ollaya-dev/ollaya:latest", ""},
-		{"example.com/custom:1", ""},
-		{"", ""},
+		{"explicit field", &decisionmodelv1alpha1.RevisionStatus{RuntimeVersion: "0.8.0"}, "0.8.0"},
+		{"default image tag", &decisionmodelv1alpha1.RevisionStatus{Image: "ghcr.io/ollaya-dev/ollaya:0.10.0"}, "0.10.0"},
+		{"cuda image tag", &decisionmodelv1alpha1.RevisionStatus{Image: "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda"}, "0.10.0"},
+		{"non-default tag", &decisionmodelv1alpha1.RevisionStatus{Image: "ghcr.io/ollaya-dev/ollaya:latest"}, ""},
+		{"user image", &decisionmodelv1alpha1.RevisionStatus{Image: "example.com/custom:1"}, ""},
+		{"nil", nil, ""},
 	}
 	for _, tc := range tests {
-		if got := runtimeVersionFromImage(tc.image); got != tc.want {
-			t.Errorf("runtimeVersionFromImage(%q) = %q, want %q", tc.image, got, tc.want)
+		if got := recordedRuntimeVersion(eng, tc.rev); got != tc.want {
+			t.Errorf("%s: recordedRuntimeVersion = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// An engine without the RuntimeVersioner capability: a set spec.runtimeVersion
+// is unsupported; everything else degrades to "no pinning".
+func TestRuntimeVersionWithoutCapability(t *testing.T) {
+	eng := bareEngine{}
+	if runtimeVersioner(eng) != nil {
+		t.Fatal("bareEngine must not expose RuntimeVersioner")
+	}
+	if err := validateRuntimeVersion(eng, "0.10.0"); err == nil {
+		t.Error("a set runtimeVersion must be unsupported without the capability")
+	}
+	if err := validateRuntimeVersion(eng, ""); err != nil {
+		t.Errorf("empty runtimeVersion must be allowed: %v", err)
+	}
+	r := &DecisionModelReconciler{RuntimeVersionPolicy: RuntimeVersionPinned}
+	if got := r.effectiveRuntimeVersion(eng, dmWith("", ""),
+		&decisionmodelv1alpha1.RevisionStatus{RuntimeVersion: "0.8.0"}); got != "" {
+		t.Errorf("no-capability effective version = %q, want empty", got)
+	}
+	if runtimeUpdateAvailable(eng, "0.8.0") {
+		t.Error("no-capability engine must never advertise a runtime update")
 	}
 }
 
@@ -112,3 +142,6 @@ func TestValidRuntimeVersionPolicy(t *testing.T) {
 		}
 	}
 }
+
+// compile-time: fakeEngine implements RuntimeVersioner; bareEngine does not.
+var _ engine.RuntimeVersioner = (*fakeEngine)(nil)
