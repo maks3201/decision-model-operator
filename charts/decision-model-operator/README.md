@@ -41,6 +41,191 @@ From a source checkout use `charts/decision-model-operator` instead of the OCI r
 The chart installs the CRD (from its `crds/` directory), RBAC, the manager
 Deployment and — when `metrics.enabled` — the metrics Service.
 
+## Quick start
+
+Install the operator (above), then apply a minimal `DecisionModel` and send it a
+request. `laya:en` serves on CPU in a few GB of RAM.
+
+```yaml
+# dm.yaml
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  name: support-router
+spec:
+  engine: ollaya
+  model: laya:en        # an explicit ":tag" is required (a bare name resolves to :latest, a heavier artifact)
+  device: cpu
+  replicas: 1
+```
+
+```sh
+kubectl apply -f dm.yaml
+kubectl get dm -w          # wait for PHASE=Ready (dm is the short name)
+```
+
+Once `Ready`, port-forward the Service (named after the DecisionModel, port
+`11435`) and POST a decision to `/v1/systemone`:
+
+```sh
+kubectl port-forward svc/support-router 11435:11435 &
+
+curl -sS -X POST http://127.0.0.1:11435/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary '{
+    "model": "laya:en",
+    "state": "I was charged twice for my subscription this month. Please refund the second charge.",
+    "questions": {
+      "department": {
+        "type": "choice",
+        "criteria": {
+          "billing": "billing, payments, charges, refunds",
+          "technical": "technical bugs and errors",
+          "sales": "pricing and plans",
+          "other": "anything else"
+        }
+      }
+    }
+  }'
+```
+
+The response has one answer per question id (for `choice`: `choice`, `confidence`
+and `probabilities`). See the
+[quickstart](https://maks3201.github.io/decision-model-operator/quickstart/) for
+the full walkthrough and
+[sizing](https://maks3201.github.io/decision-model-operator/sizing/) for per-model
+`resources`.
+
+## Examples
+
+Each snippet below is a `values.yaml` for `helm install -f values.yaml` unless it
+is a `DecisionModel` (applied with `kubectl`).
+
+### Behind a corporate proxy
+
+The operator's registry egress and every prefetch Job go through the proxy; the
+in-cluster calls to serving Pods stay direct. Set the service CIDR and in-cluster
+DNS in `noProxy` (not the pod CIDR).
+
+```yaml
+# values.yaml
+proxy:
+  httpProxy: http://proxy.corp:3128
+  httpsProxy: http://proxy.corp:3128
+  noProxy: 10.96.0.0/12,.svc,.cluster.local
+```
+
+If the proxy URL carries credentials, put them in a Secret with keys
+`httpProxy`/`httpsProxy`/`noProxy` and set `proxy.existingSecret: <name>` instead.
+
+### Air-gapped (registry mirror + weight mirror)
+
+Point the operator at an internal registry mirror (manifests) and a Hugging Face
+mirror (weights), and allow the mirror host:
+
+```yaml
+# values.yaml
+manager:
+  ollayaRegistry: https://registry.internal        # manifests + digests
+  ollayaHFEndpoint: https://hf-mirror.internal      # model-weight blobs
+  allowedRegistries: registry.internal              # SSRF allow-list
+```
+
+For a private or gated model, add a download token. The Secret **must** carry the
+label `decisionmodel.io/download-token: "true"`, and the token is referenced from
+the DecisionModel's `spec.cache`:
+
+```sh
+kubectl create secret generic my-hf-token --from-literal=token=hf_...
+kubectl label secret my-hf-token decisionmodel.io/download-token=true
+```
+
+```yaml
+# dm.yaml
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  name: support-router
+spec:
+  engine: ollaya
+  model: laya:en
+  device: cpu
+  cache:
+    downloadTokenSecretRef:
+      name: my-hf-token
+      key: token
+```
+
+### Namespace-scoped
+
+Watch only a fixed set of namespaces; the chart then renders a namespaced
+`Role`+`RoleBinding` in each instead of a ClusterRole. The namespaces must
+already exist, and the cluster-scoped CRD is still installed once by an admin.
+
+```yaml
+# values.yaml
+watchNamespaces:
+  - team-a
+  - team-b
+```
+
+### GPU (`device: cuda`)
+
+GPU serving needs the amd64 CUDA runtime image (`:<appVersion>-cuda`, amd64-only)
+and the NVIDIA device plugin on the cluster. GPU nodes are usually tainted
+`nvidia.com/gpu`; the operator adds the matching toleration automatically. A
+blue-green rollout runs two revisions at once, so size for a second GPU (or use
+time-slicing / MIG).
+
+```yaml
+# dm.yaml
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  name: support-router
+spec:
+  engine: ollaya
+  model: laya:en
+  device: cuda          # selects the :<appVersion>-cuda image and adds nvidia.com/gpu: 1
+  replicas: 1
+```
+
+See
+[GPU CI](https://maks3201.github.io/decision-model-operator/gpu-ci/) for a
+GPU-enabled kind setup and the Pascal/Volta `:cuda12` note.
+
+### Metrics
+
+`metrics.enabled` (default `true`) exposes controller-runtime metrics on
+`:8443`/HTTPS and creates a metrics Service. The chart does not ship a Prometheus
+`ServiceMonitor`; scrape the Service with your monitoring stack. See
+[metrics](https://maks3201.github.io/decision-model-operator/metrics/).
+
+## Verify the chart
+
+The OCI chart is signed with [cosign](https://github.com/sigstore/cosign) (verify with v3+)
+(keyless, GitHub OIDC) from v0.2.0:
+
+```sh
+ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
+ISSUER=https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.3.0 \
+  --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
+```
+
+## Support
+
+- **Questions / help:**
+  [GitHub Discussions](https://github.com/maks3201/decision-model-operator/discussions).
+- **Bugs / feature requests:**
+  [GitHub Issues](https://github.com/maks3201/decision-model-operator/issues).
+- **Security vulnerabilities:** see
+  [SECURITY.md](https://github.com/maks3201/decision-model-operator/blob/main/SECURITY.md)
+  (do not open a public issue).
+- **Documentation:**
+  [docs site](https://maks3201.github.io/decision-model-operator/).
+
 ## Upgrade
 
 ```sh
