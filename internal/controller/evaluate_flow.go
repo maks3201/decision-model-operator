@@ -35,6 +35,7 @@ import (
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
+	"github.com/maks3201/decision-model-operator/internal/eval"
 )
 
 // evaluateOrPromote gates promotion on an eval run when spec.rollout.evaluation
@@ -78,7 +79,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseEvaluating)
 
 	// Load and parse the dataset.
-	raw, err := r.loadDataset(ctx, dm, &evalSpec.DatasetRef)
+	raw, deprecatedLabel, err := r.loadDataset(ctx, dm, &evalSpec.DatasetRef)
 	if err != nil {
 		switch {
 		case errors.Is(err, errDatasetNotFound):
@@ -99,6 +100,12 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 			return r.finish(ctx, dm, ctrl.Result{}, err)
 		}
 	}
+	if deprecatedLabel {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventDeprecatedSecretLabel,
+			"dataset Secret %q is accepted via the deprecated %s label; add %s=true instead",
+			evalSpec.DatasetRef.SecretRef.Name,
+			decisionmodelv1alpha1.LabelAPIKey, decisionmodelv1alpha1.LabelEvalDataset)
+	}
 	maxCases := int(evalSpec.MaxCases)
 	if maxCases == 0 {
 		maxCases = defaultMaxCases
@@ -110,6 +117,8 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 				err.Error(), decisionmodelv1alpha1.AnnotationRetry))
 	}
 	dsHash := datasetHash(raw)
+	dsDigest := datasetDigestFull(raw)
+	scoreTol := scoreTolerance(evalSpec)
 
 	// Ensure the candidate evaluation is running / read its result.
 	candKey := evalKey{dm.Namespace, dm.Name, candidate.Hash, dsHash, maxCases}
@@ -120,7 +129,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	// scratch, but EvaluationStarted must not be emitted a second time for the
 	// same revision (derive it from persisted cluster state, not the in-memory
 	// store).
-	candRes, running, evErr := r.ensureEval(ctx, dm, dec, candidate, apiKey, cases, candKey, resuming)
+	candRes, running, evErr := r.ensureEval(ctx, dm, dec, candidate, apiKey, cases, candKey, resuming, scoreTol)
 	if evErr != nil {
 		// A Pod-list/ownership failure must abort (workqueue backoff), not be
 		// mistaken for "still running".
@@ -164,7 +173,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	// is not run at all and never delays promotion or causes EvaluationTimeout.
 	var baseline *evalResult
 	if needsBaseline {
-		b, baselineDone, baselineUnavailable, bErr := r.baselineResult(ctx, dm, dec, apiKey, cases, dsHash, maxCases)
+		b, baselineDone, baselineUnavailable, bErr := r.baselineResult(ctx, dm, dec, apiKey, cases, dsHash, maxCases, scoreTol)
 		if bErr != nil {
 			return r.finish(ctx, dm, ctrl.Result{}, bErr)
 		}
@@ -197,6 +206,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	minAcc, _ := parseDecimal(evalSpec.MinAccuracy)
 
 	// Record the result in status.
+	policyHash := evalPolicyHash(evalSpec)
 	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{
 		Revision:        candidate.Hash,
 		Accuracy:        formatDecimal(candRes.accuracy),
@@ -204,7 +214,9 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		Brier:           formatDecimal(candRes.brier),
 		Cases:           int32(candRes.total),
 		FailedCases:     int32(candRes.failedCases),
-		PolicyHash:      evalPolicyHash(evalSpec),
+		PolicyHash:      policyHash,
+		DatasetDigest:   dsDigest,
+		ApprovalID:      approvalID(candidate.Hash, policyHash, dsDigest),
 		CompletedAt:     ptrTime(metav1.NewTime(r.now())),
 		MinAccuracy:     evalSpec.MinAccuracy,
 		MaxAccuracyDrop: evalSpec.MaxAccuracyDrop,
@@ -320,6 +332,7 @@ func (r *DecisionModelReconciler) ensureEval(
 	cases []evalCase,
 	key evalKey,
 	resuming bool,
+	scoreTol float64,
 ) (evalResult, bool, error) {
 	store := r.evalStoreOrInit()
 
@@ -357,7 +370,7 @@ func (r *DecisionModelReconciler) ensureEval(
 	runCtx, cancel := context.WithCancel(r.bgContext())
 	store.start(key, cancel)
 	go func() {
-		res := runEvaluation(runCtx, dec, baseURL, apiKey, candidate.Model, cases, r.now, evalTimeout)
+		res := runEvaluation(runCtx, dec, baseURL, apiKey, candidate.Model, cases, r.now, evalTimeout, scoreTol)
 		store.finish(key, res)
 	}()
 	return evalResult{}, true, nil
@@ -377,6 +390,7 @@ func (r *DecisionModelReconciler) baselineResult(
 	cases []evalCase,
 	dsHash string,
 	maxCases int,
+	scoreTol float64,
 ) (res *evalResult, done bool, unavailable bool, err error) {
 	stable := dm.Status.StableRevision
 	if stable == nil {
@@ -415,7 +429,7 @@ func (r *DecisionModelReconciler) baselineResult(
 	runCtx, cancel := context.WithCancel(r.bgContext())
 	store.start(key, cancel)
 	go func() {
-		res := runEvaluation(runCtx, dec, baseURL, apiKey, stable.Model, cases, r.now, evalTimeout)
+		res := runEvaluation(runCtx, dec, baseURL, apiKey, stable.Model, cases, r.now, evalTimeout, scoreTol)
 		store.finish(key, res)
 	}()
 	return nil, false, false, nil
@@ -456,51 +470,54 @@ func (r *DecisionModelReconciler) revisionPodBaseURL(
 	return "", false, nil
 }
 
-// loadDataset reads the JSONL dataset from a ConfigMap or Secret.
+// loadDataset reads the JSONL dataset from a ConfigMap or Secret. deprecatedLabel
+// is true when a dataset Secret was accepted only via the legacy
+// decisionmodel.io/api-key label (the caller emits a deprecation Warning).
 func (r *DecisionModelReconciler) loadDataset(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	ref *decisionmodelv1alpha1.DatasetRef,
-) ([]byte, error) {
+) (data []byte, deprecatedLabel bool, err error) {
 	log := logf.FromContext(ctx)
-	rdr, err := r.reader()
-	if err != nil {
-		return nil, err
+	rdr, rerr := r.reader()
+	if rerr != nil {
+		return nil, false, rerr
 	}
 	switch {
 	case ref.ConfigMapRef != nil:
 		var cm corev1.ConfigMap
 		if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.ConfigMapRef.Name}, &cm); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("%w: ConfigMap %s", errDatasetNotFound, ref.ConfigMapRef.Name)
+				return nil, false, fmt.Errorf("%w: ConfigMap %s", errDatasetNotFound, ref.ConfigMapRef.Name)
 			}
-			return nil, fmt.Errorf("read ConfigMap %s: %w", ref.ConfigMapRef.Name, err)
+			return nil, false, fmt.Errorf("read ConfigMap %s: %w", ref.ConfigMapRef.Name, err)
 		}
 		if v, ok := cm.Data[ref.ConfigMapRef.Key]; ok {
-			return []byte(v), nil
+			return []byte(v), false, nil
 		}
 		if v, ok := cm.BinaryData[ref.ConfigMapRef.Key]; ok {
-			return v, nil
+			return v, false, nil
 		}
-		return nil, fmt.Errorf("%w: key %q in ConfigMap %s", errDatasetKeyNotFound, ref.ConfigMapRef.Key, ref.ConfigMapRef.Name)
+		return nil, false, fmt.Errorf("%w: key %q in ConfigMap %s", errDatasetKeyNotFound, ref.ConfigMapRef.Key, ref.ConfigMapRef.Name)
 	case ref.SecretRef != nil:
 		var sec corev1.Secret
 		if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.SecretRef.Name}, &sec); err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("%w: Secret %s", errDatasetNotFound, ref.SecretRef.Name)
+				return nil, false, fmt.Errorf("%w: Secret %s", errDatasetNotFound, ref.SecretRef.Name)
 			}
-			return nil, fmt.Errorf("read Secret %s: %w", ref.SecretRef.Name, err)
+			return nil, false, fmt.Errorf("read Secret %s: %w", ref.SecretRef.Name, err)
 		}
-		if err := requireAPIKeyLabel(sec.Labels); err != nil {
-			return nil, err
+		deprecated, lerr := requireEvalDatasetLabel(sec.Labels)
+		if lerr != nil {
+			return nil, false, lerr
 		}
 		if v, ok := sec.Data[ref.SecretRef.Key]; ok {
-			return v, nil
+			return v, deprecated, nil
 		}
-		return nil, fmt.Errorf("%w: key %q in Secret %s", errDatasetKeyNotFound, ref.SecretRef.Key, ref.SecretRef.Name)
+		return nil, deprecated, fmt.Errorf("%w: key %q in Secret %s", errDatasetKeyNotFound, ref.SecretRef.Key, ref.SecretRef.Name)
 	default:
 		log.V(1).Info("dataset ref has neither configMapRef nor secretRef")
-		return nil, fmt.Errorf("datasetRef has neither configMapRef nor secretRef")
+		return nil, false, fmt.Errorf("datasetRef has neither configMapRef nor secretRef")
 	}
 }
 
@@ -554,3 +571,64 @@ func formatDecimal(v float64) string {
 }
 
 func ptrTime(t metav1.Time) *metav1.Time { return &t }
+
+// evalIdentityStale reports whether a parked candidate's recorded evaluation
+// result no longer matches the current policy or dataset content, so it must be
+// re-evaluated rather than promoted. datasetChanged is true specifically when the
+// dataset bytes changed (a DatasetChanged Event/condition). A dataset that is now
+// unreadable is also stale (re-evaluation will hold on it). No ConfigMap/Secret
+// watch is used: this re-reads on each reconcile while parked, so the detection
+// delay is at most one regate interval.
+func (r *DecisionModelReconciler) evalIdentityStale(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	evalSpec *decisionmodelv1alpha1.EvaluationSpec,
+) (stale, datasetChanged bool) {
+	ev := dm.Status.Evaluation
+	if ev == nil {
+		return true, false
+	}
+	if ev.PolicyHash != evalPolicyHash(evalSpec) {
+		return true, false
+	}
+	raw, _, err := r.loadDataset(ctx, dm, &evalSpec.DatasetRef)
+	if err != nil {
+		// Unreadable now (deleted/relabelled): the recorded result is stale.
+		return true, false
+	}
+	if datasetDigestFull(raw) != ev.DatasetDigest {
+		return true, true
+	}
+	return false, false
+}
+
+// datasetDigestFull returns the full sha256 (64 bare-hex chars) of the dataset
+// bytes, recorded in status.evaluation.datasetDigest as part of a result's
+// identity. (datasetHash returns a 16-char form used only as an in-memory
+// evalKey component.)
+func datasetDigestFull(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// scoreTolerance parses spec.rollout.evaluation.scoreTolerance into a level
+// band, defaulting to eval.DefaultScoreTolerance when unset/invalid.
+func scoreTolerance(evalSpec *decisionmodelv1alpha1.EvaluationSpec) float64 {
+	if evalSpec == nil || evalSpec.ScoreTolerance == "" {
+		return eval.DefaultScoreTolerance
+	}
+	v, err := strconv.ParseFloat(evalSpec.ScoreTolerance, 64)
+	if err != nil || v < 0 {
+		return eval.DefaultScoreTolerance
+	}
+	return v
+}
+
+// approvalID is the identity a manual approval must name: the first 12 hex of
+// sha256(revisionHash + policyHash + datasetDigest). Without evaluation
+// (policyHash and datasetDigest both empty) it is derived from the revision hash
+// alone, so a manual-only hold still has a stable approvalID.
+func approvalID(revHash, policyHash, datasetDigest string) string {
+	sum := sha256.Sum256([]byte(revHash + "\x1f" + policyHash + "\x1f" + datasetDigest))
+	return hex.EncodeToString(sum[:])[:12]
+}

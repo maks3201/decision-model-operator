@@ -278,8 +278,14 @@ var _ = Describe("manual promotion", func() {
 			Expect(reconcile1(m)).To(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
 			Expect(serviceRevision(name)).To(Equal(m.rev1))
 
-			// The matching hash promotes.
-			annotate(name, cand)
+			// Approve: with evaluation the bare hash is NOT honoured, only the
+			// approvalID is; without evaluation the bare hash still works.
+			token := cand
+			if withEval {
+				token = getDM(name).Status.Evaluation.ApprovalID
+				Expect(token).NotTo(BeEmpty())
+			}
+			annotate(name, token)
 			Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 			dm = getDM(name)
 			Expect(dm.Status.StableRevision.Hash).To(Equal(cand))
@@ -294,7 +300,7 @@ var _ = Describe("manual promotion", func() {
 
 			// The approval is NOT consumed by the reconcile that promotes: it is
 			// removed only once the promotion is the persisted stable revision.
-			Expect(getDM(name).Annotations).To(HaveKeyWithValue(promoteKey, cand))
+			Expect(getDM(name).Annotations).To(HaveKeyWithValue(promoteKey, token))
 			Expect(reconcile1(m)).To(Equal(decisionmodelv1alpha1.PhaseReady))
 			Expect(getDM(name).Annotations).NotTo(HaveKey(promoteKey))
 		},
@@ -479,5 +485,115 @@ var _ = Describe("manual promotion", func() {
 		ev := getDM(name).Status.Evaluation
 		Expect(ev).NotTo(BeNil())
 		Expect(ev.BaselineAccuracy).To(BeEmpty(), "baseline not run without a relative gate")
+	})
+
+	// Promotion by approvalID (the current form); a wrong value is ignored.
+	It("promotes on the approvalID and records it in status", func() {
+		name := "mp-approvalid"
+		m := newManual(name, true, true)
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		id := getDM(name).Status.Evaluation.ApprovalID
+		Expect(id).NotTo(BeEmpty())
+
+		// A wrong value (neither approvalID nor the candidate hash) is ignored.
+		annotate(name, "deadbeefdead")
+		Expect(reconcile1(m)).To(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		Expect(serviceRevision(name)).To(Equal(m.rev1))
+
+		// The approvalID promotes.
+		annotate(name, id)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
+		// The annotation is consumed once the promotion is durable.
+		Expect(reconcile1(m)).To(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Annotations).NotTo(HaveKey(promoteKey))
+	})
+
+	// Editing the dataset content while parked re-evaluates (DatasetChanged) and
+	// rotates the approvalID; an approval for the OLD identity does not promote.
+	It("re-evaluates on a dataset content change and rotates the approvalID", func() {
+		name := "mp-dschange"
+		m := newManual(name, true, true)
+		startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		oldEv := getDM(name).Status.Evaluation
+		Expect(oldEv.DatasetDigest).NotTo(BeEmpty())
+		oldID := oldEv.ApprovalID
+
+		// Edit the dataset content in place AND set the old approvalID in the same
+		// edit: the operator must re-evaluate (not promote on the stale result).
+		Expect(func() error {
+			cm := &corev1.ConfigMap{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: datasetName}, cm); err != nil {
+				return err
+			}
+			cm.Data["cases.jsonl"] = strings.Repeat(
+				`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}`+"\n", 12)
+			return k8sClient.Update(ctx, cm)
+		}()).To(Succeed())
+		annotate(name, oldID)
+
+		ph := reconcile1(m)
+		Expect(ph).NotTo(Equal(decisionmodelv1alpha1.PhaseReady), "must not promote on the stale dataset result")
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(m.rev1))
+
+		// It re-parks under the new dataset digest with a different approvalID.
+		Eventually(func() string {
+			reconcile1(m)
+			ev := getDM(name).Status.Evaluation
+			if ev == nil {
+				return ""
+			}
+			return ev.DatasetDigest
+		}, "10s", "50ms").ShouldNot(Equal(oldEv.DatasetDigest))
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		newID := getDM(name).Status.Evaluation.ApprovalID
+		Expect(newID).NotTo(Equal(oldID), "approvalID rotates when the dataset changes")
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(m.rev1), "still not promoted on the old approval")
+	})
+
+	// With evaluation configured, a bare revision hash never promotes: even with
+	// the identity intact it is ignored with a DeprecatedApproval Warning; only
+	// the approvalID promotes.
+	It("ignores a bare-hash approval when evaluation is configured", func() {
+		name := "mp-barehash"
+		m := newManual(name, true, true)
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		id := getDM(name).Status.Evaluation.ApprovalID
+		Expect(id).NotTo(Equal(cand), "the approvalID is not the bare revision hash")
+
+		// Bare hash: ignored, stays parked, a DeprecatedApproval Warning names the ID.
+		annotate(name, cand)
+		for i := 0; i < 3; i++ {
+			Expect(reconcile1(m)).To(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		}
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(m.rev1), "bare hash must not promote with eval")
+		fr := m.r.Recorder.(*events.FakeRecorder)
+		var warned bool
+		for len(fr.Events) > 0 {
+			e := <-fr.Events
+			if strings.Contains(e, "DeprecatedApproval") && strings.Contains(e, id) {
+				warned = true
+			}
+		}
+		Expect(warned).To(BeTrue(), "a DeprecatedApproval Warning naming the approvalID must be emitted")
+
+		// The approvalID promotes.
+		annotate(name, id)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
+	})
+
+	// Without evaluation the bare hash still works for one release (deprecated).
+	It("still accepts a bare-hash approval without evaluation", func() {
+		name := "mp-barehash-noeval"
+		m := newManual(name, false, true)
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		annotate(name, cand)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
 	})
 })

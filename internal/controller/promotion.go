@@ -36,8 +36,10 @@ const (
 	reasonPromotionPending = "PromotionPending"
 	reasonPromoted         = "Promoted"
 
-	eventAwaitingPromotion = "AwaitingPromotion"
-	eventPromotionApproved = "PromotionApproved"
+	eventAwaitingPromotion  = "AwaitingPromotion"
+	eventPromotionApproved  = "PromotionApproved"
+	eventDeprecatedApproval = "DeprecatedApproval"
+	eventStaleApproval      = "StaleApproval"
 )
 
 // manualPromotion reports whether the effective promotion policy holds a
@@ -68,11 +70,47 @@ func effectivePromotionPolicy(dm *decisionmodelv1alpha1.DecisionModel) decisionm
 	return decisionmodelv1alpha1.PromotionAutomatic
 }
 
-// isApproved reports whether the promote annotation approves exactly this
-// candidate revision. An approval for any other hash (a stale one for an older
-// candidate) never promotes a newer candidate.
-func isApproved(dm *decisionmodelv1alpha1.DecisionModel, candidateHash string) bool {
-	return candidateHash != "" && dm.Annotations[decisionmodelv1alpha1.AnnotationPromote] == candidateHash
+// currentApprovalID is the approval identity for this candidate right now:
+// the recorded evaluation's approvalID when it belongs to this candidate, else
+// (no evaluation, or a manual-only hold) derived from the revision hash alone.
+func currentApprovalID(dm *decisionmodelv1alpha1.DecisionModel, candidate *decisionmodelv1alpha1.RevisionStatus) string {
+	if ev := dm.Status.Evaluation; ev != nil && ev.Revision == candidate.Hash && ev.ApprovalID != "" {
+		return ev.ApprovalID
+	}
+	return approvalID(candidate.Hash, "", "")
+}
+
+// approvalDecision is the outcome of matching the promote annotation.
+type approvalDecision int
+
+const (
+	approvalNone        approvalDecision = iota // no/stale annotation
+	approvalByID                                // matches the current approvalID
+	approvalByBareHash                          // deprecated bare revision hash (no eval only)
+	approvalBareIgnored                         // bare hash with eval configured: NOT honoured
+)
+
+// approvalMatch classifies the promote annotation against this candidate.
+// With rollout.evaluation configured the ONLY thing that promotes is the current
+// approvalID: a bare revision hash is explicitly NOT honoured (it would otherwise
+// carry an approval given for an old result across a re-evaluation of the same
+// revision). Without evaluation (manual hold only) the bare hash keeps working
+// for one release.
+func approvalMatch(dm *decisionmodelv1alpha1.DecisionModel, candidate *decisionmodelv1alpha1.RevisionStatus) approvalDecision {
+	tok := dm.Annotations[decisionmodelv1alpha1.AnnotationPromote]
+	if tok == "" {
+		return approvalNone
+	}
+	if tok == currentApprovalID(dm, candidate) {
+		return approvalByID
+	}
+	if tok == candidate.Hash && candidate.Hash != "" {
+		if evaluationSpec(dm) != nil {
+			return approvalBareIgnored
+		}
+		return approvalByBareHash
+	}
+	return approvalNone
 }
 
 // promoteOrAwait is the single exit of the gate: a candidate that passed
@@ -98,20 +136,46 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 		return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
 	}
 
-	// A re-evaluation triggered by a policy change must re-park and NOT honour an
-	// approval on that cycle: the result is re-recorded under the new policy hash
-	// first. The SAME approval then promotes the candidate on the next reconcile,
-	// on the freshly recorded result addendum).
-	if isApproved(dm, candidate.Hash) && !skipApproval {
-		r.event(ctx, dm, corev1.EventTypeNormal, eventPromotionApproved,
-			"promotion of revision %s approved via %s", candidate.Hash, decisionmodelv1alpha1.AnnotationPromote)
-		setStatusCondition(dm, metav1.Condition{
-			Type:    decisionmodelv1alpha1.ConditionPromoted,
-			Status:  metav1.ConditionTrue,
-			Reason:  reasonPromoted,
-			Message: fmt.Sprintf("revision %s promoted after approval", candidate.Hash),
-		})
-		return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
+	wantID := currentApprovalID(dm, candidate)
+	// A re-evaluation triggered by a policy/dataset change must re-park and NOT
+	// honour an approval on that cycle (skipApproval): the result is re-recorded
+	// under the new identity (new approvalID) first, which the user must approve.
+	if !skipApproval {
+		decision := approvalMatch(dm, candidate)
+		switch decision {
+		case approvalByID, approvalByBareHash:
+			if decision == approvalByBareHash {
+				r.event(ctx, dm, corev1.EventTypeWarning, eventDeprecatedApproval,
+					"revision %s approved by bare hash (deprecated); set %s=%s instead",
+					candidate.Hash, decisionmodelv1alpha1.AnnotationPromote, wantID)
+			}
+			r.event(ctx, dm, corev1.EventTypeNormal, eventPromotionApproved,
+				"promotion of revision %s approved via %s", candidate.Hash, decisionmodelv1alpha1.AnnotationPromote)
+			setStatusCondition(dm, metav1.Condition{
+				Type:    decisionmodelv1alpha1.ConditionPromoted,
+				Status:  metav1.ConditionTrue,
+				Reason:  reasonPromoted,
+				Message: fmt.Sprintf("revision %s promoted after approval", candidate.Hash),
+			})
+			return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
+		case approvalBareIgnored:
+			// A bare revision hash while evaluation is configured is NOT honoured:
+			// it could carry an approval given for an old result across a re-eval of
+			// the same revision. Warn with the exact command (every reconcile until
+			// the user switches to the approvalID; bounded by the regate requeue).
+			r.event(ctx, dm, corev1.EventTypeWarning, eventDeprecatedApproval,
+				"ignoring bare-hash approval for revision %s; set %s=%s (the approvalID) to promote",
+				candidate.Hash, decisionmodelv1alpha1.AnnotationPromote, wantID)
+		case approvalNone:
+			// A set-but-non-matching approval is stale (identity changed): warn once,
+			// naming the current approvalID, and keep waiting.
+			if tok := dm.Annotations[decisionmodelv1alpha1.AnnotationPromote]; tok != "" &&
+				tok != candidate.Hash && dm.Status.Phase != decisionmodelv1alpha1.PhaseAwaitingPromotion {
+				r.event(ctx, dm, corev1.EventTypeWarning, eventStaleApproval,
+					"ignoring stale approval %q for revision %s; current approvalID is %s",
+					tok, candidate.Hash, wantID)
+			}
+		}
 	}
 
 	// Announce once, on entry (not on every re-reconcile while waiting).
@@ -119,7 +183,7 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 		r.event(ctx, dm, corev1.EventTypeNormal, eventAwaitingPromotion,
 			"candidate %s passed its gate%s; set annotation %s=%s to promote",
 			modelRef(candidate), evaluationSummary(dm, candidate.Hash),
-			decisionmodelv1alpha1.AnnotationPromote, candidate.Hash)
+			decisionmodelv1alpha1.AnnotationPromote, wantID)
 	}
 	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseAwaitingPromotion)
 	setStatusCondition(dm, metav1.Condition{
@@ -127,7 +191,7 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 		Status: metav1.ConditionFalse,
 		Reason: reasonPromotionPending,
 		Message: fmt.Sprintf("revision %s is ready; set annotation %s=%s to promote it",
-			candidate.Hash, decisionmodelv1alpha1.AnnotationPromote, candidate.Hash),
+			candidate.Hash, decisionmodelv1alpha1.AnnotationPromote, wantID),
 	})
 	// Keep re-inspecting the parked candidate's Pods: a model lost in the meantime
 	// must not be promoted on the strength of an old probe.
@@ -176,7 +240,14 @@ func (r *DecisionModelReconciler) consumePromoteApproval(
 	dm *decisionmodelv1alpha1.DecisionModel,
 ) error {
 	tok, ok := dm.Annotations[decisionmodelv1alpha1.AnnotationPromote]
-	if !ok || dm.Status.StableRevision == nil || dm.Status.StableRevision.Hash != tok {
+	if !ok || dm.Status.StableRevision == nil {
+		return nil
+	}
+	// The approval is durable once the revision it named is the persisted stable.
+	// Accept both the approvalID (current form) and the bare revision hash (the
+	// deprecated form) so whichever the user set is cleared after promotion.
+	stable := dm.Status.StableRevision
+	if tok != currentApprovalID(dm, stable) && tok != stable.Hash {
 		return nil
 	}
 	base := dm.DeepCopy()

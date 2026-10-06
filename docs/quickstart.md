@@ -261,20 +261,39 @@ The controller clears the failed revision once when this value differs from the
 one it last consumed. Returning the spec to the last stable revision also clears
 it.
 
-### API key (Secret label requirement)
+### Secret capability labels
 
-If you set `spec.auth.apiKeySecretRef`, the referenced Secret **must** carry the
-label `decisionmodel.io/api-key: "true"`, or the operator refuses to read it
-(phase `Degraded`, `Ready=False`, reason `SecretNotAllowed`). This guards against a
-DecisionModel editor pointing the operator at an arbitrary Secret.
+A Secret the operator reads must carry the label for the capability it is used
+for — one label grants exactly one capability:
+
+| Capability | Label | Granted to |
+|---|---|---|
+| Engine API key | `decisionmodel.io/api-key: "true"` | `spec.auth.apiKeySecretRef` |
+| Eval dataset | `decisionmodel.io/eval-dataset: "true"` | a `datasetRef.secretRef` dataset |
+| Download token | `decisionmodel.io/download-token: "true"` | `spec.cache.downloadTokenSecretRef` |
+
+A Secret without the required label is refused: the API key and download token
+report phase `Degraded`, `Ready=False`, reason `SecretNotAllowed`; a dataset
+Secret is **held** in `Evaluating` (`Evaluated=False`, reason `SecretNotAllowed`)
+until the label is added. This guards against a DecisionModel editor pointing the
+operator at an arbitrary Secret.
 
 ```sh
 kubectl label secret my-ollaya-key decisionmodel.io/api-key=true
+kubectl label secret my-golden-dataset decisionmodel.io/eval-dataset=true
 ```
 
 Adding the label to an existing Secret is enough to recover: the operator re-reads
 the Secret on its next reconcile and clears the condition within ~60 s — no spec
 change and no annotation are required.
+
+> **Transition.** A dataset Secret labelled only with the older
+> `decisionmodel.io/api-key: "true"` still works for one release but emits a
+> `DeprecatedSecretLabel` Warning; switch it to `decisionmodel.io/eval-dataset`.
+
+The API-key Secret must contain the referenced key: `apiKeySecretRef.optional` is
+rejected (CEL), and a labelled Secret missing the key is reported as `Degraded`,
+reason `APIKeyInvalid`, with no workloads changed.
 
 ### Rotating the API key
 
@@ -336,11 +355,40 @@ args, or Helm `manager.*` values):
 | `--allow-insecure-registries` | `false` | Permit `http://` model registries (dev only). |
 | `--allow-image-override` | `false` | Permit `spec.image` to override the engine's default image. |
 | `--max-concurrent-reconciles` | `4` | Max DecisionModels reconciled concurrently. |
+| `--runtime-version-policy` | `Pinned` | How an unset `spec.runtimeVersion` resolves: `Pinned` reuses the stable revision's recorded runtime version (an operator upgrade starts no rollout) or `FollowOperator` uses the engine default. |
+| `--max-concurrent-rollouts` | `0` | Max DecisionModels rolling out at once across the watched scope (0 = unlimited). Others wait in phase `Pending` (reason `RolloutQueued`), FIFO. |
 | `--ollaya-registry` | (empty) | Default registry base URL for host-less model names; empty = `OLLAYA_REGISTRY` env, else `https://ollaya.dev`. |
 | `--ollaya-hf-endpoint` | (empty) | Base URL for model-weight downloads (a Hugging Face mirror or enterprise endpoint; the registry still serves manifests). Empty = `OLLAYA_HF_ENDPOINT` env, else Hugging Face. Needs the 0.10.0+ runtime. |
 
 The security defaults are deliberately strict: only `ollaya.dev`, no `http://`,
 and no image override unless you opt in.
+
+## Upgrading the operator
+
+A new operator release may ship a newer default engine runtime image. What
+happens to your DecisionModels on `helm upgrade` depends on
+`--runtime-version-policy`:
+
+- **Pinned (default).** A DecisionModel that does not set `spec.runtimeVersion`
+  keeps the runtime version its stable revision was promoted with, so an operator
+  upgrade alone starts **no** rollout. The new default is surfaced as the
+  `RuntimeUpdateAvailable` condition and a one-off Event; adopt it deliberately by
+  setting `spec.runtimeVersion` (e.g. `0.10.0`) on each DecisionModel, which
+  starts a normal blue-green rollout for that one.
+- **FollowOperator.** An unset `spec.runtimeVersion` tracks the operator default,
+  so an upgrade rolls every DecisionModel onto the new runtime at once. Bound the
+  blast radius with `--max-concurrent-rollouts` (e.g. `2`–`3`): DecisionModels
+  beyond the budget wait in phase `Pending` (reason `RolloutQueued`) and roll out
+  in FIFO order as slots free up.
+
+Pin a specific runtime regardless of policy with `spec.runtimeVersion` (mutually
+exclusive with `spec.image`):
+
+```yaml
+spec:
+  model: laya:en
+  runtimeVersion: "0.10.0"   # exact engine release; survives operator upgrades
+```
 
 ## Eval-gated rollout
 

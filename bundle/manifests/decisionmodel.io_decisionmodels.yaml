@@ -89,7 +89,10 @@ spec:
                       APIKeySecretRef references a Secret key holding the engine API key. The
                       Secret must carry the label decisionmodel.io/api-key: "true" (opt-in), or
                       the operator reports Degraded (SecretNotAllowed) and creates no workloads.
-                      The same key is used by the operator's prober and evaluator.
+                      The same key is used by the operator's prober and evaluator. The referenced
+                      key must exist (optional is not supported: the prober and the serving Pod
+                      would otherwise disagree); a missing key is reported as Degraded
+                      (APIKeyInvalid).
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -112,6 +115,10 @@ spec:
                     - key
                     type: object
                     x-kubernetes-map-type: atomic
+                    x-kubernetes-validations:
+                    - message: 'apiKeySecretRef.optional is not supported: the key
+                        must exist'
+                      rule: '!has(self.optional) || !self.optional'
                 type: object
               cache:
                 description: Cache configures the model store PVC.
@@ -201,6 +208,7 @@ spec:
                   Image overrides the engine's default container image. Rejected unless the
                   operator is started with --allow-image-override (a DecisionModel editor
                   could otherwise run an arbitrary image under the operator's Pod template).
+                  Mutually exclusive with runtimeVersion.
                 type: string
               model:
                 description: |-
@@ -313,7 +321,9 @@ spec:
                           secretRef:
                             description: |-
                               SecretRef selects a key in a Secret holding the JSONL dataset. The Secret
-                              must carry the label decisionmodel.io/api-key: "true" (opt-in guard).
+                              must carry the label decisionmodel.io/eval-dataset: "true" (opt-in guard).
+                              For one release a Secret labelled only decisionmodel.io/api-key: "true" is
+                              still accepted (deprecated; a Warning Event names the label to add).
                             properties:
                               key:
                                 description: Key holding the JSONL content.
@@ -366,6 +376,15 @@ spec:
                           MinAccuracy is the minimum accuracy (decimal string in [0,1], e.g. "0.90")
                           the candidate must reach to be promoted.
                         pattern: ^(0(\.[0-9]+)?|1(\.0+)?)$
+                        type: string
+                      scoreTolerance:
+                        description: |-
+                          ScoreTolerance is the correctness band for "score" questions (decimal
+                          string): a predicted expected-value level counts as correct when it is
+                          within this many levels of the golden integer level. A case may override it
+                          per question via a "tolerance" map. Empty means the default (0.5, "rounds to
+                          the expected level").
+                        pattern: ^[0-9]+(\.[0-9]+)?$
                         type: string
                     required:
                     - datasetRef
@@ -458,6 +477,15 @@ spec:
                     Manual'
                   rule: '!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion)
                     || self.promotion == ''Manual'''
+              runtimeVersion:
+                description: |-
+                  RuntimeVersion pins the engine runtime release (e.g. "0.10.0", plain
+                  MAJOR.MINOR.PATCH) independently of the operator's default. Pinning it means
+                  an operator upgrade that changes the default runtime image does not start a
+                  rollout for this DecisionModel. Mutually exclusive with image. When unset
+                  the effective version follows --runtime-version-policy.
+                pattern: ^[0-9]+\.[0-9]+\.[0-9]+$
+                type: string
               scheduling:
                 description: Scheduling is a passthrough of nodeSelector/tolerations/affinity
                   for serving Pods.
@@ -1444,6 +1472,9 @@ spec:
             required:
             - model
             type: object
+            x-kubernetes-validations:
+            - message: image and runtimeVersion are mutually exclusive
+              rule: '!(has(self.image) && has(self.runtimeVersion))'
           status:
             description: DecisionModelStatus defines the observed state of DecisionModel.
             properties:
@@ -1564,6 +1595,13 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  runtimeVersion:
+                    description: |-
+                      RuntimeVersion is the resolved engine runtime version for this revision
+                      (e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the
+                      version is then unknown. Recorded so a stable revision keeps its runtime
+                      version across operator upgrades under --runtime-version-policy=Pinned.
+                    type: string
                 type: object
               conditions:
                 description: Conditions represent the latest available observations
@@ -1636,6 +1674,14 @@ spec:
                   accuracy:
                     description: Accuracy is the candidate accuracy (decimal string).
                     type: string
+                  approvalId:
+                    description: |-
+                      ApprovalID is the identity a manual approval must name: the first 12 hex of
+                      sha256(revisionHash + policyHash + datasetDigest). Set the annotation
+                      decisionmodel.io/promote to this value to promote. It changes whenever the
+                      revision, policy or dataset changes, so an approval cannot carry over a
+                      re-evaluation.
+                    type: string
                   baselineAccuracy:
                     description: BaselineAccuracy is the stable revision's accuracy
                       for this dataset, if known.
@@ -1654,6 +1700,13 @@ spec:
                   completedAt:
                     description: CompletedAt is when the evaluation finished.
                     format: date-time
+                    type: string
+                  datasetDigest:
+                    description: |-
+                      DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was
+                      produced from. Together with policyHash it is the result's identity: if the
+                      dataset content changes (same ConfigMap/Secret, edited in place) a parked
+                      candidate is re-evaluated rather than promoted on the stale result.
                     type: string
                   ece:
                     description: ECE is the candidate's expected calibration error
@@ -1822,6 +1875,13 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  runtimeVersion:
+                    description: |-
+                      RuntimeVersion is the resolved engine runtime version for this revision
+                      (e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the
+                      version is then unknown. Recorded so a stable revision keeps its runtime
+                      version across operator upgrades under --runtime-version-policy=Pinned.
+                    type: string
                 type: object
               lastPromotionTime:
                 description: LastPromotionTime is when a candidate was most recently
@@ -1990,6 +2050,13 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  runtimeVersion:
+                    description: |-
+                      RuntimeVersion is the resolved engine runtime version for this revision
+                      (e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the
+                      version is then unknown. Recorded so a stable revision keeps its runtime
+                      version across operator upgrades under --runtime-version-policy=Pinned.
+                    type: string
                 type: object
             type: object
         type: object

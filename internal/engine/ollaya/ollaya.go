@@ -271,6 +271,9 @@ var _ engine.Decider = (*Engine)(nil)
 // Compile-time check that Engine implements the optional RegistryHoster capability.
 var _ engine.RegistryHoster = (*Engine)(nil)
 
+// Compile-time check that Engine implements the optional RuntimeVersioner capability.
+var _ engine.RuntimeVersioner = (*Engine)(nil)
+
 // Name returns the engine name.
 func (e *Engine) Name() string { return engineName }
 
@@ -1057,6 +1060,55 @@ func imageForVersion(version, device string) string {
 		return imageRepo + ":" + version + "-cuda"
 	}
 	return imageRepo + ":" + version
+}
+
+// DefaultRuntimeVersion implements engine.RuntimeVersioner: the release used when
+// Params.RuntimeVersion is empty.
+func (e *Engine) DefaultRuntimeVersion() string { return DefaultRuntimeVersion }
+
+// ValidateRuntimeVersion implements engine.RuntimeVersioner, delegating to the
+// package-level validator (empty is valid; below MinRuntimeVersion or malformed
+// is an *InvalidRuntimeVersionError).
+func (e *Engine) ValidateRuntimeVersion(version string) error {
+	return ValidateRuntimeVersion(version)
+}
+
+// CompareRuntimeVersions implements engine.RuntimeVersioner: it orders two
+// MAJOR.MINOR.PATCH versions (-1, 0, 1). A version that is not valid (malformed,
+// or below the minimum) is treated as "unknown" and compares equal to anything,
+// so it never claims an update is available — matching the controller's prior
+// behaviour.
+func (e *Engine) CompareRuntimeVersions(a, b string) int {
+	if !comparableVersion(a) || !comparableVersion(b) {
+		return 0
+	}
+	return compareVersions(a, b)
+}
+
+// comparableVersion reports whether v is a concrete, orderable runtime version:
+// a well-formed MAJOR.MINOR.PATCH string that is not below the minimum. The empty
+// "use the default" sentinel and any malformed or below-minimum string are not
+// comparable (treated as "unknown").
+func comparableVersion(v string) bool {
+	return runtimeVersionRE.MatchString(v) && ValidateRuntimeVersion(v) == nil
+}
+
+// RuntimeVersionFromImage implements engine.RuntimeVersioner: it extracts the
+// MAJOR.MINOR.PATCH release from one of the engine's default image tags
+// (ghcr.io/ollaya-dev/ollaya:<v> or :<v>-cuda). Anything else — a different
+// repository, a digest-only reference, or a mirror of the image under another
+// registry — returns "" (the version is then unknown).
+func (e *Engine) RuntimeVersionFromImage(image string) string {
+	prefix := imageRepo + ":"
+	if !strings.HasPrefix(image, prefix) {
+		return ""
+	}
+	tag := strings.TrimPrefix(image, prefix)
+	tag = strings.TrimSuffix(tag, "-cuda")
+	if ValidateRuntimeVersion(tag) != nil {
+		return ""
+	}
+	return tag
 }
 
 const (

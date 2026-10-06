@@ -103,12 +103,26 @@ func (f *fakeEngine) RegistryHost(name string) (string, bool, error) {
 }
 
 // fakeImageFor mirrors the real engine's imageFor: an explicit p.Image override
-// wins, otherwise the device default (distinct CPU/CUDA images). It lets the
-// test assert that a cuda DM without spec.image prefetches with the CPU
-// default rather than the resolved serving (CUDA) image.
+// wins; otherwise, when a runtime version is set, a version-specific tag
+// (so a pinned spec.runtimeVersion yields a distinct serving image and the
+// revision hash reflects it); otherwise the device default (distinct CPU/CUDA
+// images). It lets the test assert that a cuda DM without spec.image prefetches
+// with the CPU default rather than the resolved serving (CUDA) image.
 func fakeImageFor(p engine.Params) string {
 	if p.Image != "" {
 		return p.Image
+	}
+	// A non-default pinned version yields a version-specific tag so the revision
+	// hash reflects it. The engine default version (or an unset version) maps to
+	// the plain device-default image, matching the real engine where the default
+	// version IS the default image — so recording and reusing the default version
+	// under Pinned never changes the resolved image or the hash.
+	if p.RuntimeVersion != "" && p.RuntimeVersion != ollaya.DefaultRuntimeVersion {
+		img := "ghcr.io/ollaya-dev/ollaya:" + p.RuntimeVersion
+		if p.Device == engine.DeviceCUDA {
+			img += "-cuda"
+		}
+		return img
 	}
 	if p.Device == engine.DeviceCUDA {
 		return fakeImageCUDA

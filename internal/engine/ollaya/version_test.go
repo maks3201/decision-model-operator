@@ -171,3 +171,86 @@ func TestDefaultImagesDerivedFromDefaultVersion(t *testing.T) {
 		t.Errorf("DefaultImageCUDA = %q, want %q", DefaultImageCUDA, wantCUDA)
 	}
 }
+
+func TestRuntimeVersionerDefaultAndValidate(t *testing.T) {
+	e := New()
+	if e.DefaultRuntimeVersion() != DefaultRuntimeVersion {
+		t.Errorf("DefaultRuntimeVersion() = %q, want %q", e.DefaultRuntimeVersion(), DefaultRuntimeVersion)
+	}
+	// Delegates to the package validator.
+	if err := e.ValidateRuntimeVersion("0.10.0"); err != nil {
+		t.Errorf("ValidateRuntimeVersion(0.10.0) = %v, want nil", err)
+	}
+	if err := e.ValidateRuntimeVersion("latest"); err == nil {
+		t.Errorf("ValidateRuntimeVersion(latest) = nil, want error")
+	}
+	if err := e.ValidateRuntimeVersion(""); err != nil {
+		t.Errorf("ValidateRuntimeVersion(\"\") = %v, want nil (empty is valid)", err)
+	}
+}
+
+func TestCompareRuntimeVersions(t *testing.T) {
+	e := New()
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"0.7.3", "0.10.0", -1},
+		{"0.10.0", "0.7.3", 1},
+		{"0.10.0", "0.10.0", 0},
+		{"1.2.3", "1.2.4", -1},
+		{"1.3.0", "1.2.9", 1},
+		{"2.0.0", "1.9.9", 1},
+		// An invalid or below-minimum version is "unknown" -> compares equal (0).
+		{"latest", "0.10.0", 0},
+		{"0.10.0", "latest", 0},
+		{"0.7.2", "0.10.0", 0}, // below minimum -> unknown
+		{"", "0.10.0", 0},      // empty is valid-but-not-a-number here -> unknown
+	}
+	for _, tt := range tests {
+		if got := e.CompareRuntimeVersions(tt.a, tt.b); got != tt.want {
+			t.Errorf("CompareRuntimeVersions(%q, %q) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestRuntimeVersionFromImage(t *testing.T) {
+	e := New()
+	tests := []struct {
+		name  string
+		image string
+		want  string
+	}{
+		{"cpu default tag", "ghcr.io/ollaya-dev/ollaya:0.10.0", "0.10.0"},
+		{"cuda default tag", "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda", "0.10.0"},
+		{"older cpu tag", "ghcr.io/ollaya-dev/ollaya:0.7.3", "0.7.3"},
+		{"empty image", "", ""},
+		{"other repository", "docker.io/library/ollaya:0.10.0", ""},
+		{"mirror of the image", "mirror.corp/ollaya-dev/ollaya:0.10.0", ""},
+		{"digest-only reference", "ghcr.io/ollaya-dev/ollaya@sha256:abc", ""},
+		{"non-version tag", "ghcr.io/ollaya-dev/ollaya:latest", ""},
+		{"below-minimum tag", "ghcr.io/ollaya-dev/ollaya:0.7.2", ""},
+		{"cuda12 suffix not stripped", "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda12", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := e.RuntimeVersionFromImage(tt.image); got != tt.want {
+				t.Errorf("RuntimeVersionFromImage(%q) = %q, want %q", tt.image, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRuntimeVersionFromImageRoundTrip pins that an image the engine itself
+// builds round-trips back to the version it was built from.
+func TestRuntimeVersionFromImageRoundTrip(t *testing.T) {
+	e := New()
+	for _, ver := range []string{"0.7.3", "0.10.0", "1.2.3"} {
+		for _, dev := range []string{engine.DeviceCPU, engine.DeviceCUDA} {
+			img := imageForVersion(ver, dev)
+			if got := e.RuntimeVersionFromImage(img); got != ver {
+				t.Errorf("RuntimeVersionFromImage(%q) = %q, want %q", img, got, ver)
+			}
+		}
+	}
+}

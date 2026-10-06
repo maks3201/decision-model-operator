@@ -434,6 +434,11 @@ var errDatasetKeyNotFound = errors.New("dataset key not found")
 // start.
 var errDownloadTokenInvalid = errors.New("download token invalid")
 
+// errAPIKeyInvalid reports that the API-key Secret exists and is labelled but is
+// missing the referenced key, so the prober and the serving Pod would read
+// different keys. The revision is held Degraded (APIKeyInvalid), not failed.
+var errAPIKeyInvalid = errors.New("api key invalid")
+
 // errResourceConflict reports that an object with the name this DM wants to
 // manage exists but is NOT controlled by this DM (different/absent controller
 // owner UID). The reconciler must never update or delete such an object; it
@@ -507,6 +512,23 @@ func requireAPIKeyLabel(labels map[string]string) error {
 		return fmt.Errorf("%w: missing label %s=true", errSecretNotAllowed, decisionmodelv1alpha1.LabelAPIKey)
 	}
 	return nil
+}
+
+// requireEvalDatasetLabel enforces the dataset-Secret capability label. The
+// current label is decisionmodel.io/eval-dataset=true. For one release a Secret
+// carrying only the legacy decisionmodel.io/api-key=true is still accepted and
+// reported as deprecated so the caller can emit a Warning. A Secret with neither
+// label returns errSecretNotAllowed (held, not failed — see the dataset hold).
+func requireEvalDatasetLabel(labels map[string]string) (deprecated bool, err error) {
+	switch {
+	case labels[decisionmodelv1alpha1.LabelEvalDataset] == annotationTrue:
+		return false, nil
+	case labels[decisionmodelv1alpha1.LabelAPIKey] == annotationTrue:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: missing label %s=true",
+			errSecretNotAllowed, decisionmodelv1alpha1.LabelEvalDataset)
+	}
 }
 
 // requireDownloadTokenLabel returns errSecretNotAllowed unless the Secret carries

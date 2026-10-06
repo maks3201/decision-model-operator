@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/maks3201/decision-model-operator/internal/engine"
+	"github.com/maks3201/decision-model-operator/internal/eval"
 	"github.com/maks3201/decision-model-operator/internal/eval/calibration"
 )
 
@@ -50,6 +51,9 @@ type evalCase struct {
 	State     json.RawMessage            `json:"state"`
 	Questions json.RawMessage            `json:"questions"`
 	Expected  map[string]json.RawMessage `json:"expected"`
+	// Tolerance optionally overrides the score-question correctness band per
+	// question id (levels). Absent entries fall back to the spec scoreTolerance.
+	Tolerance map[string]float64 `json:"tolerance,omitempty"`
 }
 
 // datasetHash returns a stable content hash for a dataset (bare hex, 16 chars).
@@ -95,33 +99,62 @@ func parseDataset(raw []byte, maxCases int) ([]evalCase, error) {
 	return cases, nil
 }
 
-// scorePrediction evaluates one answer against the expected golden value and
-// returns a calibration.Prediction plus whether it could be scored. Unknown
-// types, missing answers, or malformed expectations count as scored-and-wrong
-// with zero confidence so they penalise both accuracy and calibration.
-func scorePrediction(a engine.Answer, expected json.RawMessage) (calibration.Prediction, bool) {
+// scoreOutcome is the result of scoring one answer against its golden value.
+type scoreOutcome struct {
+	scored         bool                   // false: unknown type / malformed expectation -> wrong
+	correct        bool                   // accuracy contribution
+	pred           calibration.Prediction // calibration contribution (only when hasCalibration)
+	hasCalibration bool                   // whether pred feeds ECE/Brier
+}
+
+// scorePrediction evaluates one answer against the expected golden value. tol is
+// the score-question correctness band (levels) for this question. choice/noul
+// contribute to both accuracy and calibration; a score question always counts
+// toward accuracy (MatchScore on the expected value) and contributes to
+// calibration only when the runtime returned a usable probability distribution.
+// Unknown types or malformed expectations are scored-and-wrong with no
+// calibration contribution.
+func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) scoreOutcome {
 	switch a.Type {
 	case "choice":
 		var want string
 		if err := json.Unmarshal(expected, &want); err != nil {
-			return calibration.Prediction{}, false
+			return scoreOutcome{scored: false}
 		}
 		if p, ok := calibration.FromChoice(a.Probabilities, a.Choice, want); ok {
-			return p, true
+			return scoreOutcome{scored: true, correct: p.Correct, pred: p, hasCalibration: true}
 		}
-		// No probability for the chosen label: score correctness with 0 confidence.
-		return calibration.Prediction{Confidence: 0, Correct: a.Choice == want}, true
+		return scoreOutcome{scored: true, correct: a.Choice == want,
+			pred: calibration.Prediction{Confidence: 0, Correct: a.Choice == want}, hasCalibration: true}
 	case "noul":
 		var want bool
 		if err := json.Unmarshal(expected, &want); err != nil {
-			return calibration.Prediction{}, false
+			return scoreOutcome{scored: false}
 		}
 		if a.Noul == nil {
-			return calibration.Prediction{Confidence: 0, Correct: false}, true
+			return scoreOutcome{scored: true, correct: false,
+				pred: calibration.Prediction{Confidence: 0, Correct: false}, hasCalibration: true}
 		}
-		return calibration.FromNoul(*a.Noul, want), true
+		p := calibration.FromNoul(*a.Noul, want)
+		return scoreOutcome{scored: true, correct: p.Correct, pred: p, hasCalibration: true}
+	case "score":
+		want, err := eval.ParseScoreExpected(expected)
+		if err != nil {
+			return scoreOutcome{scored: false}
+		}
+		if a.Score == nil {
+			// No predicted level: scored and wrong, no calibration contribution.
+			return scoreOutcome{scored: true, correct: false}
+		}
+		out := scoreOutcome{scored: true, correct: eval.MatchScore(*a.Score, want, tol)}
+		// Calibration only when the runtime returned a usable distribution.
+		if conf, calOK, ok := eval.ScoreCalibration(a.Probabilities, want); ok {
+			out.pred = calibration.Prediction{Confidence: conf, Correct: calOK}
+			out.hasCalibration = true
+		}
+		return out
 	default:
-		return calibration.Prediction{}, false
+		return scoreOutcome{scored: false}
 	}
 }
 
@@ -147,6 +180,7 @@ func runEvaluation(
 	cases []evalCase,
 	now func() time.Time,
 	timeout time.Duration,
+	scoreTolerance float64,
 ) evalResult {
 	deadline := now().Add(timeout)
 	var total, correct, failed, transport int
@@ -183,14 +217,22 @@ func runEvaluation(
 				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
 				continue
 			}
-			pred, scored := scorePrediction(ans, want)
-			if !scored {
+			tol := scoreTolerance
+			if c.Tolerance != nil {
+				if t, ok := c.Tolerance[qid]; ok {
+					tol = t
+				}
+			}
+			out := scorePrediction(ans, want, tol)
+			if !out.scored {
 				failed++
 				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
 				continue
 			}
-			preds = append(preds, pred)
-			if pred.Correct {
+			if out.hasCalibration {
+				preds = append(preds, out.pred)
+			}
+			if out.correct {
 				correct++
 			} else {
 				failed++
