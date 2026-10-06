@@ -61,6 +61,10 @@ var _ = Describe("Registry mirror", Ordered, func() {
 		if os.Getenv("E2E_MIRROR") == "" {
 			Skip("set E2E_MIRROR to build the mirror image and run this spec")
 		}
+		// The mirror image bakes laya:en (dmo-e2e-mirror:laya-en); it is laya-specific.
+		if !modelIsLaya() {
+			Skip("laya-specific: the registry mirror image serves laya:en")
+		}
 
 		// hack/mirror-build.sh fetched the manifest+blobs over HTTP (no ollaya) and
 		// loaded the mirror image into the kind node in BeforeSuite.

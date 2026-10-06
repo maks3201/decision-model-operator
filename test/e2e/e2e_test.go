@@ -101,8 +101,8 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 	})
 
 	It("becomes Ready with the pinned digest and a model-ready Pod", func() {
-		By("applying a DecisionModel (laya:en, cpu, replicas 1)")
-		applyDecisionModel(dmName, "laya:en", 1)
+		By(fmt.Sprintf("applying a DecisionModel (%s, cpu, replicas 1)", testModel))
+		applyDecisionModel(dmName, testModel, 1)
 
 		By("waiting for status.phase=Ready (timeout 10m)")
 		Eventually(func() (string, error) {
@@ -110,11 +110,18 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 		}, 8*time.Minute, 5*time.Second).Should(Equal("Ready"),
 			"DecisionModel never reached phase Ready")
 
-		By("checking status.stableRevision.digest == expected")
+		By("checking status.stableRevision.digest is pinned")
 		digest, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
 			"{.status.stableRevision.digest}")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(digest).To(Equal(expectedDigest), "stableRevision.digest mismatch")
+		if modelIsLaya() {
+			Expect(digest).To(Equal(expectedDigest), "stableRevision.digest mismatch")
+		} else {
+			// Non-laya models have their own digest; assert it is a resolved bare-hex
+			// sha256 rather than hard-coding each model's value.
+			Expect(digest).To(MatchRegexp(`^[0-9a-f]{64}$`),
+				"stableRevision.digest is not a bare-hex sha256: %q", digest)
+		}
 
 		By("checking status.stableRevision.device == the requested device")
 		device, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
@@ -178,7 +185,7 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 
 		By("creating a second DecisionModel and asserting it gets a different level")
 		const dm2 = "support-router-2"
-		applyDecisionModel(dm2, "laya:en", 1)
+		applyDecisionModel(dm2, testModel, 1)
 		defer func() {
 			_, _ = utils.Kubectl("delete", "decisionmodel", dm2, "-n", testNamespace, "--ignore-not-found")
 		}()
@@ -197,6 +204,9 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 	})
 
 	It("answers /v1/systemone routing the billing case to the billing department", func() {
+		if !modelIsLaya() {
+			Skip("laya-specific: asserts the support-triage billing routing of laya:en")
+		}
 		stop := make(chan struct{})
 		local := portForward(dmName, testNamespace, 11435, stop)
 		defer close(stop)
@@ -242,7 +252,7 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 	It("keeps the stable revision serving when a new revision fails to resolve", func() {
 		By("pointing spec.model at a missing tag")
 		_, err := utils.Kubectl("patch", "decisionmodel", dmName, "-n", testNamespace,
-			"--type=merge", "-p", `{"spec":{"model":"laya:does-not-exist"}}`)
+			"--type=merge", "-p", fmt.Sprintf(`{"spec":{"model":"%s:does-not-exist"}}`, modelBase()))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("expecting the phase to go Failed/RolledBack")
@@ -264,7 +274,7 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 
 		By("restoring a valid model for the scaling test")
 		_, err = utils.Kubectl("patch", "decisionmodel", dmName, "-n", testNamespace,
-			"--type=merge", "-p", `{"spec":{"model":"laya:en"}}`)
+			"--type=merge", "-p", fmt.Sprintf(`{"spec":{"model":"%s"}}`, testModel))
 		Expect(err).NotTo(HaveOccurred())
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
