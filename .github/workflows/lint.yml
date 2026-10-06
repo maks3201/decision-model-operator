@@ -70,6 +70,8 @@ jobs:
             --set manager.allowImageOverride=true \
             --set manager.ollayaRegistry=https://reg.internal \
             --set manager.ollayaHFEndpoint=https://hf.internal \
+            --set manager.runtimeVersionPolicy=FollowOperator \
+            --set manager.maxConcurrentRollouts=2 \
             --set metrics.enabled=false >/dev/null
 
       - name: values.schema.json rejects typos and bad values
@@ -86,6 +88,9 @@ jobs:
           assert_fail --set image.pullPolicy=Sometimes         # not in the enum
           assert_fail --set manager.ollayaRegistry=ftp://x     # not an http(s) URL
           assert_fail --set replicaCount=notanumber            # wrong type
+          assert_fail --set manager.runtimeVersionPolicy=Bogus # not in the enum
+          assert_fail --set manager.maxConcurrentRollouts=-1   # below minimum
+          assert_fail --set manager.maxConcurrentRollouts=notint # wrong type
           echo "schema correctly rejected all negative cases"
 
       - name: artifacthub.io/changes generator produces a packageable chart

@@ -239,6 +239,38 @@ kubectl apply -f charts/decision-model-operator/crds/decisionmodel.io_decisionmo
 
 Set `installCRDs: false` if you manage the CRD entirely out of band.
 
+### Upgrading the operator (runtime version)
+
+Each DecisionModel records the Ollaya **runtime version** its running revision was
+built with. What a `helm upgrade` that ships a newer default runtime does to a
+running model depends on `manager.runtimeVersionPolicy`:
+
+- **`Pinned` (default):** a model with no `spec.runtimeVersion` keeps serving on
+  the runtime version its stable revision already recorded. An operator upgrade
+  starts **no** rollout; the model is nudged with a `RuntimeUpdateAvailable`
+  condition instead. Roll a model forward when you choose by setting
+  `spec.runtimeVersion` (e.g. `"0.10.0"`), which triggers one blue-green rollout
+  for that model only.
+- **`FollowOperator`:** a model with no `spec.runtimeVersion` adopts the operator's
+  new default runtime automatically, so the upgrade rolls **every** such model
+  blue-green onto the new version.
+
+Because a rollout runs the old and new revisions at once (and, on GPU, needs a
+second GPU for the candidate), `FollowOperator` can start a fleet-wide stampede.
+Cap it with `manager.maxConcurrentRollouts` (`0` = unlimited; others wait in phase
+`Pending`). On GPU clusters a small budget — **2-3** — is recommended so only a
+few extra GPUs are needed at any moment:
+
+```yaml
+# values.yaml
+manager:
+  runtimeVersionPolicy: FollowOperator
+  maxConcurrentRollouts: 2
+```
+
+A model that pins `spec.runtimeVersion` or `spec.image` opts out of both policies
+(it already fixes its own runtime).
+
 ## Uninstall
 
 ```sh

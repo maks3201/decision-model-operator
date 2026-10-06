@@ -246,6 +246,38 @@ kubectl apply -f charts/decision-model-operator/crds/decisionmodel.io_decisionmo
 
 Set `installCRDs: false` if you manage the CRD entirely out of band.
 
+### Upgrading the operator (runtime version)
+
+Each DecisionModel records the Ollaya **runtime version** its running revision was
+built with. What a `helm upgrade` that ships a newer default runtime does to a
+running model depends on `manager.runtimeVersionPolicy`:
+
+- **`Pinned` (default):** a model with no `spec.runtimeVersion` keeps serving on
+  the runtime version its stable revision already recorded. An operator upgrade
+  starts **no** rollout; the model is nudged with a `RuntimeUpdateAvailable`
+  condition instead. Roll a model forward when you choose by setting
+  `spec.runtimeVersion` (e.g. `"0.10.0"`), which triggers one blue-green rollout
+  for that model only.
+- **`FollowOperator`:** a model with no `spec.runtimeVersion` adopts the operator's
+  new default runtime automatically, so the upgrade rolls **every** such model
+  blue-green onto the new version.
+
+Because a rollout runs the old and new revisions at once (and, on GPU, needs a
+second GPU for the candidate), `FollowOperator` can start a fleet-wide stampede.
+Cap it with `manager.maxConcurrentRollouts` (`0` = unlimited; others wait in phase
+`Pending`). On GPU clusters a small budget — **2-3** — is recommended so only a
+few extra GPUs are needed at any moment:
+
+```yaml
+# values.yaml
+manager:
+  runtimeVersionPolicy: FollowOperator
+  maxConcurrentRollouts: 2
+```
+
+A model that pins `spec.runtimeVersion` or `spec.image` opts out of both policies
+(it already fixes its own runtime).
+
 ## Uninstall
 
 ```sh
@@ -305,6 +337,8 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | manager.maxConcurrentReconciles | int | `4` | `--max-concurrent-reconciles`: max DecisionModels reconciled concurrently. |
 | manager.ollayaRegistry | string | `""` | `--ollaya-registry`: default registry base URL for host-less model names. Empty = the operator default (`OLLAYA_REGISTRY` env, else `https://ollaya.dev`); not rendered when empty. |
 | manager.ollayaHFEndpoint | string | `""` | `--ollaya-hf-endpoint`: base URL for model-weight downloads (a Hugging Face mirror or enterprise endpoint; the model registry still serves manifests). Empty = the runtime default (`OLLAYA_HF_ENDPOINT` env, else Hugging Face); not rendered when empty. Needs the 0.10.0+ runtime; older runtimes ignore it. |
+| manager.runtimeVersionPolicy | string | `""` | `--runtime-version-policy`: how an unset `spec.runtimeVersion` resolves. `Pinned` (default) reuses the stable revision's runtime version, so an operator upgrade starts no rollout; `FollowOperator` uses the engine default, so an upgrade rolls every DecisionModel onto the new runtime. Empty = the binary default (`Pinned`); not rendered when empty. |
+| manager.maxConcurrentRollouts | string | `nil` | `--max-concurrent-rollouts`: cap on DecisionModels rolling out at once across the watched scope (`0` = unlimited; others wait in phase `Pending`). Set a small value (e.g. 2-3) to avoid a fleet-wide stampede when the default runtime image changes under `FollowOperator`. `null`/unset = the binary default (`0`, unlimited); not rendered unless set to a positive value. |
 | watchNamespaces | list | `[]` | Namespaces to watch (`--watch-namespaces`). Empty = cluster-wide (manager ClusterRole/ClusterRoleBinding). When non-empty, the operator watches only these namespaces and the chart renders a namespaced Role+RoleBinding in each instead of the ClusterRole. The CRD stays cluster-scoped and must be installed by a cluster admin. |
 | proxy.httpProxy | string | `""` | `HTTP_PROXY` for the manager (and, via the operator, the prefetch Job). Empty = not set. |
 | proxy.httpsProxy | string | `""` | `HTTPS_PROXY` for the manager (and the prefetch Job). Empty = not set. |
