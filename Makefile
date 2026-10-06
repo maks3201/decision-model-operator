@@ -323,6 +323,8 @@ endif
 .PHONY: bundle
 bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
 	$(OPERATOR_SDK) generate kustomize manifests -q
+	@# generate kustomize manifests drops comments, so set the CSV containerImage from IMG here.
+	sed -i.bak -E 's|^(    containerImage: ).*|\1$(IMG)|' config/manifests/bases/decision-model-operator.clusterserviceversion.yaml && rm -f config/manifests/bases/decision-model-operator.clusterserviceversion.yaml.bak
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
 	$(OPERATOR_SDK) bundle validate ./bundle

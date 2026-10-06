@@ -406,7 +406,9 @@ can be referenced. What has been verified so far:
 |---|---|
 | `laya:en` | E2E on every change (kind, CPU), and once on a T4 GPU (EKS, runtime 0.7.3) |
 | `laya:multilingual`, `nli:latest`, `gliclass:latest` | Pulled, served and measured (see [sizing](sizing.md)) |
-| GGUF models on the llama.cpp runner (`winnow`, `jevk5`, `jeb`, `cygnet`, …) | Not verified yet: the readiness gate has not been checked against their `/api/ps` output |
+| `gliclass:latest`, `nli:latest` | Nightly E2E (kind, CPU) |
+| `jevk5:latest` (GGUF, Q8_0, llama.cpp runner) | Reached `Ready` on kind; the gate checks digest, device and pinning, not precision, so quantized models pass ([spike 007](https://github.com/maks3201/decision-model-operator/blob/main/docs/spikes/007-gguf-models.md)) |
+| Other GGUF models (`winnow`, `jeb`, `cygnet`, …) | Same runner as `jevk5`, not run individually; 8–13 GB, raise `spec.cache.size` |
 | Large models (`nimble`, `clef`, `jeeves`, ~18–19 GB) | Not verified: size `spec.cache.size` and the GPU yourself |
 
 Reference a model by `name:tag`:
