@@ -364,6 +364,17 @@ spec:
 		By("creating a golden dataset the model gets right (verified labels)")
 		applyConfigMap(evalNS, "golden-pass", "cases.jsonl", datasetJSONL(verified))
 
+		By("disabling the post-promotion stabilization window for this GC assertion")
+		// Default stabilization is 5m: after a promotion the previous revision's
+		// Deployment and store PVC are intentionally kept for the window (instant
+		// rollback). This spec asserts the demoted store PVC is collected shortly after
+		// promotion, so set stabilization to "0s" (collected after the 30s endpoint grace,
+		// the pre-stabilization behaviour). stabilization is not a revision-hash input, so
+		// this patch does not itself create a revision.
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", evalNS, "--type=merge",
+			"-p", `{"spec":{"rollout":{"stabilization":"0s"}}}`)
+		Expect(err).NotTo(HaveOccurred())
+
 		By("attaching evaluation and forcing a new revision (cpu bump)")
 		patchEvalAndBump(dm, evalNS, "golden-pass", "0.8", "300m")
 
@@ -391,10 +402,12 @@ spec:
 		Expect(acc).NotTo(BeEmpty(), "status.evaluation.accuracy should be recorded")
 		_, _ = fmt.Fprintf(GinkgoWriter, "recorded accuracy=%s\n", acc)
 
-		By("after promotion + the promote grace, only the new revision's store PVC remains")
-		// The demoted revision's store PVC is garbage-collected once the controller's
-		// promoteGrace window (internal/controller: promoteGrace = 30s) elapses and the
-		// stable path reconciles. Poll for the end state rather than sleeping the grace.
+		By("after promotion + the stabilization window, only the new revision's store PVC remains")
+		// With stabilization disabled (set to "0" above), the demoted revision's store PVC
+		// is garbage-collected once the endpoint grace (promoteGrace = 30s) elapses and the
+		// stable path reconciles. (With the default 5m stabilization window it would be kept
+		// for instant rollback — covered by the post-promotion rollback spec.) Poll for the
+		// end state rather than sleeping the grace.
 		Eventually(func(g Gomega) {
 			stableNow, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 			g.Expect(stableNow).To(Equal(candHash), "the candidate should now be the stable revision")

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -172,7 +173,164 @@ spec:
 	})
 })
 
+// ppNS isolates the post-promotion rollback scenario.
+const ppNS = "dmo-e2e-postpromo"
+
+// This container covers the post-promotion stabilization safety net: after a
+// candidate is promoted, the previous revision's Deployment is kept (out of the
+// Service) for the stabilization window; if the new stable then becomes unhealthy
+// within the window, the operator switches traffic back to the previous revision,
+// records status.failedRevision.reason=PostPromotionUnhealthy and emits a
+// RolledBackAfterPromotion Event. Labelled "nightly" (own stable + candidate load).
+//
+// The fault is real and operator-detected: we unload the model from the promoted
+// Pod's runtime (POST /api/decide keep_alive=0). The operator's periodic re-inspect
+// (regate, ~60s) then finds /api/ps no longer serving the model, flips the Pod's
+// readiness gate False, model-ready replicas drop below quorum, and the operator
+// rolls back to the previous (still-running) revision within the window.
+var _ = Describe("Rollout: post-promotion rollback", Label("nightly"), Ordered, func() {
+	const dm = "postpromo-router"
+
+	BeforeAll(func() {
+		if testInstall == "helm" {
+			Skip("helm job runs lifecycle specs only")
+		}
+		installAndDeploy()
+		_, _ = utils.Kubectl("create", "ns", ppNS)
+
+		By("bringing up a stable revision")
+		applyYAML(fmt.Sprintf(`apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata: {name: %s, namespace: %s}
+spec:
+  engine: ollaya
+  model: %s
+  device: %s
+  replicas: 1
+  resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
+`, dm, ppNS, testModel, testDevice))
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.phase}")
+		}, 8*time.Minute, 5*time.Second).Should(Equal("Ready"))
+	})
+
+	AfterAll(func() {
+		_, _ = utils.Kubectl("delete", "ns", ppNS, "--ignore-not-found")
+		undeploy()
+	})
+
+	AfterEach(func() { dumpDiag(ppNS, dm) })
+
+	It("rolls back to the previous revision when the new stable becomes unhealthy in the window", func() {
+		By("recording the stable revision before the rollout")
+		prevStable, err := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(prevStable).NotTo(BeEmpty())
+
+		By("promoting a new revision with a generous stabilization window (cpu bump)")
+		// A long stabilization window keeps the previous revision alive while the fault
+		// is injected and detected. No evaluation: promotion is automatic once the
+		// candidate is model-ready.
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", ppNS, "--type=merge",
+			"-p", `{"spec":{"resources":{"requests":{"cpu":"300m","memory":"1Gi"},"limits":{"memory":"4Gi"}},`+
+				`"rollout":{"stabilization":"10m"}}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		var newStable string
+		Eventually(func(g Gomega) {
+			h, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			phase, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(h).NotTo(Equal(prevStable), "a new revision should be promoted")
+			g.Expect(h).NotTo(BeEmpty())
+			g.Expect(phase).To(Equal("Ready"), "the new revision should promote to Ready")
+			newStable = h
+		}, 12*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("the previous revision is kept during the stabilization window (Stabilizing=True)")
+		Eventually(func(g Gomega) {
+			stabilizing, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Stabilizing')].status}")
+			prev, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.previousRevision.hash}")
+			g.Expect(stabilizing).To(Equal("True"), "Stabilizing condition should be True in the window")
+			g.Expect(prev).To(Equal(prevStable), "previousRevision should be the demoted stable, kept for rollback")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		Expect(serviceRevision(ppNS, dm)).To(Equal(newStable), "Service should route to the new revision after promotion")
+
+		By("making the new stable unhealthy: hold its serving Pods down so model-ready stays below quorum")
+		// A single Pod deletion self-heals (the Deployment recreates a Pod that reloads
+		// the model within a reconcile), so to create the SUSTAINED shortfall the operator
+		// treats as unhealthy we keep the new stable's Pods deleted for longer than the
+		// post-promotion debounce. This models a new model that cannot stay up (crash loop
+		// / repeated eviction) — a real failure the stabilization window exists to catch.
+		// The previous revision's Pods (a different revision label) are left untouched.
+		stopKill := make(chan struct{})
+		var killOnce sync.Once
+		stopKilling := func() { killOnce.Do(func() { close(stopKill) }) }
+		go holdRevisionPodsDown(ppNS, dm, newStable, stopKill)
+		defer stopKilling()
+
+		By("the operator detects the unhealthy new stable and rolls back to the previous revision")
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.phase}")
+		}, 10*time.Minute, 10*time.Second).Should(Equal("RolledBack"),
+			"the operator should roll back after the new stable stays unhealthy")
+		stopKilling()
+
+		By("status.failedRevision.reason is PostPromotionUnhealthy and the failed revision is the new one")
+		reason, err := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.failedRevision.reason}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reason).To(Equal("PostPromotionUnhealthy"))
+		failed, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.failedRevision.hash}")
+		Expect(failed).To(Equal(newStable), "the failed revision should be the unhealthy new stable")
+
+		By("the Service is back on the previous revision and it is the stable again")
+		Eventually(func(g Gomega) {
+			stableNow, _ := utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			g.Expect(stableNow).To(Equal(prevStable), "the previous revision should be restored as stable")
+			g.Expect(serviceRevision(ppNS, dm)).To(Equal(prevStable),
+				"Service should route back to the previous revision")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("a RolledBackAfterPromotion Event was emitted")
+		msg, err := utils.Kubectl("get", "events", "-n", ppNS,
+			"--field-selector", "reason=RolledBackAfterPromotion",
+			"-o", "jsonpath={.items[-1:].message}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(msg).NotTo(BeEmpty(), "expected a RolledBackAfterPromotion Event")
+		_, _ = fmt.Fprintf(GinkgoWriter, "RolledBackAfterPromotion: %s\n", msg)
+	})
+})
+
 // ---- helpers shared by the rollout specs (this file + the eval-gated container) ----
+
+// holdRevisionPodsDown repeatedly force-deletes the Pods of a specific revision
+// until stop is closed, keeping that revision's model-ready replicas below quorum
+// long enough for the operator's post-promotion debounce to elapse (a single
+// deletion self-heals when the recreated Pod reloads the model within a reconcile).
+// Scoped to one revision label so the previous (kept) revision is untouched.
+func holdRevisionPodsDown(ns, name, revision string, stop <-chan struct{}) {
+	defer GinkgoRecover()
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		out, err := utils.Kubectl("get", "pods",
+			"-l", "decisionmodel.io/name="+name+",decisionmodel.io/revision="+revision,
+			"-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
+		if err == nil {
+			for _, p := range strings.Fields(out) {
+				_, _ = utils.Kubectl("delete", "pod", p, "-n", ns, "--grace-period=0", "--force")
+			}
+		}
+		select {
+		case <-stop:
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
 
 // rolloutPatch bundles the fields of a merge patch that forces a new eval-gated
 // candidate revision. cpu bumps the request (the revision hash includes resources,

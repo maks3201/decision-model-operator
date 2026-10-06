@@ -25,5 +25,6 @@ Enter
 Sleep 1s
 Type "NO_WAIT=1 KIND_CLUSTER=dmo-demo hack/demo.sh run"
 Enter
-# Real wall-clock budget for a cold run (prefetch Jobs + two evaluations).
-Sleep 320s
+# Real wall-clock budget for a cold run: prefetch Jobs + two evaluations, plus the
+# ~1m post-promotion stabilization window before the previous revision is collected.
+Sleep 430s
