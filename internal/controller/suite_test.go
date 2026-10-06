@@ -55,6 +55,15 @@ var (
 	k8sClient client.Client
 )
 
+// zeroStabilizationRollout disables the post-promotion stabilization window
+// (spec.rollout.stabilization: 0), restoring the pre-window behaviour where the
+// previous revision is collected after the short endpoint-gap grace. GC and
+// promotion tests that assert collection shortly after promotion use it so the
+// 5m default window does not keep the previous revision alive through the test.
+func zeroStabilizationRollout() *decisionmodelv1alpha1.RolloutSpec {
+	return &decisionmodelv1alpha1.RolloutSpec{Stabilization: &metav1.Duration{Duration: 0}}
+}
+
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
 

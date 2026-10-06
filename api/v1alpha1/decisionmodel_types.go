@@ -209,6 +209,19 @@ type RolloutSpec struct {
 	// +optional
 	Evaluation *EvaluationSpec `json:"evaluation,omitempty"`
 
+	// Stabilization keeps the previous revision's Deployment running (scaled to
+	// its replicas, out of the Service) for this long after a promotion, so the
+	// operator can switch traffic back instantly if the new stable turns out
+	// unhealthy during the window. Default 5m when unset; "0" disables it (the
+	// previous revision is removed after a short endpoint-gap grace, as before).
+	// Must be between 1m and 24h when set to a non-zero value.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) == duration('0s') || (duration(self) >= duration('1m') && duration(self) <= duration('24h'))",message="must be 0 or between 1m and 24h"
+	// +optional
+	Stabilization *metav1.Duration `json:"stabilization,omitempty"`
+
 	// Promotion selects how a candidate that passed ModelReady is promoted:
 	//   - Automatic: promote as soon as the candidate is model-ready (and, when
 	//     evaluation is configured, has passed the gate).
@@ -434,6 +447,14 @@ type PreviousRevisionStatus struct {
 	// PromotedAt is when the newer revision was promoted (this one demoted).
 	// +optional
 	PromotedAt *metav1.Time `json:"promotedAt,omitempty"`
+	// Revision is the demoted revision's full recorded identity (engine, model,
+	// digest, device, image, resources, placement). It is retained so that, if the
+	// new stable turns out unhealthy during the stabilization window, the operator
+	// can promote this revision back to stable and render its workloads from its
+	// own recorded state rather than from a live Deployment that may already be
+	// gone.
+	// +optional
+	Revision *RevisionStatus `json:"revision,omitempty"`
 }
 
 // ReplicaStatus reports desired and model-ready replica counts.

@@ -50,10 +50,12 @@ func (r *DecisionModelReconciler) gcRevisions(
 	if dm.Status.CandidateRevision != nil {
 		keep[dm.Status.CandidateRevision.Hash] = struct{}{}
 	}
-	// The just-demoted previous revision lingers only within the grace window.
+	// The just-demoted previous revision lingers through the post-promotion keep
+	// window (the stabilization window, at least the endpoint-gap grace) so
+	// traffic can be switched back to it if the new stable turns out unhealthy.
 	prevHash := ""
 	if p := dm.Status.PreviousRevision; p != nil && p.Hash != "" {
-		within := p.PromotedAt != nil && r.now().Sub(p.PromotedAt.Time) < promoteGrace
+		within := p.PromotedAt != nil && r.now().Sub(p.PromotedAt.Time) < previousRevisionKeep(dm)
 		if within {
 			keep[p.Hash] = struct{}{}
 			prevHash = p.Hash

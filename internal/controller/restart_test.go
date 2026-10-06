@@ -284,6 +284,7 @@ var _ = Describe("restart resilience", func() {
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "gc1"},
 			Spec: decisionmodelv1alpha1.DecisionModelSpec{
 				Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: zeroStabilizationRollout(),
 			},
 		}
 		Expect(k8sClient.Create(ctx, dm)).To(Succeed())

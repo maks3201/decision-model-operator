@@ -61,6 +61,16 @@ const (
 	// new revision's EndpointSlices are populated before the old Pods disappear,
 	// avoiding a brief endpoint gap.
 	promoteGrace = 30 * time.Second
+	// stabilizationWindow is the default post-promotion window during which the
+	// previous revision is kept running (out of the Service) so traffic can be
+	// switched back if the new stable turns out unhealthy. Overridable per
+	// DecisionModel via spec.rollout.stabilization (0 disables it).
+	stabilizationWindow = 5 * time.Minute
+	// postPromotionDebounce is how long the new stable must stay below the
+	// model-ready quorum during the stabilization window before an automatic
+	// rollback (a brief dip during a rolling restart must not trip it). A gate
+	// digest/device mismatch rolls back immediately, without this debounce.
+	postPromotionDebounce = 30 * time.Second
 )
 
 // specHashAnnotation stores a hash of the desired Deployment spec so no-op
@@ -140,6 +150,9 @@ const (
 	reasonRolloutQueued           = "RolloutQueued"
 	reasonRuntimeUpdateAvailable  = "RuntimeUpdateAvailable"
 	reasonAPIKeyInvalid           = "APIKeyInvalid"
+	reasonStabilizing             = "Stabilizing"
+	reasonStabilized              = "Stabilized"
+	reasonPostPromotionUnhealthy  = "PostPromotionUnhealthy"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a
@@ -173,6 +186,8 @@ const (
 	eventStorePrefetchFail     = "StorePrefetchFailed"
 	eventStoreTerminating      = "StoreTerminating"
 	eventRuntimeUpdate         = "RuntimeUpdateAvailable"
+	eventStabilized            = "Stabilized"
+	eventRolledBackPromo       = "RolledBackAfterPromotion"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -497,6 +512,15 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	// It builds on this revision's store claim, so it waits while the previous
 	// claim of the same revision is still being deleted; once that is NotFound the
 	// next reconcile creates a fresh one.
+	// A new candidate supersedes an in-flight post-promotion stabilization window:
+	// end it so a fresh rollout is not entangled with the last one's rollback
+	// target. Only when the window is actually enabled (>0) — with stabilization
+	// disabled the previous revision keeps its short endpoint-gap grace, collected
+	// by GC as before.
+	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
+		dm.Status.PreviousRevision = nil
+		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
+	}
 	if storeTerminating {
 		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
 	}
@@ -730,14 +754,23 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	// just like a cache-sharing Degraded.
 	r.applyStableReadiness(ctx, dm, ready, desiredReplicas(dm), cacheDegraded || storeTerminating)
 
+	// Post-promotion stabilization window: while the previous revision is still
+	// kept, watch the new stable; roll back to the previous revision if it turns
+	// unhealthy, or announce Stabilized and let GC collect the previous once the
+	// window passes healthy.
+	if sr := r.reconcileStabilization(ctx, dm, eng, stable, ready); sr.rolledBack || sr.err != nil {
+		return sr.res, sr.err
+	}
+
 	// GC every stale revision: keeps stable + candidate, and the demoted
 	// previous revision only within its grace window.
 	if err := r.gcRevisions(ctx, dm); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	res := r.requeueIfShort(ready, desiredReplicas(dm))
-	// While the previous revision is still within its grace window, requeue so it
-	// gets collected once the window elapses.
+	// While the previous revision is still kept (stabilization window), requeue so
+	// the new stable's health is re-checked and the previous revision is collected
+	// once the window elapses.
 	if res.RequeueAfter == 0 && dm.Status.PreviousRevision != nil {
 		res.RequeueAfter = promoteGrace
 	}

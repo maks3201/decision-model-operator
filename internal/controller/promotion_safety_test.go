@@ -156,7 +156,8 @@ var _ = Describe("crash-safe promotion and real readiness", func() {
 		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 			Spec: decisionmodelv1alpha1.DecisionModelSpec{
-				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: &one},
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: &one,
+				Rollout: zeroStabilizationRollout()},
 		})).To(Succeed())
 	}
 	// stableA brings a DM to a stable revision A with a ready Pod.
