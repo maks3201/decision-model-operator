@@ -341,6 +341,20 @@ spec:
 
 	AfterEach(func() { dumpDiag(evalNS, dm) })
 
+	It("kubectl get dm shows Active/Candidate/Accuracy/Phase/Reason columns at Ready", func() {
+		// The printer columns are the primary at-a-glance UX. At steady state the
+		// stable model is Active, there is no Candidate, and the Phase/Reason are Ready.
+		// Free assertion: it reads the stable DM the BeforeAll already brought up.
+		cols, err := dmColumns(evalNS, dm)
+		Expect(err).NotTo(HaveOccurred())
+		_, _ = fmt.Fprintf(GinkgoWriter, "columns at Ready: %+v\n", cols)
+		Expect(cols["ACTIVE"]).To(Equal(testModel), "ACTIVE column should be the stable model")
+		Expect(cols["PHASE"]).To(Equal("Ready"))
+		Expect(cols["REASON"]).To(Equal("Ready"))
+		Expect(cols["CANDIDATE"]).To(Or(Equal("<none>"), BeEmpty()),
+			"CANDIDATE should be empty at steady state (got %q)", cols["CANDIDATE"])
+	})
+
 	It("promotes when the candidate meets minAccuracy (Evaluating -> Ready)", func() {
 		By("recording the stable revision and its store PVC before the rollout")
 		stableBefore, err := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
@@ -389,6 +403,72 @@ spec:
 			g.Expect(pvcExists(fmt.Sprintf("%s-store-%s", dm, stableBefore))).To(BeFalse(),
 				"the demoted revision's store PVC %s-store-%s should be GC'd", dm, stableBefore)
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	It("holds a candidate in Evaluating when its dataset ConfigMap is missing, then resumes on create", func() {
+		// Reuses the stable DM this container already runs, so the per-PR cost is one
+		// candidate model load (no extra stable). A candidate whose datasetRef names a
+		// ConfigMap that does not exist yet must HOLD in Evaluating (reason
+		// DatasetNotFound) rather than roll back, and must resume + promote once the
+		// ConfigMap is created — no spec change, no retry annotation.
+		By("recording the stable revision and Service selector before the rollout")
+		stableBefore, err := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableBefore).NotTo(BeEmpty())
+		Expect(serviceRevision(evalNS, dm)).To(Equal(stableBefore), "Service should route to the stable revision")
+
+		By("rolling out an eval-gated candidate whose dataset ConfigMap does not exist yet")
+		// A generous Evaluating timeout so the hold does not fail-close while this test
+		// creates the ConfigMap; minAccuracy is low so the candidate passes once the
+		// (correct) dataset exists.
+		patchRollout(dm, evalNS, rolloutPatch{
+			cpu:          "320m",
+			datasetCM:    "late-dataset",
+			minAccuracy:  "0.5",
+			evaluatingTO: "20m",
+		})
+
+		By("the candidate holds in Evaluating with Evaluated reason DatasetNotFound")
+		var candHash string
+		Eventually(func(g Gomega) {
+			h, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.candidateRevision.hash}")
+			g.Expect(h).NotTo(BeEmpty(), "candidateRevision.hash not set yet")
+			candHash = h
+			phase, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(phase).To(Equal("Evaluating"), "candidate should hold in Evaluating")
+			reason, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Evaluated')].reason}")
+			g.Expect(reason).To(Equal("DatasetNotFound"),
+				"Evaluated reason should be DatasetNotFound while the dataset is missing")
+		}, 10*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("the hold is stable: no rollback, no failedRevision, Service still on stable")
+		Consistently(func(g Gomega) {
+			phase, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(phase).To(Equal("Evaluating"), "hold should stay in Evaluating")
+			fr, _ := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.failedRevision.hash}")
+			g.Expect(fr).To(BeEmpty(), "a hold must not set failedRevision")
+			g.Expect(serviceRevision(evalNS, dm)).To(Equal(stableBefore),
+				"Service must stay on the stable revision during the hold")
+		}, 30*time.Second, 10*time.Second).Should(Succeed())
+
+		By("the Candidate column is populated while the candidate holds")
+		cols, err := dmColumns(evalNS, dm)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cols["CANDIDATE"]).To(Equal(testModel),
+			"CANDIDATE should show the candidate model during a rollout (got %q)", cols["CANDIDATE"])
+		Expect(cols["PHASE"]).To(Equal("Evaluating"))
+
+		By("creating the dataset ConfigMap -> the held candidate resumes and promotes (no spec change, no retry)")
+		applyConfigMap(evalNS, "late-dataset", "cases.jsonl", datasetJSONL(verified))
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.phase}")
+		}, 12*time.Minute, 5*time.Second).Should(Equal("Ready"),
+			"candidate should promote once the dataset exists")
+		stableNow, err := utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableNow).To(Equal(candHash), "the held candidate should now be the stable revision")
+		Expect(serviceRevision(evalNS, dm)).To(Equal(candHash), "Service should route to the promoted revision")
 	})
 
 	It("rolls back when the candidate misses minAccuracy (RolledBack, stable keeps serving)", func() {
@@ -512,6 +592,21 @@ spec:
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(code).To(Equal("200"), "stable Service stopped answering after rollback")
 		}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("the EvaluationFailed Event names the model as model@sha256:<short> and says the stable keeps serving")
+		// The operator-facing UX: a rejected candidate's Event identifies both revisions
+		// by model@sha256:<short digest> and states that the stable revision keeps serving,
+		// so an operator reading `kubectl get events` sees exactly what was rejected and
+		// that traffic was never moved. Reuse the Event already produced by this rollback;
+		// no extra model load.
+		msg, err := utils.Kubectl("get", "events", "-n", evalNS,
+			"--field-selector", "reason=EvaluationFailed",
+			"-o", "jsonpath={.items[-1:].message}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(msg).To(ContainSubstring("@sha256:"),
+			"EvaluationFailed Event should name the model as model@sha256:<short> (got %q)", msg)
+		Expect(msg).To(ContainSubstring("keeps serving"),
+			"EvaluationFailed Event should state the stable keeps serving (got %q)", msg)
 	})
 })
 
@@ -532,6 +627,8 @@ func applyYAML(manifest string) {
 }
 
 // applyConfigMap creates/updates a ConfigMap holding a single key.
+//
+//nolint:unparam // key kept explicit so call sites document the dataset key
 func applyConfigMap(ns, name, key, value string) {
 	cm := fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap

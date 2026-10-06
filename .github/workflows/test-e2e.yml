@@ -75,4 +75,7 @@ jobs:
           # Run the registry-mirror spec (kustomize job only; the Go setup guards
           # on install method). Builds + loads the mirror image in BeforeSuite.
           E2E_MIRROR: "1"
+          # Skip specs labelled "nightly" on PRs to keep the run fast; the nightly
+          # workflow runs them in full.
+          E2E_LABEL_FILTER: "!nightly"
         run: make test-e2e
