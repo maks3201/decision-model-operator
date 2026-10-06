@@ -113,6 +113,7 @@ const (
 	reasonEvaluationTimeout     = "EvaluationTimeout"
 	reasonEvaluationFailed      = "EvaluationFailed"
 	reasonBaselineUnavailable   = "BaselineUnavailable"
+	reasonDatasetChanged        = "DatasetChanged"
 
 	// Evaluated-condition reasons that tell the rollout story.
 	reasonEvaluationRunning = "EvaluationRunning"
@@ -135,6 +136,10 @@ const (
 	reasonStorePrefetchFailed     = "StorePrefetchFailed"
 	reasonStoreTerminating        = "StoreTerminating"
 	reasonDownloadTokenInvalid    = "DownloadTokenInvalid"
+	reasonInvalidRuntimeVersion   = "InvalidRuntimeVersion"
+	reasonRolloutQueued           = "RolloutQueued"
+	reasonRuntimeUpdateAvailable  = "RuntimeUpdateAvailable"
+	reasonAPIKeyInvalid           = "APIKeyInvalid"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a
@@ -149,22 +154,25 @@ const defaultAllowedRegistry = "ollaya.dev"
 
 // Event reasons (kept distinct from condition reasons for clarity).
 const (
-	eventResolved          = "Resolved"
-	eventPrefetchStarted   = "PrefetchStarted"
-	eventCached            = "Cached"
-	eventRevisionStarting  = "RevisionStarting"
-	eventPromoted          = "Promoted"
-	eventRolledBack        = "RolledBack"
-	eventFailed            = "Failed"
-	eventProbeMismatch     = "ProbeMismatch"
-	eventEvaluationStarted = "EvaluationStarted"
-	eventEvaluationPassed  = "EvaluationPassed"
-	eventEvaluationFailed  = "EvaluationFailed"
-	eventEvaluationOnHold  = "EvaluationOnHold"
-	eventResourceConflict  = "ResourceConflict"
-	eventStoreLost         = "StoreLost"
-	eventStorePrefetchFail = "StorePrefetchFailed"
-	eventStoreTerminating  = "StoreTerminating"
+	eventResolved              = "Resolved"
+	eventPrefetchStarted       = "PrefetchStarted"
+	eventCached                = "Cached"
+	eventRevisionStarting      = "RevisionStarting"
+	eventPromoted              = "Promoted"
+	eventRolledBack            = "RolledBack"
+	eventFailed                = "Failed"
+	eventProbeMismatch         = "ProbeMismatch"
+	eventEvaluationStarted     = "EvaluationStarted"
+	eventEvaluationPassed      = "EvaluationPassed"
+	eventEvaluationFailed      = "EvaluationFailed"
+	eventEvaluationOnHold      = "EvaluationOnHold"
+	eventDeprecatedSecretLabel = "DeprecatedSecretLabel"
+	eventDatasetChanged        = "DatasetChanged"
+	eventResourceConflict      = "ResourceConflict"
+	eventStoreLost             = "StoreLost"
+	eventStorePrefetchFail     = "StorePrefetchFailed"
+	eventStoreTerminating      = "StoreTerminating"
+	eventRuntimeUpdate         = "RuntimeUpdateAvailable"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -191,6 +199,15 @@ type DecisionModelReconciler struct {
 	AllowImageOverride bool
 	// MaxConcurrentReconciles bounds parallel reconciles. 0 -> defaultMaxConcurrent.
 	MaxConcurrentReconciles int
+	// RuntimeVersionPolicy selects how an unset spec.runtimeVersion resolves:
+	// "Pinned" (default) reuses the stable revision's recorded version so an
+	// operator upgrade does not start a rollout; "FollowOperator" uses the engine
+	// default. Empty means Pinned.
+	RuntimeVersionPolicy string
+	// MaxConcurrentRollouts bounds how many DecisionModels in the watched scope
+	// may have a live candidate at once. 0 means unlimited. Others wait in phase
+	// Pending (reason RolloutQueued), FIFO by phaseTransitionTime.
+	MaxConcurrentRollouts int
 	// WatchNamespaces, when non-empty, restricts reconciliation to DecisionModels
 	// in these namespaces (namespace-scoped mode). Empty means all
 	// namespaces (cluster-wide, the default). It mirrors the manager cache's
@@ -328,9 +345,17 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 3. Compute the revision and candidate identity.
-	image := servingImage(eng, r.paramsFor(&dm, digest, "", ""))
+	stable := dm.Status.StableRevision
+	// Validate an explicit spec.runtimeVersion against the engine floor (CEL
+	// rejects malformed strings; this catches a too-old version). An invalid
+	// version is Degraded and changes no workloads.
+	if err := validateRuntimeVersion(dm.Spec.RuntimeVersion); err != nil {
+		return r.degradeSecretReason(ctx, &dm, reasonInvalidRuntimeVersion, err)
+	}
+	effVer := r.effectiveRuntimeVersion(&dm, stable)
+	image := servingImage(eng, r.paramsForVersion(&dm, digest, "", "", effVer))
 	rev := RevisionHash(dm.Spec, digest, image)
-	params := r.paramsFor(&dm, digest, image, rev)
+	params := r.paramsForVersion(&dm, digest, image, rev, effVer)
 	candidate := &decisionmodelv1alpha1.RevisionStatus{
 		Hash:   rev,
 		Engine: engineOrDefault(dm.Spec.Engine),
@@ -339,11 +364,11 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		Device: deviceOrDefault(dm.Spec.Device),
 		// Record the model-affecting render inputs so the stable revision is later
 		// rendered from its own state, not a (possibly newer) spec.
-		Image:     image,
-		Resources: dm.Spec.Resources,
-		Placement: placementRecord(dm.Spec.Scheduling),
+		Image:          image,
+		RuntimeVersion: recordedCandidateRuntimeVersion(&dm, effVer),
+		Resources:      dm.Spec.Resources,
+		Placement:      placementRecord(dm.Spec.Scheduling),
 	}
-	stable := dm.Status.StableRevision
 	// A stable created before placement was recorded keeps its old hash name and
 	// workloads; just record the placement it is running with. This runs
 	// on the first reconcile after an operator upgrade, so no candidate is started
@@ -351,6 +376,11 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// recorded placement and starts a new revision.
 	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, image))
 	isStable := stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate))
+
+	// Surface whether a newer engine runtime default exists than the version this
+	// DecisionModel runs (informational; never blocks serving). An explicit
+	// spec.runtimeVersion or spec.image opts out of the nudge.
+	r.reconcileRuntimeUpdate(ctx, &dm, stable, candidate)
 
 	// Cancel any evaluations running for a revision of this DM that is neither the
 	// current candidate nor the current stable (e.g. after a spec/model change).
@@ -402,6 +432,9 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if errors.Is(err, errSecretNotAllowed) {
 			return r.degradeSecretNotAllowed(ctx, &dm, err)
 		}
+		if errors.Is(err, errAPIKeyInvalid) {
+			return r.degradeSecretReason(ctx, &dm, reasonAPIKeyInvalid, err)
+		}
 		return r.finish(ctx, &dm, ctrl.Result{}, err)
 	}
 
@@ -443,14 +476,39 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.reconcileStablePath(ctx, &dm, eng, stable, apiKey, cacheDegraded)
 	}
 
-	// Candidate revision (new spec or first creation). It builds on this
-	// revision's store claim, so it waits while the previous claim of the same
-	// revision is still being deleted; once that is NotFound the next reconcile
-	// creates a fresh one.
+	// Candidate revision (new spec or first creation).
+	return r.reconcileCandidatePath(ctx, &dm, eng, params, candidate, digest, cacheDegraded, apiKey, rev, storeTerminating)
+}
+
+// reconcileCandidatePath handles a non-stable (candidate) revision: it waits
+// while this revision's store claim is still terminating, applies the fleet
+// rollout budget, then runs the candidate rollout.
+func (r *DecisionModelReconciler) reconcileCandidatePath(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	params engine.Params,
+	candidate *decisionmodelv1alpha1.RevisionStatus,
+	digest string,
+	cacheDegraded bool,
+	apiKey, rev string,
+	storeTerminating bool,
+) (ctrl.Result, error) {
+	// It builds on this revision's store claim, so it waits while the previous
+	// claim of the same revision is still being deleted; once that is NotFound the
+	// next reconcile creates a fresh one.
 	if storeTerminating {
-		return r.finish(ctx, &dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
+		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
 	}
-	return r.reconcileCandidate(ctx, &dm, eng, params, candidate, digest, cacheDegraded, apiKey)
+	// Fleet rollout budget: a brand-new candidate waits in Pending/RolloutQueued
+	// when the watched scope is already at --max-concurrent-rollouts. A candidate
+	// already admitted bypasses the gate so an in-flight rollout cannot deadlock.
+	if queued, qres, qerr := r.gateRolloutBudget(ctx, dm, rev); qerr != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, qerr)
+	} else if queued {
+		return qres, nil
+	}
+	return r.reconcileCandidate(ctx, dm, eng, params, candidate, digest, cacheDegraded, apiKey)
 }
 
 // degradeSecretNotAllowed sets Degraded + Ready=False/SecretNotAllowed and
@@ -723,13 +781,31 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 	// approval is NOT honoured on the re-eval cycle (policyChanged); the candidate
 	// re-parks under the new policy hash and the SAME approval then promotes it on
 	// the next reconcile, now on the freshly recorded result.
+	// A policy OR dataset-content change while parked makes the recorded result
+	// stale: leave AwaitingPromotion and re-evaluate rather than promote on the
+	// old result — even if an approval annotation was set in the same edit. The
+	// re-run routes through evaluateOrPromote. The approval is NOT honoured on the
+	// re-eval cycle (policyChanged); the candidate re-parks under the new
+	// policyHash/datasetDigest with a new approvalID, which the operator must then
+	// be approved against. A dataset edited in place (same ConfigMap/Secret) is
+	// detected by re-reading its digest here, bounded by the regate requeue.
 	policyChanged := false
 	if awaiting {
 		if evalSpec := evaluationSpec(dm); evalSpec != nil {
-			ev := dm.Status.Evaluation
-			if ev == nil || ev.PolicyHash != evalPolicyHash(evalSpec) {
+			stale, datasetChanged := r.evalIdentityStale(ctx, dm, evalSpec)
+			if stale {
 				awaiting = false
 				policyChanged = true
+				if datasetChanged {
+					r.event(ctx, dm, corev1.EventTypeWarning, eventDatasetChanged,
+						"golden dataset changed while awaiting promotion; re-evaluating revision %s", rev)
+					setStatusCondition(dm, metav1.Condition{
+						Type:    decisionmodelv1alpha1.ConditionEvaluated,
+						Status:  metav1.ConditionFalse,
+						Reason:  reasonDatasetChanged,
+						Message: "golden dataset content changed; re-evaluating",
+					})
+				}
 			}
 		}
 	}

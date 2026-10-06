@@ -107,6 +107,35 @@ func TestSecretAPIKeyLabel(t *testing.T) {
 	}
 }
 
+// requireEvalDatasetLabel: the eval-dataset label is canonical; the api-key
+// label is accepted as deprecated; neither is rejected.
+func TestRequireEvalDatasetLabel(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		wantDep bool
+		wantErr bool
+	}{
+		{"eval-dataset label", map[string]string{decisionmodelv1alpha1.LabelEvalDataset: "true"}, false, false},
+		{"deprecated api-key label", map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"}, true, false},
+		{"both -> canonical wins", map[string]string{
+			decisionmodelv1alpha1.LabelEvalDataset: "true", decisionmodelv1alpha1.LabelAPIKey: "true"}, false, false},
+		{"neither", nil, false, true},
+		{"download-token is not a dataset label", map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"}, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dep, err := requireEvalDatasetLabel(tc.labels)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if dep != tc.wantDep {
+				t.Errorf("deprecated = %v, want %v", dep, tc.wantDep)
+			}
+		})
+	}
+}
+
 func TestSecretDownloadTokenLabel(t *testing.T) {
 	if err := requireDownloadTokenLabel(map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"}); err != nil {
 		t.Fatalf("labelled secret rejected: %v", err)

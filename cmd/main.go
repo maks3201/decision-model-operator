@@ -209,6 +209,16 @@ func main() {
 	var maxConcurrentReconciles int
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 4,
 		"Maximum number of DecisionModels reconciled concurrently.")
+	var runtimeVersionPolicy string
+	flag.StringVar(&runtimeVersionPolicy, "runtime-version-policy", controller.RuntimeVersionPinned,
+		"How an unset spec.runtimeVersion resolves: Pinned (reuse the stable revision's "+
+			"runtime version, so an operator upgrade starts no rollout) or FollowOperator "+
+			"(use the engine default).")
+	var maxConcurrentRollouts int
+	flag.IntVar(&maxConcurrentRollouts, "max-concurrent-rollouts", 0,
+		"Maximum DecisionModels rolling out at once across the watched scope (0 = unlimited). "+
+			"Others wait in phase Pending. Set a small value (e.g. 2-3) to avoid a fleet-wide "+
+			"stampede when the operator's default runtime image changes under FollowOperator.")
 	var watchNamespacesRaw string
 	flag.StringVar(&watchNamespacesRaw, "watch-namespaces", "",
 		"Comma-separated namespaces to watch. Empty (default) watches all namespaces. "+
@@ -398,6 +408,13 @@ func main() {
 
 	signalCtx := ctrl.SetupSignalHandler()
 
+	if !controller.ValidRuntimeVersionPolicy(runtimeVersionPolicy) {
+		setupLog.Error(
+			fmt.Errorf("invalid --runtime-version-policy %q (want Pinned or FollowOperator)", runtimeVersionPolicy),
+			"invalid flag")
+		os.Exit(1)
+	}
+
 	var allowed []string
 	for _, h := range strings.Split(allowedRegistries, ",") {
 		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
@@ -423,6 +440,8 @@ func main() {
 		AllowInsecureRegistries: allowInsecureRegistries,
 		AllowImageOverride:      allowImageOverride,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
+		RuntimeVersionPolicy:    runtimeVersionPolicy,
+		MaxConcurrentRollouts:   maxConcurrentRollouts,
 		WatchNamespaces:         watchNamespaces,
 		PrefetchProxyEnv:        prefetchProxyEnv,
 		BaseContext:             signalCtx,

@@ -44,12 +44,24 @@ import (
 // pending candidate's spec can never rewrite the stable Pod template (Bug 2).
 func (r *DecisionModelReconciler) paramsFor(
 	dm *decisionmodelv1alpha1.DecisionModel,
-	digest, image, rev string,
+	digest, image, rev string, //nolint:unparam // digest varies in production; tests happen to pass one value
+) engine.Params {
+	return r.paramsForVersion(dm, digest, image, rev, dm.Spec.RuntimeVersion)
+}
+
+// paramsForVersion is paramsFor with an explicit effective runtime version,
+// which may differ from spec.runtimeVersion when --runtime-version-policy=Pinned
+// reuses the stable revision's recorded version. The version is ignored when
+// image is a user override.
+func (r *DecisionModelReconciler) paramsForVersion(
+	dm *decisionmodelv1alpha1.DecisionModel,
+	digest, image, rev, runtimeVersion string,
 ) engine.Params {
 	p := engine.Params{
 		Model:          engine.ModelRef{Name: dm.Spec.Model, Digest: digest},
 		Device:         deviceOrDefault(dm.Spec.Device),
 		Image:          image,
+		RuntimeVersion: runtimeVersion,
 		CacheClaimName: storeName(dm),
 		Resources:      dm.Spec.Resources,
 	}
@@ -83,6 +95,7 @@ func (r *DecisionModelReconciler) paramsForRevision(
 		Model:             engine.ModelRef{Name: rev.Model, Digest: rev.Digest},
 		Device:            deviceOrDefault(rev.Device),
 		Image:             rev.Image,
+		RuntimeVersion:    rev.RuntimeVersion,
 		CacheClaimName:    claimName,
 		Resources:         rev.Resources,
 		StoreSubPath:      rev.Hash,

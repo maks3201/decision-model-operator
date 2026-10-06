@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -496,7 +498,164 @@ var _ = Describe("security guards", func() {
 		// here we assert the Deployment exists for the revision).
 		Expect(rev).NotTo(BeEmpty())
 	})
+
+	// a labelled API-key Secret missing the referenced key is held
+	// Degraded/APIKeyInvalid (prober and serving Pod would otherwise diverge).
+	It("A1: API-key Secret missing the referenced key -> Degraded/APIKeyInvalid", func() { // gitleaks:allow (test name, not a secret)
+		eng := newFakeEngine()
+		r := newR(eng)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "key-nokey",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"},
+			},
+			Data: map[string][]byte{"other": []byte("x")},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		createDM("a1", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Auth = &decisionmodelv1alpha1.AuthSpec{
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "key-nokey"}, Key: "token",
+				},
+			}
+		})
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "a1"}})
+		Expect(err).NotTo(HaveOccurred(), "APIKeyInvalid must not be terminal")
+		Expect(res.RequeueAfter).To(Equal(regateInterval))
+		Expect(getDM("a1").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded))
+		Expect(readyReason("a1")).To(Equal(reasonAPIKeyInvalid))
+		// Adding the key releases it (resolve proceeds).
+		Expect(func() error {
+			s := &corev1.Secret{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "key-nokey"}, s); err != nil {
+				return err
+			}
+			s.Data["token"] = []byte("s3cr3t")
+			return k8sClient.Update(ctx, s)
+		}()).To(Succeed())
+		reconcileOnce(r, "a1")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			reconcileOnce(r, "a1")
+			return getDM("a1").Status.Phase
+		}, "5s", "50ms").ShouldNot(Equal(decisionmodelv1alpha1.PhaseDegraded),
+			"adding the key releases the APIKeyInvalid hold")
+	})
+
+	// CEL rejects apiKeySecretRef.optional: true.
+	It("A2: rejects apiKeySecretRef.optional=true (CEL)", func() {
+		optional := true
+		err := k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "a2"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				Auth: &decisionmodelv1alpha1.AuthSpec{
+					APIKeySecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "k"}, Key: "token", Optional: &optional,
+					},
+				},
+			},
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "want Invalid, got %v", err)
+	})
+
+	// a dataset Secret labelled with the deprecated api-key label still works and
+	// emits a DeprecatedSecretLabel Warning.
+	It("A3: dataset Secret via the deprecated api-key label works with a Warning", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newR(eng)
+		dataset := []byte(`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n")
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "ds-dep",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"},
+			},
+			Data: map[string][]byte{"cases.jsonl": dataset},
+		})).To(Succeed())
+		createDM("a3", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Rollout = &decisionmodelv1alpha1.RolloutSpec{
+				Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+					DatasetRef: decisionmodelv1alpha1.DatasetRef{
+						SecretRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "ds-dep", Key: "cases.jsonl"},
+					},
+					MinAccuracy: "0.90",
+				},
+			}
+		})
+		rev := RevisionHash(getDM("a3").Spec, defaultDigest, fakeImage)
+		reconcileOnce(r, "a3")
+		markPrefetchComplete(ctx, namespace, "a3", rev)
+		reconcileOnce(r, "a3")
+		createReadyPodSG(ctx, namespace, "a3", rev)
+		// Drive to evaluation; the deprecated-label Warning must have fired.
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "a3"}})
+		Eventually(func() bool {
+			fr := r.Recorder.(*events.FakeRecorder)
+			for {
+				select {
+				case e := <-fr.Events:
+					if strings.Contains(e, eventDeprecatedSecretLabel) {
+						return true
+					}
+				default:
+					_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "a3"}})
+					return false
+				}
+			}
+		}, "5s", "50ms").Should(BeTrue(), "a DeprecatedSecretLabel Warning must be emitted")
+	})
+
+	// a dataset Secret with no capability label holds (SecretNotAllowed), not fails.
+	It("A4: dataset Secret with no capability label holds", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newR(eng)
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "ds-nolabel"},
+			Data:       map[string][]byte{"cases.jsonl": []byte("{}\n")},
+		})).To(Succeed())
+		createDM("a4", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Rollout = &decisionmodelv1alpha1.RolloutSpec{
+				Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+					DatasetRef: decisionmodelv1alpha1.DatasetRef{
+						SecretRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "ds-nolabel", Key: "cases.jsonl"},
+					},
+					MinAccuracy: "0.90",
+				},
+			}
+		})
+		rev := RevisionHash(getDM("a4").Spec, defaultDigest, fakeImage)
+		reconcileOnce(r, "a4")
+		markPrefetchComplete(ctx, namespace, "a4", rev)
+		reconcileOnce(r, "a4")
+		createReadyPodSG(ctx, namespace, "a4", rev)
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "a4"}})
+		dm := getDM("a4")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+		Expect(dm.Status.FailedRevision).To(BeNil())
+		Expect(meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionEvaluated).Reason).
+			To(Equal(reasonSecretNotAllowed))
+	})
 })
+
+// createReadyPodSG creates a gated, model-ready Pod for a revision (security
+// envtest helper).
+func createReadyPodSG(ctx context.Context, ns, dmName, rev string) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: dmName + "-pod-" + rev,
+			Labels: map[string]string{decisionmodelv1alpha1.LabelName: dmName, decisionmodelv1alpha1.LabelRevision: rev},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	pod.Status.PodIP = "10.0.0.80"
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(decisionmodelv1alpha1.ModelReadyGate), Status: corev1.ConditionTrue},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
 
 // markPrefetchFailed sets the prefetch Job for a revision to Failed.
 func markPrefetchFailed(ctx context.Context, ns, dmName, rev string) {

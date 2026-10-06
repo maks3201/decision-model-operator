@@ -23,6 +23,7 @@ import (
 )
 
 // DecisionModelSpec defines the desired state of DecisionModel.
+// +kubebuilder:validation:XValidation:rule="!(has(self.image) && has(self.runtimeVersion))",message="image and runtimeVersion are mutually exclusive"
 type DecisionModelSpec struct {
 	// Engine is the serving runtime for the model.
 	// +kubebuilder:validation:Enum=ollaya
@@ -68,9 +69,20 @@ type DecisionModelSpec struct {
 	// Image overrides the engine's default container image. Rejected unless the
 	// operator is started with --allow-image-override (a DecisionModel editor
 	// could otherwise run an arbitrary image under the operator's Pod template).
+	// Mutually exclusive with runtimeVersion.
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Image Override",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// RuntimeVersion pins the engine runtime release (e.g. "0.10.0", plain
+	// MAJOR.MINOR.PATCH) independently of the operator's default. Pinning it means
+	// an operator upgrade that changes the default runtime image does not start a
+	// rollout for this DecisionModel. Mutually exclusive with image. When unset
+	// the effective version follows --runtime-version-policy.
+	// +kubebuilder:validation:Pattern=`^[0-9]+\.[0-9]+\.[0-9]+$`
+	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Runtime Version",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
+	// +optional
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 
 	// Resources are the compute resource requirements for the serving container.
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Resources",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:resourceRequirements"}
@@ -163,7 +175,11 @@ type AuthSpec struct {
 	// APIKeySecretRef references a Secret key holding the engine API key. The
 	// Secret must carry the label decisionmodel.io/api-key: "true" (opt-in), or
 	// the operator reports Degraded (SecretNotAllowed) and creates no workloads.
-	// The same key is used by the operator's prober and evaluator.
+	// The same key is used by the operator's prober and evaluator. The referenced
+	// key must exist (optional is not supported: the prober and the serving Pod
+	// would otherwise disagree); a missing key is reported as Degraded
+	// (APIKeyInvalid).
+	// +kubebuilder:validation:XValidation:rule="!has(self.optional) || !self.optional",message="apiKeySecretRef.optional is not supported: the key must exist"
 	// +optional
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 }
@@ -273,7 +289,9 @@ type DatasetRef struct {
 	// +optional
 	ConfigMapRef *DatasetKeyRef `json:"configMapRef,omitempty"`
 	// SecretRef selects a key in a Secret holding the JSONL dataset. The Secret
-	// must carry the label decisionmodel.io/api-key: "true" (opt-in guard).
+	// must carry the label decisionmodel.io/eval-dataset: "true" (opt-in guard).
+	// For one release a Secret labelled only decisionmodel.io/api-key: "true" is
+	// still accepted (deprecated; a Warning Event names the label to add).
 	// +optional
 	SecretRef *DatasetKeyRef `json:"secretRef,omitempty"`
 }
@@ -324,6 +342,15 @@ type EvaluationSpec struct {
 	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
 	// +optional
 	MaxECEIncrease string `json:"maxECEIncrease,omitempty"`
+
+	// ScoreTolerance is the correctness band for "score" questions (decimal
+	// string): a predicted expected-value level counts as correct when it is
+	// within this many levels of the golden integer level. A case may override it
+	// per question via a "tolerance" map. Empty means the default (0.5, "rounds to
+	// the expected level").
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
+	// +optional
+	ScoreTolerance string `json:"scoreTolerance,omitempty"`
 }
 
 // DecisionModelPhase enumerates the high-level lifecycle phase of a DecisionModel.
@@ -355,6 +382,13 @@ type RevisionStatus struct {
 	// Image is the resolved serving container image for this revision.
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// RuntimeVersion is the resolved engine runtime version for this revision
+	// (e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the
+	// version is then unknown. Recorded so a stable revision keeps its runtime
+	// version across operator upgrades under --runtime-version-policy=Pinned.
+	// +optional
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 
 	// Resources are the compute resource requirements of this revision's serving
 	// container.
@@ -466,6 +500,19 @@ type EvaluationStatus struct {
 	// than promoted on the stale result.
 	// +optional
 	PolicyHash string `json:"policyHash,omitempty"`
+	// DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was
+	// produced from. Together with policyHash it is the result's identity: if the
+	// dataset content changes (same ConfigMap/Secret, edited in place) a parked
+	// candidate is re-evaluated rather than promoted on the stale result.
+	// +optional
+	DatasetDigest string `json:"datasetDigest,omitempty"`
+	// ApprovalID is the identity a manual approval must name: the first 12 hex of
+	// sha256(revisionHash + policyHash + datasetDigest). Set the annotation
+	// decisionmodel.io/promote to this value to promote. It changes whenever the
+	// revision, policy or dataset changes, so an approval cannot carry over a
+	// re-evaluation.
+	// +optional
+	ApprovalID string `json:"approvalId,omitempty"`
 	// CompletedAt is when the evaluation finished.
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`

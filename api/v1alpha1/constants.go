@@ -48,6 +48,10 @@ const (
 	// ConditionPromoted is only present once manual promotion is in play: False
 	// (AwaitingApproval) while a candidate waits, True after it was promoted.
 	ConditionPromoted = "Promoted"
+	// ConditionRuntimeUpdateAvailable is True when a newer engine runtime default
+	// is available than the version this DecisionModel is pinned to (set
+	// spec.runtimeVersion to adopt it). Informational: it never blocks serving.
+	ConditionRuntimeUpdateAvailable = "RuntimeUpdateAvailable"
 )
 
 // ModelReadyGate is the Pod readiness gate condition type set to True only when
@@ -61,8 +65,13 @@ const (
 	// LabelRevision identifies the revision hash of an owned object.
 	LabelRevision = "decisionmodel.io/revision"
 	// LabelAPIKey must be set to "true" on a Secret before the operator will read
-	// it (engine API key or eval dataset), guarding against confused-deputy use.
+	// it as the engine API key, guarding against confused-deputy use.
 	LabelAPIKey = "decisionmodel.io/api-key"
+	// LabelEvalDataset must be set to "true" on a Secret before the operator will
+	// read it as an eval golden dataset. One label grants one capability; a
+	// dataset Secret labelled only with api-key still works for one release
+	// (deprecated) and emits a Warning Event.
+	LabelEvalDataset = "decisionmodel.io/eval-dataset"
 	// LabelDownloadToken must be set to "true" on a Secret before the operator
 	// will read it as a download credential (e.g. Hugging Face token).
 	LabelDownloadToken = "decisionmodel.io/download-token"

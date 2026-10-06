@@ -22,7 +22,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -148,13 +147,17 @@ func (r *DecisionModelReconciler) apiKey(ctx context.Context, dm *decisionmodelv
 	}
 	var secret corev1.Secret
 	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
-		if apierrors.IsNotFound(err) && ref.Optional != nil && *ref.Optional {
-			return "", nil
-		}
 		return "", err
 	}
 	if err := requireAPIKeyLabel(secret.Labels); err != nil {
 		return "", err
+	}
+	// The referenced key must exist: optional is rejected by CEL, and a labelled
+	// Secret missing the key would leave the prober and the serving Pod reading
+	// different keys (empty vs real). Surface it instead of silently using "".
+	if _, ok := secret.Data[ref.Key]; !ok {
+		return "", fmt.Errorf("%w: Secret %s/%s has no key %q",
+			errAPIKeyInvalid, dm.Namespace, ref.Name, ref.Key)
 	}
 	return string(secret.Data[ref.Key]), nil
 }

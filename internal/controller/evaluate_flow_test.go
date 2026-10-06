@@ -621,7 +621,7 @@ var _ = Describe("Eval-gated rollout", func() {
 			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "golden-secret"}, s); err != nil {
 				return err
 			}
-			s.Labels = map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"}
+			s.Labels = map[string]string{decisionmodelv1alpha1.LabelEvalDataset: "true"}
 			return k8sClient.Update(ctx, s)
 		}()).To(Succeed())
 		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {

@@ -26,7 +26,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `apiKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ | APIKeySecretRef references a Secret key holding the engine API key. The<br />Secret must carry the label decisionmodel.io/api-key: "true" (opt-in), or<br />the operator reports Degraded (SecretNotAllowed) and creates no workloads.<br />The same key is used by the operator's prober and evaluator. |  | Optional: \{\} <br /> |
+| `apiKeySecretRef` _[SecretKeySelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#secretkeyselector-v1-core)_ | APIKeySecretRef references a Secret key holding the engine API key. The<br />Secret must carry the label decisionmodel.io/api-key: "true" (opt-in), or<br />the operator reports Degraded (SecretNotAllowed) and creates no workloads.<br />The same key is used by the operator's prober and evaluator. The referenced<br />key must exist (optional is not supported: the prober and the serving Pod<br />would otherwise disagree); a missing key is reported as Degraded<br />(APIKeyInvalid). |  | Optional: \{\} <br /> |
 
 
 #### CacheSpec
@@ -80,7 +80,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `configMapRef` _[DatasetKeyRef](#datasetkeyref)_ | ConfigMapRef selects a key in a ConfigMap holding the JSONL dataset. |  | Optional: \{\} <br /> |
-| `secretRef` _[DatasetKeyRef](#datasetkeyref)_ | SecretRef selects a key in a Secret holding the JSONL dataset. The Secret<br />must carry the label decisionmodel.io/api-key: "true" (opt-in guard). |  | Optional: \{\} <br /> |
+| `secretRef` _[DatasetKeyRef](#datasetkeyref)_ | SecretRef selects a key in a Secret holding the JSONL dataset. The Secret<br />must carry the label decisionmodel.io/eval-dataset: "true" (opt-in guard).<br />For one release a Secret labelled only decisionmodel.io/api-key: "true" is<br />still accepted (deprecated; a Warning Event names the label to add). |  | Optional: \{\} <br /> |
 
 
 #### DecisionModel
@@ -150,7 +150,8 @@ _Appears in:_
 | `digest` _string_ | Digest optionally pins the model to an immutable digest (bare hex sha256).<br />When empty, the operator resolves the tag and records the digest in status. |  | Pattern: `^[a-f0-9]\{64\}$` <br />Optional: \{\} <br /> |
 | `replicas` _integer_ | Replicas is the number of serving Pods for the stable revision (default 1).<br />With replicas > 1 spread across nodes the model store must be shareable —<br />see cache.accessModes; otherwise the operator reports Degraded<br />(CacheNotShareable). | 1 | Minimum: 1 <br />Optional: \{\} <br /> |
 | `device` _string_ | Device selects the target compute device for serving. "cuda" also requests<br />an nvidia.com/gpu and uses the engine's CUDA image. | cpu | Enum: [cpu cuda] <br />Optional: \{\} <br /> |
-| `image` _string_ | Image overrides the engine's default container image. Rejected unless the<br />operator is started with --allow-image-override (a DecisionModel editor<br />could otherwise run an arbitrary image under the operator's Pod template). |  | Optional: \{\} <br /> |
+| `image` _string_ | Image overrides the engine's default container image. Rejected unless the<br />operator is started with --allow-image-override (a DecisionModel editor<br />could otherwise run an arbitrary image under the operator's Pod template).<br />Mutually exclusive with runtimeVersion. |  | Optional: \{\} <br /> |
+| `runtimeVersion` _string_ | RuntimeVersion pins the engine runtime release (e.g. "0.10.0", plain<br />MAJOR.MINOR.PATCH) independently of the operator's default. Pinning it means<br />an operator upgrade that changes the default runtime image does not start a<br />rollout for this DecisionModel. Mutually exclusive with image. When unset<br />the effective version follows --runtime-version-policy. |  | Pattern: `^[0-9]+\.[0-9]+\.[0-9]+$` <br />Optional: \{\} <br /> |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources are the compute resource requirements for the serving container. |  | Optional: \{\} <br /> |
 | `scheduling` _[SchedulingSpec](#schedulingspec)_ | Scheduling is a passthrough of nodeSelector/tolerations/affinity for serving Pods. |  | Optional: \{\} <br /> |
 | `cache` _[CacheSpec](#cachespec)_ | Cache configures the model store PVC. |  | Optional: \{\} <br /> |
@@ -222,6 +223,7 @@ _Appears in:_
 | `maxCases` _integer_ | MaxCases caps how many dataset cases are used (first N). | 500 | Maximum: 5000 <br />Minimum: 1 <br />Optional: \{\} <br /> |
 | `maxECE` _string_ | MaxECE is the maximum tolerated Expected Calibration Error (decimal string<br />in [0,1], e.g. "0.10"). Empty disables the absolute ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
 | `maxECEIncrease` _string_ | MaxECEIncrease is the maximum tolerated ECE increase vs the stable baseline<br />(decimal string). Only enforced when a stable revision exists to provide a<br />baseline; empty disables the relative ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
+| `scoreTolerance` _string_ | ScoreTolerance is the correctness band for "score" questions (decimal<br />string): a predicted expected-value level counts as correct when it is<br />within this many levels of the golden integer level. A case may override it<br />per question via a "tolerance" map. Empty means the default (0.5, "rounds to<br />the expected level"). |  | Pattern: `^[0-9]+(\.[0-9]+)?$` <br />Optional: \{\} <br /> |
 
 
 #### EvaluationStatus
@@ -252,6 +254,8 @@ _Appears in:_
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `datasetDigest` _string_ | DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was<br />produced from. Together with policyHash it is the result's identity: if the<br />dataset content changes (same ConfigMap/Secret, edited in place) a parked<br />candidate is re-evaluated rather than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `approvalId` _string_ | ApprovalID is the identity a manual approval must name: the first 12 hex of<br />sha256(revisionHash + policyHash + datasetDigest). Set the annotation<br />decisionmodel.io/promote to this value to promote. It changes whenever the<br />revision, policy or dataset changes, so an approval cannot carry over a<br />re-evaluation. |  | Optional: \{\} <br /> |
 | `completedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | CompletedAt is when the evaluation finished. |  | Optional: \{\} <br /> |
 
 
@@ -333,6 +337,7 @@ _Appears in:_
 | `digest` _string_ | Digest is the resolved immutable digest for this revision. |  |  |
 | `device` _string_ | Device is the target device for this revision. |  |  |
 | `image` _string_ | Image is the resolved serving container image for this revision. |  | Optional: \{\} <br /> |
+| `runtimeVersion` _string_ | RuntimeVersion is the resolved engine runtime version for this revision<br />(e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the<br />version is then unknown. Recorded so a stable revision keeps its runtime<br />version across operator upgrades under --runtime-version-policy=Pinned. |  | Optional: \{\} <br /> |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources are the compute resource requirements of this revision's serving<br />container. |  | Optional: \{\} <br /> |
 | `precision` _string_ | Precision is the quantization level reported by the engine (e.g. F32, F16). |  |  |
 | `placement` _string_ | Placement is a short hash of spec.scheduling (nodeSelector, tolerations,<br />affinity, runtimeClassName) as it was when this revision was created, or<br />"none" when no scheduling was set. Empty only on a revision recorded by an<br />older operator version, which the controller adopts on its first reconcile.<br />Placement is part of a revision's identity: a change of scheduling starts a<br />new revision (blue-green, own store) instead of rolling the running<br />Deployment in place. A hash is recorded, not the spec, because Affinity is a<br />very large schema and this type appears three times in the CRD. |  | Optional: \{\} <br /> |

@@ -130,6 +130,22 @@ type Decider interface {
 	Decide(ctx context.Context, baseURL, apiKey string, req DecideRequest) (DecideResponse, error)
 }
 
+// RuntimeVersioner is an optional capability for engines whose runtime release
+// can be pinned (Params.RuntimeVersion). The controller uses it to pin a
+// DecisionModel's runtime across operator upgrades without importing the engine
+// package.
+type RuntimeVersioner interface {
+	// DefaultRuntimeVersion is the release used when Params.RuntimeVersion is empty.
+	DefaultRuntimeVersion() string
+	// ValidateRuntimeVersion rejects a version the engine cannot serve ("" is valid).
+	ValidateRuntimeVersion(version string) error
+	// CompareRuntimeVersions orders two valid versions: -1, 0 or 1.
+	CompareRuntimeVersions(a, b string) int
+	// RuntimeVersionFromImage returns the release an engine default image was built
+	// for, or "" when the image is not one of the engine's defaults.
+	RuntimeVersionFromImage(image string) string
+}
+
 // DecideRequest is a TypeSafe /v1/systemone request. State and Questions are passed
 // through verbatim (any JSON), so the engine does not need to model the question schema.
 type DecideRequest struct {
