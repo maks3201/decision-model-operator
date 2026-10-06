@@ -2,93 +2,180 @@
 
 # decision-model-operator
 
+**Safely ship decision models to Kubernetes.**
+
+decision-model-operator evaluates a candidate model on your golden dataset *before* it receives
+production traffic, and blocks or rolls back the ones that got worse.
+
 [![Tests](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test.yml)
 [![E2E](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml/badge.svg?branch=main)](https://github.com/maks3201/decision-model-operator/actions/workflows/test-e2e.yml)
 [![codecov](https://codecov.io/gh/maks3201/decision-model-operator/branch/main/graph/badge.svg)](https://codecov.io/gh/maks3201/decision-model-operator)
 [![Release](https://img.shields.io/github/v/release/maks3201/decision-model-operator?sort=semver)](https://github.com/maks3201/decision-model-operator/releases)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/decision-model-operator)](https://artifacthub.io/packages/search?repo=decision-model-operator)
-[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=maks3201_decision-model-operator&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=maks3201_decision-model-operator)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/maks3201/decision-model-operator/badge)](https://scorecard.dev/viewer/?uri=github.com/maks3201/decision-model-operator)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15233/badge)](https://www.bestpractices.dev/projects/15233)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A Kubernetes operator that runs open-source System-1 decision models (Laya, Kev, JevK5, …)
-served by [Ollaya](https://github.com/ollaya-dev/ollaya), and manages their model lifecycle:
-**pin → prefetch → load → verify → evaluate → promote → roll back**.
-
-> **Status: alpha.** The API is `decisionmodel.io/v1alpha1` and may change between minor
-> versions. Not affiliated with TypeSafe, Convai Innovations or Ollaya.
-
-📖 **Documentation:** <https://maks3201.github.io/decision-model-operator/>
-
-## Why
-
-A plain Deployment of a model server tells you the process is up. It does not tell you
-*which* model is loaded, *where* it runs, or whether the new version is any good.
-decision-model-operator closes those gaps:
-
-| Feature | What it does |
-|---|---|
-| **Digest pinning** | Resolves `model: laya:en` to an immutable sha256 digest and records it in `status`. A moved tag never changes a running revision. |
-| **Prefetch** | A Job pulls and verifies the weights into a per-revision PVC *before* any serving Pod starts. Serving Pods mount the store read-only. |
-| **Model-aware readiness** | A Pod readiness gate (`decisionmodel.io/model-ready`) turns True only when the runtime reports the expected digest on the expected device — a silent CUDA→CPU fallback keeps the Pod out of the Service. |
-| **Blue-green rollout** | Every model-affecting change creates a candidate revision next to the stable one; traffic switches only when the candidate is ready. Failures roll back automatically. |
-| **Eval-gated promotion** | Optionally runs a golden dataset against the candidate and promotes only if accuracy, accuracy drop and calibration (ECE) gates pass. |
-| **Secure defaults** | Registry allow-list, no `http://` registries, no image override, labelled API-key Secrets, restricted Pod security. Each guard can be relaxed explicitly. |
-
-## How it works
-
-```text
-DecisionModel ──► Resolving ──► Caching ──► Starting ──► Evaluating ──► Promoting ──► Ready
-                  (digest)      (Job→PVC)   (candidate,   (golden set,   (Service
-                                            readiness     optional)      switch)
-                                            gate)
-                       any failure ──► RolledBack (stable keeps serving) or Failed
+```yaml
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  name: support-router
+spec:
+  model: laya:en                    # change this line to roll out a new model
+  rollout:
+    evaluation:
+      datasetRef: { configMapRef: { name: support-router-golden, key: cases.jsonl } }
+      minAccuracy: "0.90"           # absolute gate
+      maxAccuracyDrop: "0.01"       # relative gate: at most 1 point worse than production
 ```
 
-The operator owns everything it creates (PVC, Job, Deployments, Service) through owner
-references; deleting the `DecisionModel` cleans up. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for the full design.
+## The problem
 
-## Requirements
+Decision models make production decisions: ticket routing, intent classification, guardrails, risk
+scoring, agent and tool selection. A new version can start, load and answer requests, and still make
+*worse* decisions. A Kubernetes Deployment only knows that the Pod is alive. It promotes the regression.
 
-- Kubernetes **1.29+**
-- A default StorageClass with `ReadWriteOnce` (`ReadWriteMany` for `replicas > 1` across nodes)
-- Egress from the prefetch Job to `https://ollaya.dev` (manifests) and `https://huggingface.co` plus the
-  Hugging Face CDN it redirects to (`*.hf.co`, weights), or [internal mirrors](docs/quickstart.md) for both
-- For `device: cuda`: amd64 nodes with the NVIDIA device plugin
+When you change `spec.model`, decision-model-operator:
 
-## Installation
+1. resolves the tag to an immutable digest and downloads the weights next to production;
+2. starts the candidate without traffic and checks the runtime really loaded **that** digest on
+   **that** device (no silent GPU→CPU fallback);
+3. runs your evaluation dataset against the candidate and against the current production model;
+4. compares the results with your thresholds;
+5. switches the Service to the candidate only if every gate passes;
+6. otherwise keeps production on the old model, deletes the candidate and records why.
 
-### Helm (recommended)
+```text
+            spec.model changed
+                    │
+                    ▼
+ Resolve digest ─► Download ─► Start candidate ─► Evaluate ──pass──► Switch traffic ─► Ready
+                                (no traffic,        (golden set,                        (old model
+                                 model-ready gate)   vs production)                      removed)
+                                                        │
+                                                       fail
+                                                        ▼
+                                          RolledBack: production untouched,
+                                          reason in status and Events
+```
+
+## Quickstart
+
+Needs Kubernetes 1.29+ with a default StorageClass (kind works).
 
 <!-- x-release-please-start-version -->
 ```sh
 helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
-  --version 0.3.0 \
-  --namespace decision-model-operator-system --create-namespace
+  --version 0.3.0 --namespace decision-model-operator-system --create-namespace
+
+kubectl apply -f https://raw.githubusercontent.com/maks3201/decision-model-operator/v0.3.0/config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml
+kubectl get dm support-router -w
 ```
 <!-- x-release-please-end -->
 
-Chart values are documented in the [chart README](charts/decision-model-operator/README.md)
-and on [Artifact Hub](https://artifacthub.io/packages/search?repo=decision-model-operator).
+The sample creates the golden dataset ConfigMap and an eval-gated `DecisionModel`. The model is served
+at `http://support-router.<namespace>.svc:11435/v1/systemone`. Edit `spec.model` and watch the rollout:
 
-### kubectl
+```sh
+kubectl describe dm support-router     # conditions, revisions, evaluation, Events
+```
+
+A failed gate looks like this in the Events:
+
+```text
+Warning  EvaluationFailed  evaluation failed: accuracy 0.8000 < minAccuracy 0.9000
+Warning  RolledBack        revision 5d1c… rolled back (EvaluationFailed): accuracy 0.8000 < minAccuracy 0.9000
+```
+
+The full walk-through (first request, scaling, proxies, mirrors) is in the
+[quickstart guide](https://maks3201.github.io/decision-model-operator/quickstart/).
+
+## Capabilities
+
+| | |
+|---|---|
+| **Evaluation-gated promotion** | Golden dataset (JSONL) run against candidate and production. Gates: minimum accuracy, maximum accuracy drop vs production, calibration (ECE, maximum ECE increase), sample size, timeout. |
+| **Blue-green rollout** | Every model change is a new revision next to the stable one. Traffic moves in one Service switch after the gates pass; the old revision is deleted after a short grace. |
+| **Rollback** | A candidate that fails to download, start, load or pass evaluation is rolled back; production keeps serving. The failed revision is recorded and not retried until you change the spec or set a retry token. |
+| **Manual promotion** | Hold a candidate that passed evaluation until someone approves it. |
+| **Model-aware readiness** | A Pod readiness gate turns True only when the runtime reports the expected digest on the expected device and the model is pinned in memory. |
+| **Digest pinning and prefetch** | `laya:en` is resolved to a sha256 digest and recorded in status; weights are prefetched into a per-revision volume and verified before any serving Pod starts. |
+| **Status you can read** | Phases, conditions, revisions (stable, candidate, failed, previous), evaluation scores and baselines, Kubernetes Events, Prometheus metrics. |
+| **Secure defaults** | Registry allow-list, labelled Secrets only, no image override, restricted Pod security, signed releases with SBOM and provenance. |
+
+## Supported runtimes
+
+| Runtime | Status |
+|---|---|
+| [Ollaya](https://github.com/ollaya-dev/ollaya) 0.10 (CPU, CUDA) | Supported. Verified models are listed in the [quickstart](https://maks3201.github.io/decision-model-operator/quickstart/#supported-models). |
+| Ollama `/v1/systemone` | Investigated ([spike 004](docs/spikes/004-ollama-engine.md)); not implemented. |
+
+The runtime is behind a small adapter interface (`internal/engine`): resolve a model to a digest, render
+the serving and prefetch workloads, inspect what is loaded, warm up. Lifecycle, evaluation and
+promotion do not depend on the runtime.
+
+## Why not just use an Ollama operator or a model-serving platform?
+
+Generic operators ([ollama-operator](https://github.com/nekomeowww/ollama-operator),
+[KubeAI](https://github.com/kubeai-project/kubeai), [KServe](https://github.com/kserve/kserve)) run
+model servers well: workloads, GPUs, autoscaling, model download. They decide a new version is ready
+when it is *up*.
+
+decision-model-operator decides a new version is ready when it is *right*:
+
+- it knows the decision-model contract (questions, choices, confidences);
+- it evaluates the candidate and compares it with production on the same dataset;
+- it blocks the regression before traffic moves and says why;
+- it never rewrites the running production revision while a candidate is tried.
+
+It does not try to be a general serving platform, a GPU scheduler, an autoscaler or a model registry.
+
+## How evaluation works
+
+The dataset is JSONL, one case per line:
+
+```json
+{"state": {"ticket": "card declined at checkout"},
+ "questions": {"q1": {"type": "choice", "options": ["billing", "technical", "account"]}},
+ "expected": {"q1": "billing"}}
+```
+
+During a rollout the operator sends every case to one candidate Pod (`/v1/systemone`), scores the answers,
+and, if a relative gate is set, scores production on the same cases. Results land in `status.evaluation`
+(accuracy, baseline accuracy, ECE, Brier, cases) and in the `decisionmodel_evaluation_*` metrics. Details:
+[evaluation guide](https://maks3201.github.io/decision-model-operator/evaluation/).
+
+## Production considerations
+
+- **Egress:** the prefetch Job needs `https://ollaya.dev` (manifests) and `https://huggingface.co` plus
+  `*.hf.co` (weights), or [internal mirrors](https://maks3201.github.io/decision-model-operator/quickstart/#supported-models)
+  for both.
+- **Storage:** one PVC per revision; a rollout briefly needs twice the model size. `replicas > 1` across
+  nodes needs `ReadWriteMany`.
+- **GPU:** `device: cuda` needs amd64 nodes with the NVIDIA device plugin, and a second GPU for the
+  candidate during a rollout.
+- **GitOps:** a Git commit that changes `spec.model` is the rollout; Argo CD and Flux notes are in
+  [docs/gitops.md](docs/gitops.md).
+- **Sizing:** per-model memory and disk in [docs/sizing.md](docs/sizing.md).
+- **Multi-tenancy:** [namespace-scoped mode](docs/ARCHITECTURE.md#namespace-scoped-mode) and the
+  security guards in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#9-security).
+
+> **Status: alpha.** The API is `decisionmodel.io/v1alpha1` and may change between minor versions.
+> Not affiliated with TypeSafe, Convai Innovations or Ollaya.
+
+## Install options and verification
 
 <!-- x-release-please-start-version -->
 ```sh
+# kubectl instead of Helm
 kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.3.0/install.yaml
 ```
 <!-- x-release-please-end -->
 
-Both install the CRD, RBAC and the controller into `decision-model-operator-system`.
-
-### Verify the release
-
-From v0.2.0 the image, the Helm chart and the release files are signed with
-[cosign](https://github.com/sigstore/cosign) v3+ (keyless, GitHub OIDC), and the image carries an
-SPDX SBOM and SLSA provenance. Releases after v0.2.0 also attach SLSA build provenance for
-the release files (`gh attestation verify`):
+Images, charts and release files are signed with [cosign](https://github.com/sigstore/cosign) v3+
+(keyless, GitHub OIDC); the image carries an SPDX SBOM and SLSA provenance, and release files after v0.2.0
+have build provenance attestations:
 
 <!-- x-release-please-start-version -->
 ```sh
@@ -107,72 +194,36 @@ docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.3.0
 ```
 <!-- x-release-please-end -->
 
-## Usage
-
-```yaml
-apiVersion: decisionmodel.io/v1alpha1
-kind: DecisionModel
-metadata:
-  name: support-router
-spec:
-  model: laya:en        # explicit tag required
-  device: cpu           # cpu | cuda
-  replicas: 2
-```
-
-```sh
-kubectl apply -f config/samples/decisionmodel_v1alpha1_decisionmodel.yaml
-kubectl get dm -w
-```
-
-```text
-NAME             MODEL     DEVICE   PHASE   READY   AGE
-support-router   laya:en   cpu      Ready   2       3m
-```
-
-The model is then served at `http://support-router.<namespace>.svc:11435/v1/systemone`.
-Changing `spec.model`, `spec.device` or `spec.resources` starts a blue-green rollout;
-`replicas` and scheduling changes are applied in place.
-
-An eval-gated example is in
-[config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml](config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml).
-
 ## Documentation
 
 | Guide | |
 |---|---|
-| [Quickstart](docs/quickstart.md) | Install, first model, request, scaling, proxy and mirror setup, uninstall |
-| [API reference](docs/api-reference.md) | All `DecisionModel` fields |
-| [Eval-gated rollout](docs/evaluation.md) | Golden datasets, accuracy and calibration gates |
-| [Sizing](docs/sizing.md) | Per-model CPU/memory and PVC sizes |
-| [GitOps](docs/gitops.md) | Argo CD / Flux notes |
-| [Metrics](docs/metrics.md) | Operator metrics |
+| [Quickstart](https://maks3201.github.io/decision-model-operator/quickstart/) | Install, first model, request, scaling, proxy and mirror setup, uninstall |
+| [Evaluation](https://maks3201.github.io/decision-model-operator/evaluation/) | Datasets, gates, manual promotion, timeouts, retries |
+| [API reference](https://maks3201.github.io/decision-model-operator/api-reference/) | Every `DecisionModel` field |
+| [Sizing](docs/sizing.md) · [GitOps](docs/gitops.md) · [Metrics](docs/metrics.md) | Operations |
 | [Architecture](docs/ARCHITECTURE.md) | Design, state machine, security model |
 
 ## Roadmap
 
 | Stage | Scope |
 |---|---|
-| Released | Digest pinning, prefetch, model-aware readiness, blue-green rollout, eval-gated promotion, security guards, namespace-scoped mode; signed releases with SBOM and provenance |
-| Next | Per-revision API key, autoscaling (KEDA on in-flight / queue), runtime metrics, node-local cache, GPU E2E in CI |
-| Later | Shadow traffic, confidence cascade with LLM fallback |
+| Released | Evaluation-gated blue-green rollout, rollback, manual promotion, model-aware readiness, digest pinning, prefetch, Ollaya runtime, mirrors, signed releases |
+| Next | Reproducible demo, clearer status and Events, rollback after promotion (stabilization window), per-question precision/recall/F1 gates |
+| Later | More runtimes (Ollama), shadow traffic, canary percentages |
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release contains.
 
-## Development
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Questions and ideas go to
+[Discussions](https://github.com/maks3201/decision-model-operator/discussions). Report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md).
 
 ```sh
-make generate manifests   # after changing api/
 make build lint test      # build, golangci-lint, unit + envtest
 make test-e2e             # kind cluster with the CPU Ollaya image
 ```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [RELEASING.md](RELEASING.md)
-for how releases are cut.
-
-## Security
-
-Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
