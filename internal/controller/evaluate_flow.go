@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,6 +51,12 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 ) (ctrl.Result, error) {
 	evalSpec := evaluationSpec(dm)
 	if evalSpec == nil {
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionEvaluated,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonEvaluationSkipped,
+			Message: "no evaluation configured; promotion follows model readiness",
+		})
 		return r.promoteOrAwait(ctx, dm, eng, candidate, precision, cacheDegraded, policyChanged)
 	}
 
@@ -60,15 +67,37 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 			"engine does not support evaluation (no Decider)")
 	}
 
+	// Enter Evaluating before loading the dataset, so the Evaluating timeout
+	// measures any hold on a missing/unreadable dataset (phaseTransitionTime is
+	// set on the transition and not reset on requeue). Capture whether we were
+	// ALREADY in Evaluating for this candidate first: that distinguishes a
+	// post-restart resume (do not re-announce EvaluationStarted) from a fresh
+	// entry, and setPhase below would otherwise erase the distinction.
+	resuming := dm.Status.Phase == decisionmodelv1alpha1.PhaseEvaluating &&
+		dm.Status.CandidateRevision != nil && dm.Status.CandidateRevision.Hash == candidate.Hash
+	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseEvaluating)
+
 	// Load and parse the dataset.
 	raw, err := r.loadDataset(ctx, dm, &evalSpec.DatasetRef)
 	if err != nil {
-		if errors.Is(err, errSecretNotAllowed) {
-			return r.rollbackOrFailPermanent(ctx, dm, candidate, reasonSecretNotAllowed, err.Error())
+		switch {
+		case errors.Is(err, errDatasetNotFound):
+			return r.holdForDataset(ctx, dm, candidate, reasonDatasetNotFound, err)
+		case errors.Is(err, errDatasetKeyNotFound):
+			return r.holdForDataset(ctx, dm, candidate, reasonDatasetKeyNotFound, err)
+		case errors.Is(err, errSecretNotAllowed):
+			// A later label fix is picked up by the requeue; fail only on timeout.
+			return r.holdForDataset(ctx, dm, candidate, reasonSecretNotAllowed, err)
+		default:
+			// Any other read error (timeout, 5xx, throttling, RBAC) is transient:
+			// back off via the workqueue without recording a failed revision. The
+			// Evaluating timeout still bounds the overall wait on the next pass.
+			if r.phaseExceeded(dm, evaluatingTimeout(dm)) {
+				return r.rollbackOrFail(ctx, dm, candidate, reasonDatasetNotFound,
+					"dataset unreadable before the evaluation deadline: "+err.Error())
+			}
+			return r.finish(ctx, dm, ctrl.Result{}, err)
 		}
-		// A missing/unreadable dataset object is transient (may be created later);
-		// only a genuinely invalid dataset (parse error below) is permanent.
-		return r.rollbackOrFail(ctx, dm, candidate, reasonDatasetInvalid, err.Error())
 	}
 	maxCases := int(evalSpec.MaxCases)
 	if maxCases == 0 {
@@ -76,20 +105,21 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	}
 	cases, err := parseDataset(raw, maxCases)
 	if err != nil {
-		return r.rollbackOrFailPermanent(ctx, dm, candidate, reasonDatasetInvalid, err.Error())
+		return r.rollbackOrFailPermanent(ctx, dm, candidate, reasonDatasetInvalid,
+			fmt.Sprintf("%s (fix the dataset and set the %s annotation to retry)",
+				err.Error(), decisionmodelv1alpha1.AnnotationRetry))
 	}
 	dsHash := datasetHash(raw)
 
 	// Ensure the candidate evaluation is running / read its result.
 	candKey := evalKey{dm.Namespace, dm.Name, candidate.Hash, dsHash, maxCases}
-	// resuming is true when a prior reconcile already advanced *this* candidate
-	// into Evaluating and persisted it — i.e. the manager restarted (or leadership
-	// moved) mid-evaluation and the in-memory eval store is empty again. In that
-	// case the eval restarts from scratch, but EvaluationStarted must not be
-	// emitted a second time for the same revision (derive it from persisted
-	// cluster state, not the in-memory store).
-	resuming := dm.Status.Phase == decisionmodelv1alpha1.PhaseEvaluating &&
-		dm.Status.CandidateRevision != nil && dm.Status.CandidateRevision.Hash == candidate.Hash
+	// resuming (computed above, before entering Evaluating) is true when a prior
+	// reconcile already advanced *this* candidate into Evaluating and persisted
+	// it — i.e. the manager restarted (or leadership moved) mid-evaluation and the
+	// in-memory eval store is empty again. In that case the eval restarts from
+	// scratch, but EvaluationStarted must not be emitted a second time for the
+	// same revision (derive it from persisted cluster state, not the in-memory
+	// store).
 	candRes, running, evErr := r.ensureEval(ctx, dm, dec, candidate, apiKey, cases, candKey, resuming)
 	if evErr != nil {
 		// A Pod-list/ownership failure must abort (workqueue backoff), not be
@@ -101,7 +131,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionEvaluated,
 		Status:  metav1.ConditionFalse,
-		Reason:  reasonEvaluating,
+		Reason:  reasonEvaluationRunning,
 		Message: "running golden-dataset evaluation",
 	})
 
@@ -168,14 +198,18 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 
 	// Record the result in status.
 	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{
-		Revision:    candidate.Hash,
-		Accuracy:    formatDecimal(candRes.accuracy),
-		ECE:         formatDecimal(candRes.ece),
-		Brier:       formatDecimal(candRes.brier),
-		Cases:       int32(candRes.total),
-		FailedCases: int32(candRes.failedCases),
-		PolicyHash:  evalPolicyHash(evalSpec),
-		CompletedAt: ptrTime(metav1.NewTime(r.now())),
+		Revision:        candidate.Hash,
+		Accuracy:        formatDecimal(candRes.accuracy),
+		ECE:             formatDecimal(candRes.ece),
+		Brier:           formatDecimal(candRes.brier),
+		Cases:           int32(candRes.total),
+		FailedCases:     int32(candRes.failedCases),
+		PolicyHash:      evalPolicyHash(evalSpec),
+		CompletedAt:     ptrTime(metav1.NewTime(r.now())),
+		MinAccuracy:     evalSpec.MinAccuracy,
+		MaxAccuracyDrop: evalSpec.MaxAccuracyDrop,
+		MaxECE:          evalSpec.MaxECE,
+		MaxECEIncrease:  evalSpec.MaxECEIncrease,
 	}
 	if baseline != nil {
 		dm.Status.Evaluation.BaselineAccuracy = formatDecimal(baseline.accuracy)
@@ -187,25 +221,63 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		minAcc: minAcc, maxDrop: maxDrop, hasDrop: hasDrop,
 		maxECE: maxECE, hasMaxECE: hasMaxECE, maxECEInc: maxECEInc, hasMaxECEInc: hasMaxECEInc,
 	}); failed {
-		r.event(ctx, dm, corev1.EventTypeWarning, eventEvaluationFailed, "evaluation failed: %s", failMsg)
+		dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationFailed
+		dm.Status.Evaluation.Reason = failMsg
+		r.event(ctx, dm, corev1.EventTypeWarning, eventEvaluationFailed,
+			"candidate %s failed evaluation: %s; %s keeps serving",
+			modelRef(candidate), failMsg, modelRef(dm.Status.StableRevision))
 		return r.rollbackOrFail(ctx, dm, candidate, reasonEvaluationFailed, failMsg)
 	}
+	dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationPassed
 
 	// Emit EvaluationPassed once, on the Evaluated condition transition to True.
 	if !meta.IsStatusConditionTrue(dm.Status.Conditions, decisionmodelv1alpha1.ConditionEvaluated) {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventEvaluationPassed,
-			"evaluation passed: accuracy %.4f", candRes.accuracy)
+			"candidate %s passed evaluation: accuracy %.4f", modelRef(candidate), candRes.accuracy)
 	}
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionEvaluated,
 		Status:  metav1.ConditionTrue,
-		Reason:  reasonEvaluated,
+		Reason:  reasonEvaluationPassed,
 		Message: fmt.Sprintf("accuracy %.4f", candRes.accuracy),
 	})
 	return r.promoteOrAwait(ctx, dm, eng, candidate, precision, cacheDegraded, policyChanged)
 }
 
-// evalGates bundles the parsed gate thresholds from the evaluation spec.
+// holdForDataset keeps a candidate in Evaluating while its golden dataset is
+// missing/unreadable in a way a user can fix without a spec change (object or
+// key not yet created, Secret not yet labelled). No traffic moves and the
+// candidate Deployment is kept. It sets Evaluated=False with the given reason,
+// emits one Warning Event per distinct cause (not on every requeue), and
+// requeues at regateInterval — unless the Evaluating timeout has expired, in
+// which case the candidate is rolled back with the hold reason (fail-closed).
+func (r *DecisionModelReconciler) holdForDataset(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	candidate *decisionmodelv1alpha1.RevisionStatus,
+	reason string,
+	cause error,
+) (ctrl.Result, error) {
+	if r.phaseExceeded(dm, evaluatingTimeout(dm)) {
+		return r.rollbackOrFail(ctx, dm, candidate, reason,
+			cause.Error()+" before the evaluation deadline")
+	}
+	// Emit the Warning once per cause: only when the Evaluated condition is not
+	// already False for this same reason.
+	cur := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionEvaluated)
+	if cur == nil || cur.Status != metav1.ConditionFalse || cur.Reason != reason {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventEvaluationOnHold,
+			"evaluation on hold (%s): %s", reason, cause.Error())
+	}
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionEvaluated,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: cause.Error(),
+	})
+	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+}
+
 type evalGates struct {
 	minAcc       float64
 	maxDrop      float64
@@ -399,6 +471,9 @@ func (r *DecisionModelReconciler) loadDataset(
 	case ref.ConfigMapRef != nil:
 		var cm corev1.ConfigMap
 		if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.ConfigMapRef.Name}, &cm); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("%w: ConfigMap %s", errDatasetNotFound, ref.ConfigMapRef.Name)
+			}
 			return nil, fmt.Errorf("read ConfigMap %s: %w", ref.ConfigMapRef.Name, err)
 		}
 		if v, ok := cm.Data[ref.ConfigMapRef.Key]; ok {
@@ -407,10 +482,13 @@ func (r *DecisionModelReconciler) loadDataset(
 		if v, ok := cm.BinaryData[ref.ConfigMapRef.Key]; ok {
 			return v, nil
 		}
-		return nil, fmt.Errorf("key %q not found in ConfigMap %s", ref.ConfigMapRef.Key, ref.ConfigMapRef.Name)
+		return nil, fmt.Errorf("%w: key %q in ConfigMap %s", errDatasetKeyNotFound, ref.ConfigMapRef.Key, ref.ConfigMapRef.Name)
 	case ref.SecretRef != nil:
 		var sec corev1.Secret
 		if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.SecretRef.Name}, &sec); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("%w: Secret %s", errDatasetNotFound, ref.SecretRef.Name)
+			}
 			return nil, fmt.Errorf("read Secret %s: %w", ref.SecretRef.Name, err)
 		}
 		if err := requireAPIKeyLabel(sec.Labels); err != nil {
@@ -419,7 +497,7 @@ func (r *DecisionModelReconciler) loadDataset(
 		if v, ok := sec.Data[ref.SecretRef.Key]; ok {
 			return v, nil
 		}
-		return nil, fmt.Errorf("key %q not found in Secret %s", ref.SecretRef.Key, ref.SecretRef.Name)
+		return nil, fmt.Errorf("%w: key %q in Secret %s", errDatasetKeyNotFound, ref.SecretRef.Key, ref.SecretRef.Name)
 	default:
 		log.V(1).Info("dataset ref has neither configMapRef nor secretRef")
 		return nil, fmt.Errorf("datasetRef has neither configMapRef nor secretRef")

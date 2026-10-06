@@ -33,16 +33,39 @@ import (
 
 // Manual promotion gate.
 const (
-	reasonAwaitingApproval  = "AwaitingApproval"
-	reasonPromotionApproved = "Approved"
+	reasonPromotionPending = "PromotionPending"
+	reasonPromoted         = "Promoted"
 
 	eventAwaitingPromotion = "AwaitingPromotion"
 	eventPromotionApproved = "PromotionApproved"
 )
 
-// manualPromotion reports whether spec.rollout.manualPromotion is set.
+// manualPromotion reports whether the effective promotion policy holds a
+// passed candidate for human approval (promotion: Manual, or the deprecated
+// manualPromotion: true alias).
 func manualPromotion(dm *decisionmodelv1alpha1.DecisionModel) bool {
-	return dm.Spec.Rollout != nil && dm.Spec.Rollout.ManualPromotion
+	return effectivePromotionPolicy(dm) == decisionmodelv1alpha1.PromotionManual
+}
+
+// effectivePromotionPolicy resolves spec.rollout.promotion, honouring the
+// deprecated manualPromotion alias and the documented defaults: EvaluationGated
+// when rollout.evaluation is set, else Automatic. manualPromotion:true forces
+// Manual (CEL rejects a conflicting explicit promotion).
+func effectivePromotionPolicy(dm *decisionmodelv1alpha1.DecisionModel) decisionmodelv1alpha1.PromotionPolicy {
+	r := dm.Spec.Rollout
+	if r == nil {
+		return decisionmodelv1alpha1.PromotionAutomatic
+	}
+	if r.Promotion != "" {
+		return r.Promotion
+	}
+	if r.ManualPromotion { //nolint:staticcheck // deprecated field kept working as an alias for promotion: Manual
+		return decisionmodelv1alpha1.PromotionManual
+	}
+	if r.Evaluation != nil {
+		return decisionmodelv1alpha1.PromotionEvaluationGated
+	}
+	return decisionmodelv1alpha1.PromotionAutomatic
 }
 
 // isApproved reports whether the promote annotation approves exactly this
@@ -85,7 +108,7 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 		setStatusCondition(dm, metav1.Condition{
 			Type:    decisionmodelv1alpha1.ConditionPromoted,
 			Status:  metav1.ConditionTrue,
-			Reason:  reasonPromotionApproved,
+			Reason:  reasonPromoted,
 			Message: fmt.Sprintf("revision %s promoted after approval", candidate.Hash),
 		})
 		return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
@@ -94,15 +117,15 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 	// Announce once, on entry (not on every re-reconcile while waiting).
 	if dm.Status.Phase != decisionmodelv1alpha1.PhaseAwaitingPromotion {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventAwaitingPromotion,
-			"revision %s passed its gate%s; set annotation %s=%s to promote",
-			candidate.Hash, evaluationSummary(dm, candidate.Hash),
+			"candidate %s passed its gate%s; set annotation %s=%s to promote",
+			modelRef(candidate), evaluationSummary(dm, candidate.Hash),
 			decisionmodelv1alpha1.AnnotationPromote, candidate.Hash)
 	}
 	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseAwaitingPromotion)
 	setStatusCondition(dm, metav1.Condition{
 		Type:   decisionmodelv1alpha1.ConditionPromoted,
 		Status: metav1.ConditionFalse,
-		Reason: reasonAwaitingApproval,
+		Reason: reasonPromotionPending,
 		Message: fmt.Sprintf("revision %s is ready; set annotation %s=%s to promote it",
 			candidate.Hash, decisionmodelv1alpha1.AnnotationPromote, candidate.Hash),
 	})
@@ -124,6 +147,20 @@ func evaluationSummary(dm *decisionmodelv1alpha1.DecisionModel, hash string) str
 		s += ", ECE " + ev.ECE
 	}
 	return s
+}
+
+// promotionEvalSummary renders " (accuracy 0.9400, baseline 0.9300)" for the
+// Promoted Event, or "" when the promoted revision was not evaluated.
+func promotionEvalSummary(dm *decisionmodelv1alpha1.DecisionModel, hash string) string {
+	ev := dm.Status.Evaluation
+	if ev == nil || ev.Revision != hash || ev.Accuracy == "" {
+		return ""
+	}
+	s := " (accuracy " + ev.Accuracy
+	if ev.BaselineAccuracy != "" {
+		s += ", baseline " + ev.BaselineAccuracy
+	}
+	return s + ")"
 }
 
 // consumePromoteApproval removes the promote annotation once the revision it
@@ -179,10 +216,6 @@ func (r *DecisionModelReconciler) promote(
 		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil)
 	}
 	switching := prevStable == nil || prevStable.Hash != rev
-	fromRev := "<none>"
-	if prevStable != nil {
-		fromRev = prevStable.Hash
-	}
 	candidate.Precision = precision
 	dm.Status.StableRevision = candidate
 	dm.Status.CandidateRevision = nil
@@ -192,13 +225,20 @@ func (r *DecisionModelReconciler) promote(
 		// Record the demoted revision so its workloads linger for promoteGrace
 		// (endpoints of the new revision must populate first), then emit Promoted
 		// exactly once for this transition.
+		now := metav1.NewTime(r.now())
+		dm.Status.LastPromotionTime = &now
 		if prevStable != nil {
-			now := metav1.NewTime(r.now())
 			dm.Status.PreviousRevision = &decisionmodelv1alpha1.PreviousRevisionStatus{
 				Hash: prevStable.Hash, PromotedAt: &now,
 			}
 		}
-		r.event(ctx, dm, corev1.EventTypeNormal, eventPromoted, "promoted revision %s -> %s", fromRev, rev)
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionPromoted,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonPromoted,
+			Message: fmt.Sprintf("revision %s is serving", rev),
+		})
+		r.event(ctx, dm, corev1.EventTypeNormal, eventPromoted, "promoted %s%s", modelRef(candidate), promotionEvalSummary(dm, candidate.Hash))
 		bufferRollout(ctx, rolloutPromoted)
 	}
 	// GC now: everything except the new stable, the just-demoted previous revision
@@ -250,6 +290,10 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	dm.Status.CandidateRevision = nil
+	failedAt := metav1.NewTime(r.now())
+	failed.Reason = reason
+	failed.Message = message
+	failed.FailedAt = &failedAt
 	dm.Status.FailedRevision = failed
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionDegraded,
@@ -259,13 +303,23 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 	})
 	if dm.Status.StableRevision != nil {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseRolledBack)
+		// Ready stays True on a rollback: the stable revision keeps serving. The
+		// reason tells the story (a candidate was rejected), the Degraded condition
+		// above carries the failure detail.
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonCandidateRejected,
+			Message: fmt.Sprintf("candidate %s rejected (%s); %s keeps serving", modelRef(failed), reason, modelRef(dm.Status.StableRevision)),
+		})
 		r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
-			"revision %s rolled back (%s): %s", failed.Hash, reason, message)
+			"candidate %s rejected (%s): %s; %s keeps serving",
+			modelRef(failed), reason, message, modelRef(dm.Status.StableRevision))
 		bufferRollout(ctx, rolloutRolledBack)
 	} else {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseFailed)
 		r.event(ctx, dm, corev1.EventTypeWarning, eventFailed,
-			"revision %s failed (%s): %s", failed.Hash, reason, message)
+			"revision %s failed (%s): %s", modelRef(failed), reason, message)
 		bufferRollout(ctx, rolloutFailed)
 	}
 	return r.finish(ctx, dm, ctrl.Result{}, nil)

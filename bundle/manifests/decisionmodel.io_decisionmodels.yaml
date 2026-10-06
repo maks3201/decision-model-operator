@@ -17,24 +17,39 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.model
-      name: Model
+    - jsonPath: .status.stableRevision.model
+      name: Active
       type: string
-    - jsonPath: .status.stableRevision.digest
-      name: Digest
-      priority: 1
+    - jsonPath: .status.candidateRevision.model
+      name: Candidate
       type: string
-    - jsonPath: .spec.device
-      name: Device
+    - jsonPath: .status.evaluation.accuracy
+      name: Accuracy
       type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.replicas.modelReady
-      name: Ready
-      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
+      type: date
+    - jsonPath: .status.stableRevision.digest
+      name: Digest
+      priority: 1
+      type: string
+    - jsonPath: .status.stableRevision.device
+      name: Device
+      priority: 1
+      type: string
+    - jsonPath: .status.replicas.modelReady
+      name: Ready
+      priority: 1
+      type: integer
+    - jsonPath: .status.lastPromotionTime
+      name: Promoted
+      priority: 1
       type: date
     name: v1alpha1
     schema:
@@ -367,7 +382,29 @@ spec:
                       DecisionModel (no stable revision yet) is promoted without approval, since
                       there is no traffic to protect. The approval annotation is removed once the
                       promotion has been persisted.
+
+                      Deprecated: use promotion: Manual. manualPromotion:true keeps working as an
+                      alias for promotion: Manual.
                     type: boolean
+                  promotion:
+                    description: |-
+                      Promotion selects how a candidate that passed ModelReady is promoted:
+                        - Automatic: promote as soon as the candidate is model-ready (and, when
+                          evaluation is configured, has passed the gate).
+                        - EvaluationGated: like Automatic but requires rollout.evaluation to be
+                          set (rejected by CEL otherwise); the gate decides promotion.
+                        - Manual: hold the candidate in AwaitingPromotion until a human sets the
+                          annotation decisionmodel.io/promote to the candidate's revision hash
+                          (evaluation still runs when configured).
+                      When unset the effective policy is EvaluationGated if rollout.evaluation is
+                      set, else Automatic. The deprecated manualPromotion:true is an alias for
+                      Manual; setting both promotion and manualPromotion:true to disagreeing
+                      values is rejected by CEL.
+                    enum:
+                    - Automatic
+                    - EvaluationGated
+                    - Manual
+                    type: string
                   timeouts:
                     description: |-
                       Timeouts overrides the progress timeouts of a rollout. Unset fields keep
@@ -412,6 +449,15 @@ spec:
                             <= duration('24h')
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: 'promotion: EvaluationGated requires rollout.evaluation
+                    to be set'
+                  rule: '!(has(self.promotion) && self.promotion == ''EvaluationGated'')
+                    || has(self.evaluation)'
+                - message: 'manualPromotion: true conflicts with promotion; use promotion:
+                    Manual'
+                  rule: '!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion)
+                    || self.promotion == ''Manual'''
               scheduling:
                 description: Scheduling is a passthrough of nodeSelector/tolerations/affinity
                   for serving Pods.
@@ -1415,6 +1461,12 @@ spec:
                   engine:
                     description: Engine is the serving runtime for this revision.
                     type: string
+                  failedAt:
+                    description: |-
+                      FailedAt is when this revision was recorded as failed. Set only on
+                      status.failedRevision; nil on stable/candidate.
+                    format: date-time
+                    type: string
                   hash:
                     description: Hash is the short revision hash of the model-affecting
                       spec fields.
@@ -1422,6 +1474,11 @@ spec:
                   image:
                     description: Image is the resolved serving container image for
                       this revision.
+                    type: string
+                  message:
+                    description: |-
+                      Message is a human-readable explanation of a failure. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   model:
                     description: Model is the model name for this revision.
@@ -1440,6 +1497,11 @@ spec:
                   precision:
                     description: Precision is the quantization level reported by the
                       engine (e.g. F32, F16).
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is a short machine reason for why this revision failed. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   resources:
                     description: |-
@@ -1602,12 +1664,38 @@ spec:
                       wrong or unanswerable.
                     format: int32
                     type: integer
+                  maxAccuracyDrop:
+                    description: MaxAccuracyDrop echoes the accuracy-drop limit the
+                      gate applied, if any.
+                    type: string
+                  maxEce:
+                    description: MaxECE echoes the absolute ECE limit the gate applied,
+                      if any.
+                    type: string
+                  maxEceIncrease:
+                    description: MaxECEIncrease echoes the relative ECE-increase limit
+                      the gate applied, if any.
+                    type: string
+                  minAccuracy:
+                    description: MinAccuracy echoes the accuracy floor the gate applied,
+                      if any.
+                    type: string
                   policyHash:
                     description: |-
                       PolicyHash is a hash of the effective evaluation policy (thresholds,
                       datasetRef, maxCases) this result was produced under. A parked candidate in
                       AwaitingPromotion whose current policy hash differs is re-evaluated rather
                       than promoted on the stale result.
+                    type: string
+                  reason:
+                    description: Reason is the gate message (e.g. the failing comparison),
+                      human-readable.
+                    type: string
+                  result:
+                    description: 'Result is the gate outcome: Passed or Failed.'
+                    enum:
+                    - Passed
+                    - Failed
                     type: string
                   revision:
                     description: Revision is the revision hash the evaluation was
@@ -1631,6 +1719,12 @@ spec:
                   engine:
                     description: Engine is the serving runtime for this revision.
                     type: string
+                  failedAt:
+                    description: |-
+                      FailedAt is when this revision was recorded as failed. Set only on
+                      status.failedRevision; nil on stable/candidate.
+                    format: date-time
+                    type: string
                   hash:
                     description: Hash is the short revision hash of the model-affecting
                       spec fields.
@@ -1638,6 +1732,11 @@ spec:
                   image:
                     description: Image is the resolved serving container image for
                       this revision.
+                    type: string
+                  message:
+                    description: |-
+                      Message is a human-readable explanation of a failure. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   model:
                     description: Model is the model name for this revision.
@@ -1656,6 +1755,11 @@ spec:
                   precision:
                     description: Precision is the quantization level reported by the
                       engine (e.g. F32, F16).
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is a short machine reason for why this revision failed. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   resources:
                     description: |-
@@ -1719,6 +1823,11 @@ spec:
                         type: object
                     type: object
                 type: object
+              lastPromotionTime:
+                description: LastPromotionTime is when a candidate was most recently
+                  promoted to stable.
+                format: date-time
+                type: string
               lastRetryToken:
                 description: |-
                   LastRetryToken is the value of the decisionmodel.io/retry annotation the
@@ -1778,6 +1887,12 @@ spec:
                   engine:
                     description: Engine is the serving runtime for this revision.
                     type: string
+                  failedAt:
+                    description: |-
+                      FailedAt is when this revision was recorded as failed. Set only on
+                      status.failedRevision; nil on stable/candidate.
+                    format: date-time
+                    type: string
                   hash:
                     description: Hash is the short revision hash of the model-affecting
                       spec fields.
@@ -1785,6 +1900,11 @@ spec:
                   image:
                     description: Image is the resolved serving container image for
                       this revision.
+                    type: string
+                  message:
+                    description: |-
+                      Message is a human-readable explanation of a failure. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   model:
                     description: Model is the model name for this revision.
@@ -1803,6 +1923,11 @@ spec:
                   precision:
                     description: Precision is the quantization level reported by the
                       engine (e.g. F32, F16).
+                    type: string
+                  reason:
+                    description: |-
+                      Reason is a short machine reason for why this revision failed. Set only on
+                      status.failedRevision; empty on stable/candidate.
                     type: string
                   resources:
                     description: |-

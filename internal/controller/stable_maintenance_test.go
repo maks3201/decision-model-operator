@@ -152,7 +152,7 @@ var _ = Describe("stable maintenance during a rollout", func() {
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 			Spec: decisionmodelv1alpha1.DecisionModelSpec{
 				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
-				Rollout: &decisionmodelv1alpha1.RolloutSpec{ManualPromotion: true},
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Promotion: decisionmodelv1alpha1.PromotionManual},
 			},
 		})).To(Succeed())
 		rec := func() {

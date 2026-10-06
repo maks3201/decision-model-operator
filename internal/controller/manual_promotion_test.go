@@ -177,7 +177,10 @@ var _ = Describe("manual promotion", func() {
 			},
 			setDigest: func(d string) { fake.mu.Lock(); fake.digest = d; fake.mu.Unlock() },
 		}
-		rollout := &decisionmodelv1alpha1.RolloutSpec{ManualPromotion: manual}
+		rollout := &decisionmodelv1alpha1.RolloutSpec{}
+		if manual {
+			rollout.Promotion = decisionmodelv1alpha1.PromotionManual
+		}
 		if withEval {
 			rollout.Evaluation = &decisionmodelv1alpha1.EvaluationSpec{
 				DatasetRef: decisionmodelv1alpha1.DatasetRef{
@@ -247,7 +250,7 @@ var _ = Describe("manual promotion", func() {
 			promoted := condition(name, decisionmodelv1alpha1.ConditionPromoted)
 			Expect(promoted).NotTo(BeNil())
 			Expect(promoted.Status).To(Equal(metav1.ConditionFalse))
-			Expect(promoted.Reason).To(Equal("AwaitingApproval"))
+			Expect(promoted.Reason).To(Equal("PromotionPending"))
 			Expect(promoted.Message).To(ContainSubstring(cand))
 			if withEval {
 				Expect(meta_IsTrue(dm, decisionmodelv1alpha1.ConditionEvaluated)).To(BeTrue())
@@ -353,15 +356,54 @@ var _ = Describe("manual promotion", func() {
 		Expect(condition(name, decisionmodelv1alpha1.ConditionPromoted)).To(BeNil())
 	})
 
-	It("promotes without approval when manualPromotion is switched off while waiting", func() {
+	It("promotes without approval when the promotion policy is switched to Automatic while waiting", func() {
 		name := "mp-off"
 		m := newManual(name, false, true)
 		cand := startCandidate(m, "kev:en", digest2)
 		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
 
 		Expect(updateDM(ctx, namespace, name, func(dm *decisionmodelv1alpha1.DecisionModel) {
-			dm.Spec.Rollout.ManualPromotion = false
+			dm.Spec.Rollout.Promotion = decisionmodelv1alpha1.PromotionAutomatic
 		})).To(Succeed())
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
+	})
+
+	It("treats the deprecated manualPromotion:true as promotion: Manual", func() {
+		name := "mp-alias"
+		fake := newFakeEngine()
+		clock = time.Now()
+		m := &mp{
+			name: name,
+			r: &DecisionModelReconciler{
+				Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+				Engines:  map[string]engine.Engine{"ollaya": fake},
+				Prober:   &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}},
+				Recorder: events.NewFakeRecorder(256),
+				Now:      func() time.Time { return clock },
+			},
+			setDigest: func(d string) { fake.mu.Lock(); fake.digest = d; fake.mu.Unlock() },
+		}
+		//nolint:staticcheck // exercising the deprecated alias on purpose
+		rollout := &decisionmodelv1alpha1.RolloutSpec{ManualPromotion: true}
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1), Rollout: rollout,
+			},
+		})).To(Succeed())
+		reconcile1(m)
+		m.rev1 = RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		markJobComplete(name, m.rev1)
+		reconcile1(m)
+		createGatedPod(name, m.rev1)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return reconcile1(m) }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseReady))
+
+		// A second revision must now be held for approval, exactly like promotion: Manual.
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		annotate(name, cand)
 		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
 	})
@@ -377,14 +419,19 @@ var _ = Describe("manual promotion", func() {
 		Expect(getDM(name).Annotations).To(HaveKeyWithValue(promoteKey, "deadbeef00"))
 	})
 
-	It("leaves manualPromotion=false behaviour unchanged: promotes immediately and ignores the annotation", func() {
+	It("promotes immediately with promotion: Automatic and ignores the annotation", func() {
 		name := "mp-auto"
 		m := newManual(name, false, false)
 		annotate(name, "whatever")
 		cand := startCandidate(m, "kev:en", digest2)
 		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(cand))
-		Expect(condition(name, decisionmodelv1alpha1.ConditionPromoted)).To(BeNil())
+		// Promoted is True (reason Promoted) on the normal promotion; it is never
+		// held for approval, so there is no AwaitingPromotion / PromotionPending.
+		promoted := condition(name, decisionmodelv1alpha1.ConditionPromoted)
+		Expect(promoted).NotTo(BeNil())
+		Expect(promoted.Status).To(Equal(metav1.ConditionTrue))
+		Expect(promoted.Reason).To(Equal("Promoted"))
 		Expect(countEvents(m, "AwaitingPromotion")["AwaitingPromotion"]).To(BeZero())
 	})
 
