@@ -60,6 +60,14 @@ When you change `spec.model`, decision-model-operator:
                                           reason in status and Events
 ```
 
+## Demo
+
+![A weaker candidate is rejected by the evaluation gate while production keeps serving; a candidate that passes is promoted](docs/assets/demo.gif)
+
+Real run on kind, sped up about 8×: `laya:en` serves, `laya:multilingual` scores 0.80 on a 40-case English
+routing set and is rejected (`minAccuracy 0.90`), `nli:latest` scores 0.925 and is promoted. Reproduce with
+`make demo` ([examples/demo](examples/demo/README.md), about 5 minutes on a cold cluster).
+
 ## Quickstart
 
 Needs Kubernetes 1.29+ with a default StorageClass (kind works).
@@ -81,11 +89,10 @@ at `http://support-router.<namespace>.svc:11435/v1/systemone`. Edit `spec.model`
 kubectl describe dm support-router     # conditions, revisions, evaluation, Events
 ```
 
-A failed gate looks like this in the Events:
+A failed gate looks like this in the Events (from the demo):
 
 ```text
-Warning  EvaluationFailed  evaluation failed: accuracy 0.8000 < minAccuracy 0.9000
-Warning  RolledBack        revision 5d1c… rolled back (EvaluationFailed): accuracy 0.8000 < minAccuracy 0.9000
+EvaluationFailed  candidate laya:multilingual@sha256:2840506e failed evaluation: accuracy 0.8000 < minAccuracy 0.9000; laya:en@sha256:c305a927 keeps serving
 ```
 
 The full walk-through (first request, scaling, proxies, mirrors) is in the
@@ -209,7 +216,7 @@ docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.3.0
 | Stage | Scope |
 |---|---|
 | Released | Evaluation-gated blue-green rollout, rollback, manual promotion, model-aware readiness, digest pinning, prefetch, Ollaya runtime, mirrors, signed releases |
-| Next | Reproducible demo, clearer status and Events, rollback after promotion (stabilization window), per-question precision/recall/F1 gates |
+| Next | Score-question evaluation, dataset-bound approvals, runtime version pinned across operator upgrades, rollback after promotion (stabilization window), F1 gates |
 | Later | More runtimes (Ollama), shadow traffic, canary percentages |
 
 See [CHANGELOG.md](CHANGELOG.md) for what each release contains.
