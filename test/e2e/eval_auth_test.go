@@ -105,13 +105,13 @@ kind: DecisionModel
 metadata: {name: %s, namespace: %s}
 spec:
   engine: ollaya
-  model: laya:en
+  model: %s
   device: %s
   replicas: 1
   resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
   auth:
     apiKeySecretRef: {name: %s, key: token}
-`, dm, authNS, testDevice, secretName))
+`, dm, authNS, testModel, testDevice, secretName))
 
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(authNS, "decisionmodel", dm, "{.status.phase}")
@@ -122,7 +122,7 @@ spec:
 		defer close(stop)
 
 		body, _ := json.Marshal(map[string]any{
-			"model": "laya:en", "keep_alive": -1,
+			"model": testModel, "keep_alive": -1,
 			"state": evalStates[0], "questions": deptQuestion(),
 		})
 
@@ -204,7 +204,7 @@ stringData:
 		local := portForward(dm, authNS, 11435, stop)
 		defer close(stop)
 		body, _ := json.Marshal(map[string]any{
-			"model": "laya:en", "keep_alive": -1,
+			"model": testModel, "keep_alive": -1,
 			"state": evalStates[0], "questions": deptQuestion(),
 		})
 		Eventually(func(g Gomega) {
@@ -242,13 +242,13 @@ kind: DecisionModel
 metadata: {name: auth-bad, namespace: %s}
 spec:
   engine: ollaya
-  model: laya:en
+  model: %s
   device: %s
   replicas: 1
   resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
   auth:
     apiKeySecretRef: {name: %s, key: token}
-`, authNS, testDevice, badSecretName))
+`, authNS, testModel, testDevice, badSecretName))
 
 		By("Ready=False with reason SecretNotAllowed")
 		Eventually(func(g Gomega) {
@@ -285,11 +285,11 @@ kind: DecisionModel
 metadata: {name: %s, namespace: %s}
 spec:
   engine: ollaya
-  model: laya:en
+  model: %s
   device: %s
   replicas: 1
   resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
-`, dm, evalNS, testDevice))
+`, dm, evalNS, testModel, testDevice))
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(evalNS, "decisionmodel", dm, "{.status.phase}")
 		}, 8*time.Minute, 5*time.Second).Should(Equal("Ready"))
@@ -313,7 +313,7 @@ spec:
 		verified = make([]string, len(evalStates))
 		for i, st := range evalStates {
 			body, _ := json.Marshal(map[string]any{
-				"model": "laya:en", "keep_alive": -1,
+				"model": testModel, "keep_alive": -1,
 				"state": st, "questions": deptQuestion(),
 			})
 			var resp struct {

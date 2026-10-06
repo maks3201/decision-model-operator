@@ -43,6 +43,36 @@ var testDevice = envOr("E2E_DEVICE", "cpu")
 // tag; the GPU workflow overrides it via OLLAYA_IMAGE (…:0.10.0-cuda).
 var ollayaImage = envOr("OLLAYA_IMAGE", "ghcr.io/ollaya-dev/ollaya:0.10.0")
 
+// testModel is the model the suite exercises. Per-PR runs use laya:en; the nightly
+// matrix overrides it via E2E_MODEL (e.g. gliclass:latest, nli:latest) to catch a
+// runtime or registry change that breaks a model other than laya. Specs that assert
+// laya-specific behaviour (the pinned laya:en digest, the support-triage routing of
+// /v1/systemone) skip when the model is not laya; model-agnostic specs (lifecycle,
+// readiness gate, scaling, eval that learns labels live) run for every model.
+var testModel = envOr("E2E_MODEL", "laya:en")
+
+// modelIsLaya reports whether testModel is a laya tag (its family is "laya"), used to
+// gate laya-specific assertions.
+func modelIsLaya() bool {
+	base := testModel
+	if i := strings.IndexByte(base, ':'); i >= 0 {
+		base = base[:i]
+	}
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	return base == "laya"
+}
+
+// modelBase returns testModel without its tag (e.g. "gliclass" for "gliclass:latest"),
+// used to build a deliberately-missing tag for the failed-rollout spec.
+func modelBase() string {
+	if i := strings.IndexByte(testModel, ':'); i >= 0 {
+		return testModel[:i]
+	}
+	return testModel
+}
+
 // envOr returns the env var value or a default when unset/empty.
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
