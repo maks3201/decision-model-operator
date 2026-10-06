@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/maks3201/decision-model-operator/compare/v0.2.1...v0.3.0) (2026-10-06)
+
+
+### Features
+
+* **api:** add spec.cache.downloadTokenSecretRef for private or gated weights ([003292f](https://github.com/maks3201/decision-model-operator/commit/003292fc26fe97fe0b38fe920d186ec3610a08e5))
+* download model weights from a Hugging Face mirror (--ollaya-hf-endpoint) ([003292f](https://github.com/maks3201/decision-model-operator/commit/003292fc26fe97fe0b38fe920d186ec3610a08e5))
+* **ollaya:** default to the Ollaya 0.10.0 runtime ([003292f](https://github.com/maks3201/decision-model-operator/commit/003292fc26fe97fe0b38fe920d186ec3610a08e5))
+
 ## [0.2.1](https://github.com/maks3201/decision-model-operator/compare/v0.2.0...v0.2.1) (2026-10-05)
 
 

@@ -19,7 +19,7 @@ laptop-scale cluster.
 
 ### From a release (recommended)
 
-Replace `<tag>` with a released version (e.g. `v0.2.1`<!-- x-release-please-version -->):
+Replace `<tag>` with a released version (e.g. `v0.3.0`<!-- x-release-please-version -->):
 
 ```sh
 kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/<tag>/install.yaml
@@ -45,7 +45,7 @@ kubectl -n decision-model-operator-system logs deploy/decision-model-operator-co
 
 The chart is published on GHCR as an OCI artifact (and listed on
 [Artifact Hub](https://artifacthub.io/packages/search?repo=decision-model-operator)).
-Replace `<version>` with a chart version without the `v` (e.g. `0.2.1`<!-- x-release-please-version -->); the operator
+Replace `<version>` with a chart version without the `v` (e.g. `0.3.0`<!-- x-release-please-version -->); the operator
 image defaults to the matching `v<version>` tag:
 
 ```sh
