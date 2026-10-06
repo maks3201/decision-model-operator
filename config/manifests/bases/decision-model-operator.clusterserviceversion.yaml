@@ -166,6 +166,12 @@ spec:
         path: failedRevision
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:text
+      - description: LastPromotionTime is when a candidate was most recently promoted
+          to stable.
+        displayName: Last Promotion Time
+        path: lastPromotionTime
+        x-descriptors:
+        - urn:alm:descriptor:text
       - description: Phase is the high-level lifecycle phase.
         displayName: Phase
         path: phase

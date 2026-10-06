@@ -34,6 +34,9 @@ spec:
     limits:
       memory: 4Gi
   rollout:
+    # Promotion policy: Automatic | EvaluationGated | Manual. EvaluationGated (the
+    # default when rollout.evaluation is set) promotes only after the gate passes.
+    promotion: EvaluationGated
     evaluation:
       datasetRef:
         configMapRef:

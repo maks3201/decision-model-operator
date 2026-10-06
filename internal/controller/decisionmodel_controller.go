@@ -108,11 +108,20 @@ const (
 
 	reasonEvaluationUnsupported = "EvaluationUnsupported"
 	reasonDatasetInvalid        = "DatasetInvalid"
+	reasonDatasetNotFound       = "DatasetNotFound"
+	reasonDatasetKeyNotFound    = "DatasetKeyNotFound"
 	reasonEvaluationTimeout     = "EvaluationTimeout"
 	reasonEvaluationFailed      = "EvaluationFailed"
-	reasonEvaluating            = "Evaluating"
-	reasonEvaluated             = "Evaluated"
 	reasonBaselineUnavailable   = "BaselineUnavailable"
+
+	// Evaluated-condition reasons that tell the rollout story.
+	reasonEvaluationRunning = "EvaluationRunning"
+	reasonEvaluationPassed  = "EvaluationPassed"
+	reasonEvaluationSkipped = "EvaluationSkipped"
+
+	// Ready-condition reason on a rollback: the candidate was rejected and the
+	// stable revision keeps serving.
+	reasonCandidateRejected = "CandidateRejected"
 
 	reasonReplicasNotModelReady = "ReplicasNotModelReady"
 	reasonNoModelReadyPods      = "NoModelReadyPods"
@@ -151,6 +160,7 @@ const (
 	eventEvaluationStarted = "EvaluationStarted"
 	eventEvaluationPassed  = "EvaluationPassed"
 	eventEvaluationFailed  = "EvaluationFailed"
+	eventEvaluationOnHold  = "EvaluationOnHold"
 	eventResourceConflict  = "ResourceConflict"
 	eventStoreLost         = "StoreLost"
 	eventStorePrefetchFail = "StorePrefetchFailed"

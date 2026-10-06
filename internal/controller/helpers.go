@@ -420,6 +420,15 @@ func podConditionHasStatus(pod *corev1.Pod, status corev1.ConditionStatus) bool 
 // opt-in label (confused-deputy guard).
 var errSecretNotAllowed = errors.New("secret not allowed")
 
+// errDatasetNotFound is returned when the referenced dataset ConfigMap or Secret
+// does not exist. It is a hold (the object may be created later), not a terminal
+// failure.
+var errDatasetNotFound = errors.New("dataset object not found")
+
+// errDatasetKeyNotFound is returned when the referenced dataset object exists but
+// does not contain the referenced key. Also a hold: the key may be added later.
+var errDatasetKeyNotFound = errors.New("dataset key not found")
+
 // errDownloadTokenInvalid is returned when the download-token Secret exists and
 // is labelled but is missing the referenced key, so the prefetch Job cannot
 // start.
@@ -453,6 +462,33 @@ func apiKeyChecksum(key string) string {
 	}
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// modelRef renders a revision as a human-readable "model@sha256:<short>" for
+// Events and messages, e.g. "laya:en@sha256:c305a927". It falls back to the
+// bare revision hash when the revision is nil or has no model/digest, so an
+// Event never loses the identity of what it is about.
+func modelRef(rev *decisionmodelv1alpha1.RevisionStatus) string {
+	if rev == nil {
+		return "<none>"
+	}
+	switch {
+	case rev.Model != "" && rev.Digest != "":
+		return fmt.Sprintf("%s@sha256:%s", rev.Model, shortDigest(rev.Digest))
+	case rev.Model != "":
+		return rev.Model
+	default:
+		return rev.Hash
+	}
+}
+
+// shortDigest returns the first 8 hex characters of a bare-hex digest (or the
+// whole string when shorter), matching the short form shown in Events.
+func shortDigest(digest string) string {
+	if len(digest) > 8 {
+		return digest[:8]
+	}
+	return digest
 }
 
 // setStatusCondition sets a condition on dm.Status.Conditions, stamping

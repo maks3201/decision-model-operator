@@ -40,6 +40,7 @@ func resetMetrics() {
 	evaluationAccuracyGauge.Reset()
 	evaluationECEGauge.Reset()
 	probeResultsTotal.Reset()
+	revisionInfoGauge.Reset()
 	// registryResolveDuration is a plain Histogram (no labels) and cannot be
 	// reset; tests that assert on it read its sample count as a delta.
 }
@@ -231,6 +232,61 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 	// keep's phase gauge is still one-hot on Ready.
 	if got := testutil.ToFloat64(phaseGauge.WithLabelValues("ns", "keep", string(decisionmodelv1alpha1.PhaseReady))); got != 1 {
 		t.Errorf("keep phase Ready gauge = %v, want 1", got)
+	}
+}
+
+func TestRevisionInfoBoundedToTwoSeriesAndStaleCleaned(t *testing.T) {
+	resetMetrics()
+	dm := newDM("dm")
+	dm.Status.Phase = decisionmodelv1alpha1.PhaseReady
+	dm.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{
+		Model: "laya:en", Digest: "c305a927000000000000000000000000000000000000000000000000000000aa",
+	}
+	dm.Status.CandidateRevision = &decisionmodelv1alpha1.RevisionStatus{
+		Model: "kev:en", Digest: "1a2b3c4d000000000000000000000000000000000000000000000000000000bb",
+	}
+	recordStatusMetrics(dm)
+
+	if n := testutil.CollectAndCount(revisionInfoGauge); n != 2 {
+		t.Fatalf("revision_info series = %d, want 2 (stable+candidate)", n)
+	}
+	if got := testutil.ToFloat64(revisionInfoGauge.WithLabelValues(
+		"ns", "dm", roleStable, "laya:en", dm.Status.StableRevision.Digest)); got != 1 {
+		t.Errorf("stable revision_info = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(revisionInfoGauge.WithLabelValues(
+		"ns", "dm", roleCandidate, "kev:en", dm.Status.CandidateRevision.Digest)); got != 1 {
+		t.Errorf("candidate revision_info = %v, want 1", got)
+	}
+
+	// Promote: candidate becomes stable with a new model/digest, no candidate.
+	// The old stable series (and the old candidate series) must not linger.
+	dm.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{
+		Model: "kev:en", Digest: "1a2b3c4d000000000000000000000000000000000000000000000000000000bb",
+	}
+	dm.Status.CandidateRevision = nil
+	recordStatusMetrics(dm)
+
+	if n := testutil.CollectAndCount(revisionInfoGauge); n != 1 {
+		t.Fatalf("revision_info series after promote = %d, want 1 (stable only)", n)
+	}
+	if got := testutil.ToFloat64(revisionInfoGauge.WithLabelValues(
+		"ns", "dm", roleStable, "kev:en", dm.Status.StableRevision.Digest)); got != 1 {
+		t.Errorf("new stable revision_info = %v, want 1", got)
+	}
+}
+
+func TestRevisionInfoDeletedOnDMDelete(t *testing.T) {
+	resetMetrics()
+	dm := newDM("dm")
+	dm.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{Model: "laya:en", Digest: "abc"}
+	recordStatusMetrics(dm)
+	if n := testutil.CollectAndCount(revisionInfoGauge); n != 1 {
+		t.Fatalf("revision_info series = %d, want 1", n)
+	}
+	deleteMetrics("ns", "dm")
+	if n := testutil.CollectAndCount(revisionInfoGauge); n != 0 {
+		t.Errorf("revision_info series after delete = %d, want 0", n)
 	}
 }
 

@@ -173,6 +173,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `phase` _[DecisionModelPhase](#decisionmodelphase)_ | Phase is the high-level lifecycle phase. |  | Optional: \{\} <br /> |
 | `phaseTransitionTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | PhaseTransitionTime is when Phase last changed. Used for progress timeouts. |  | Optional: \{\} <br /> |
+| `lastPromotionTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | LastPromotionTime is when a candidate was most recently promoted to stable. |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | ObservedGeneration is the generation last processed by the controller. |  | Optional: \{\} <br /> |
 | `endpoint` _string_ | Endpoint is the in-cluster serving endpoint URL. |  | Optional: \{\} <br /> |
 | `stableRevision` _[RevisionStatus](#revisionstatus)_ | StableRevision is the revision currently receiving traffic. |  | Optional: \{\} <br /> |
@@ -183,6 +184,23 @@ _Appears in:_
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
 | `evaluation` _[EvaluationStatus](#evaluationstatus)_ | Evaluation records the most recent eval-gated rollout result. |  | Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#condition-v1-meta) array_ | Conditions represent the latest available observations of the object's state. |  | Optional: \{\} <br /> |
+
+
+#### EvaluationResult
+
+_Underlying type:_ _string_
+
+EvaluationResult is the outcome of applying the evaluation gate.
+
+
+
+_Appears in:_
+- [EvaluationStatus](#evaluationstatus)
+
+| Field | Description |
+| --- | --- |
+| `Passed` | EvaluationPassed means the candidate met every configured gate.<br /> |
+| `Failed` | EvaluationFailed means the candidate failed at least one gate.<br /> |
 
 
 #### EvaluationSpec
@@ -227,6 +245,12 @@ _Appears in:_
 | `ece` _string_ | ECE is the candidate's expected calibration error (decimal string). |  |  |
 | `brier` _string_ | Brier is the candidate's Brier score (decimal string). |  |  |
 | `baselineEce` _string_ | BaselineECE is the stable revision's ECE for this dataset, if known. |  |  |
+| `minAccuracy` _string_ | MinAccuracy echoes the accuracy floor the gate applied, if any. |  | Optional: \{\} <br /> |
+| `maxAccuracyDrop` _string_ | MaxAccuracyDrop echoes the accuracy-drop limit the gate applied, if any. |  | Optional: \{\} <br /> |
+| `maxEce` _string_ | MaxECE echoes the absolute ECE limit the gate applied, if any. |  | Optional: \{\} <br /> |
+| `maxEceIncrease` _string_ | MaxECEIncrease echoes the relative ECE-increase limit the gate applied, if any. |  | Optional: \{\} <br /> |
+| `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
+| `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
 | `completedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | CompletedAt is when the evaluation finished. |  | Optional: \{\} <br /> |
 
@@ -248,6 +272,24 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `hash` _string_ | Hash is the demoted revision's hash. |  |  |
 | `promotedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | PromotedAt is when the newer revision was promoted (this one demoted). |  | Optional: \{\} <br /> |
+
+
+#### PromotionPolicy
+
+_Underlying type:_ _string_
+
+PromotionPolicy selects how a model-ready candidate is promoted.
+
+
+
+_Appears in:_
+- [RolloutSpec](#rolloutspec)
+
+| Field | Description |
+| --- | --- |
+| `Automatic` | PromotionAutomatic promotes a candidate as soon as it is model-ready (and,<br />when evaluation is configured, has passed the gate).<br /> |
+| `EvaluationGated` | PromotionEvaluationGated requires rollout.evaluation and lets the gate<br />decide promotion. Rejected by CEL when evaluation is unset.<br /> |
+| `Manual` | PromotionManual holds a passed candidate in AwaitingPromotion until a human<br />approves it via the decisionmodel.io/promote annotation.<br /> |
 
 
 #### ReplicaStatus
@@ -294,6 +336,9 @@ _Appears in:_
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources are the compute resource requirements of this revision's serving<br />container. |  | Optional: \{\} <br /> |
 | `precision` _string_ | Precision is the quantization level reported by the engine (e.g. F32, F16). |  |  |
 | `placement` _string_ | Placement is a short hash of spec.scheduling (nodeSelector, tolerations,<br />affinity, runtimeClassName) as it was when this revision was created, or<br />"none" when no scheduling was set. Empty only on a revision recorded by an<br />older operator version, which the controller adopts on its first reconcile.<br />Placement is part of a revision's identity: a change of scheduling starts a<br />new revision (blue-green, own store) instead of rolling the running<br />Deployment in place. A hash is recorded, not the spec, because Affinity is a<br />very large schema and this type appears three times in the CRD. |  | Optional: \{\} <br /> |
+| `reason` _string_ | Reason is a short machine reason for why this revision failed. Set only on<br />status.failedRevision; empty on stable/candidate. |  | Optional: \{\} <br /> |
+| `message` _string_ | Message is a human-readable explanation of a failure. Set only on<br />status.failedRevision; empty on stable/candidate. |  | Optional: \{\} <br /> |
+| `failedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | FailedAt is when this revision was recorded as failed. Set only on<br />status.failedRevision; nil on stable/candidate. |  | Optional: \{\} <br /> |
 
 
 #### RolloutSpec
@@ -310,7 +355,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `evaluation` _[EvaluationSpec](#evaluationspec)_ | Evaluation gates promotion on a golden-dataset accuracy check. When unset,<br />a candidate is promoted as soon as all its Pods are model-ready. |  | Optional: \{\} <br /> |
-| `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to the<br />candidate's revision hash. The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted. | false | Optional: \{\} <br /> |
+| `promotion` _[PromotionPolicy](#promotionpolicy)_ | Promotion selects how a candidate that passed ModelReady is promoted:<br />  - Automatic: promote as soon as the candidate is model-ready (and, when<br />    evaluation is configured, has passed the gate).<br />  - EvaluationGated: like Automatic but requires rollout.evaluation to be<br />    set (rejected by CEL otherwise); the gate decides promotion.<br />  - Manual: hold the candidate in AwaitingPromotion until a human sets the<br />    annotation decisionmodel.io/promote to the candidate's revision hash<br />    (evaluation still runs when configured).<br />When unset the effective policy is EvaluationGated if rollout.evaluation is<br />set, else Automatic. The deprecated manualPromotion:true is an alias for<br />Manual; setting both promotion and manualPromotion:true to disagreeing<br />values is rejected by CEL. |  | Enum: [Automatic EvaluationGated Manual] <br />Optional: \{\} <br /> |
+| `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to the<br />candidate's revision hash. The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted.<br />Deprecated: use promotion: Manual. manualPromotion:true keeps working as an<br />alias for promotion: Manual. | false | Optional: \{\} <br /> |
 | `timeouts` _[RolloutTimeouts](#rollouttimeouts)_ | Timeouts overrides the progress timeouts of a rollout. Unset fields keep<br />the built-in defaults. Large models (tens of GB) need more than the<br />defaults on a cold node. Not part of the revision hash; a change applies to<br />the phase timeouts immediately, but a prefetch Job that already exists keeps<br />the deadline it was created with. |  | Optional: \{\} <br /> |
 
 

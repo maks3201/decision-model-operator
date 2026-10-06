@@ -52,6 +52,7 @@ const (
 	metricEvaluationECE           = "decisionmodel_evaluation_ece"
 	metricProbeResultsTotal       = "decisionmodel_probe_results_total"
 	metricRegistryResolveDuration = "decisionmodel_registry_resolve_duration_seconds"
+	metricRevisionInfo            = "decisionmodel_revision_info"
 )
 
 // Metric label keys.
@@ -60,6 +61,15 @@ const (
 	labelName      = "name"
 	labelPhase     = "phase"
 	labelResult    = "result"
+	labelRole      = "role"
+	labelModel     = "model"
+	labelDigest    = "digest"
+)
+
+// Revision-info role label values.
+const (
+	roleStable    = "stable"
+	roleCandidate = "candidate"
 )
 
 // Rollout result label values.
@@ -144,6 +154,12 @@ var (
 		Help:    "Duration of a model registry tag->digest resolution, in seconds.",
 		Buckets: prometheus.DefBuckets,
 	})
+
+	revisionInfoGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metricRevisionInfo,
+		Help: "The model and digest of each live revision role of a DecisionModel " +
+			"(always 1). At most two series per DecisionModel: role=stable and role=candidate.",
+	}, []string{labelNamespace, labelName, labelRole, labelModel, labelDigest})
 )
 
 func init() {
@@ -157,6 +173,7 @@ func init() {
 		evaluationECEGauge,
 		probeResultsTotal,
 		registryResolveDuration,
+		revisionInfoGauge,
 	)
 }
 
@@ -185,6 +202,25 @@ func recordStatusMetrics(dm *decisionmodelv1alpha1.DecisionModel) {
 			evaluationECEGauge.WithLabelValues(ns, name).Set(v)
 		}
 	}
+
+	recordRevisionInfo(ns, name, roleStable, dm.Status.StableRevision)
+	recordRevisionInfo(ns, name, roleCandidate, dm.Status.CandidateRevision)
+}
+
+// recordRevisionInfo keeps exactly one decisionmodel_revision_info series per
+// (DecisionModel, role). It first deletes any existing series for the role (the
+// model/digest are in the label set, so a model change would otherwise leave a
+// stale series), then sets the current one. When the role is empty (no such
+// revision) only the delete runs, so the metric stays bounded to the roles that
+// actually exist — at most two series per DecisionModel.
+func recordRevisionInfo(ns, name, role string, rev *decisionmodelv1alpha1.RevisionStatus) {
+	revisionInfoGauge.DeletePartialMatch(prometheus.Labels{
+		labelNamespace: ns, labelName: name, labelRole: role,
+	})
+	if rev == nil || rev.Model == "" {
+		return
+	}
+	revisionInfoGauge.WithLabelValues(ns, name, role, rev.Model, rev.Digest).Set(1)
 }
 
 // deleteMetrics removes every series for a DecisionModel. Called from the
@@ -199,6 +235,7 @@ func deleteMetrics(namespace, name string) {
 	evaluationAccuracyGauge.DeletePartialMatch(l)
 	evaluationECEGauge.DeletePartialMatch(l)
 	probeResultsTotal.DeletePartialMatch(l)
+	revisionInfoGauge.DeletePartialMatch(l)
 }
 
 // observeRegistryResolve records a registry resolution duration. No DM labels,

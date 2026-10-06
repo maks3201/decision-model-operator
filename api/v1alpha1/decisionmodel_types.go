@@ -168,13 +168,46 @@ type AuthSpec struct {
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 }
 
+// PromotionPolicy selects how a model-ready candidate is promoted.
+type PromotionPolicy string
+
+const (
+	// PromotionAutomatic promotes a candidate as soon as it is model-ready (and,
+	// when evaluation is configured, has passed the gate).
+	PromotionAutomatic PromotionPolicy = "Automatic"
+	// PromotionEvaluationGated requires rollout.evaluation and lets the gate
+	// decide promotion. Rejected by CEL when evaluation is unset.
+	PromotionEvaluationGated PromotionPolicy = "EvaluationGated"
+	// PromotionManual holds a passed candidate in AwaitingPromotion until a human
+	// approves it via the decisionmodel.io/promote annotation.
+	PromotionManual PromotionPolicy = "Manual"
+)
+
 // RolloutSpec configures rollout behaviour.
+// +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && self.promotion == 'EvaluationGated') || has(self.evaluation)",message="promotion: EvaluationGated requires rollout.evaluation to be set"
+// +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion) || self.promotion == 'Manual'",message="manualPromotion: true conflicts with promotion; use promotion: Manual"
 type RolloutSpec struct {
 	// Evaluation gates promotion on a golden-dataset accuracy check. When unset,
 	// a candidate is promoted as soon as all its Pods are model-ready.
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Evaluation",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
 	// +optional
 	Evaluation *EvaluationSpec `json:"evaluation,omitempty"`
+
+	// Promotion selects how a candidate that passed ModelReady is promoted:
+	//   - Automatic: promote as soon as the candidate is model-ready (and, when
+	//     evaluation is configured, has passed the gate).
+	//   - EvaluationGated: like Automatic but requires rollout.evaluation to be
+	//     set (rejected by CEL otherwise); the gate decides promotion.
+	//   - Manual: hold the candidate in AwaitingPromotion until a human sets the
+	//     annotation decisionmodel.io/promote to the candidate's revision hash
+	//     (evaluation still runs when configured).
+	// When unset the effective policy is EvaluationGated if rollout.evaluation is
+	// set, else Automatic. The deprecated manualPromotion:true is an alias for
+	// Manual; setting both promotion and manualPromotion:true to disagreeing
+	// values is rejected by CEL.
+	// +kubebuilder:validation:Enum=Automatic;EvaluationGated;Manual
+	// +optional
+	Promotion PromotionPolicy `json:"promotion,omitempty"`
 
 	// ManualPromotion holds a candidate that passed its gate (model-ready, plus
 	// evaluation when configured) in phase AwaitingPromotion until a human
@@ -184,6 +217,9 @@ type RolloutSpec struct {
 	// DecisionModel (no stable revision yet) is promoted without approval, since
 	// there is no traffic to protect. The approval annotation is removed once the
 	// promotion has been persisted.
+	//
+	// Deprecated: use promotion: Manual. manualPromotion:true keeps working as an
+	// alias for promotion: Manual.
 	// +kubebuilder:default=false
 	// +optional
 	ManualPromotion bool `json:"manualPromotion,omitempty"`
@@ -338,6 +374,21 @@ type RevisionStatus struct {
 	// very large schema and this type appears three times in the CRD.
 	// +optional
 	Placement string `json:"placement,omitempty"`
+
+	// Reason is a short machine reason for why this revision failed. Set only on
+	// status.failedRevision; empty on stable/candidate.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message is a human-readable explanation of a failure. Set only on
+	// status.failedRevision; empty on stable/candidate.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// FailedAt is when this revision was recorded as failed. Set only on
+	// status.failedRevision; nil on stable/candidate.
+	// +optional
+	FailedAt *metav1.Time `json:"failedAt,omitempty"`
 }
 
 // PreviousRevisionStatus records the revision demoted by the latest promotion
@@ -362,6 +413,16 @@ type ReplicaStatus struct {
 	ModelReady int32 `json:"modelReady,omitempty"`
 }
 
+// EvaluationResult is the outcome of applying the evaluation gate.
+type EvaluationResult string
+
+const (
+	// EvaluationPassed means the candidate met every configured gate.
+	EvaluationPassed EvaluationResult = "Passed"
+	// EvaluationFailed means the candidate failed at least one gate.
+	EvaluationFailed EvaluationResult = "Failed"
+)
+
 // EvaluationStatus records the outcome of an eval-gated rollout evaluation.
 type EvaluationStatus struct {
 	// Revision is the revision hash the evaluation was run against.
@@ -380,6 +441,25 @@ type EvaluationStatus struct {
 	Brier string `json:"brier,omitempty"`
 	// BaselineECE is the stable revision's ECE for this dataset, if known.
 	BaselineECE string `json:"baselineEce,omitempty"`
+	// MinAccuracy echoes the accuracy floor the gate applied, if any.
+	// +optional
+	MinAccuracy string `json:"minAccuracy,omitempty"`
+	// MaxAccuracyDrop echoes the accuracy-drop limit the gate applied, if any.
+	// +optional
+	MaxAccuracyDrop string `json:"maxAccuracyDrop,omitempty"`
+	// MaxECE echoes the absolute ECE limit the gate applied, if any.
+	// +optional
+	MaxECE string `json:"maxEce,omitempty"`
+	// MaxECEIncrease echoes the relative ECE-increase limit the gate applied, if any.
+	// +optional
+	MaxECEIncrease string `json:"maxEceIncrease,omitempty"`
+	// Result is the gate outcome: Passed or Failed.
+	// +kubebuilder:validation:Enum=Passed;Failed
+	// +optional
+	Result EvaluationResult `json:"result,omitempty"`
+	// Reason is the gate message (e.g. the failing comparison), human-readable.
+	// +optional
+	Reason string `json:"reason,omitempty"`
 	// PolicyHash is a hash of the effective evaluation policy (thresholds,
 	// datasetRef, maxCases) this result was produced under. A parked candidate in
 	// AwaitingPromotion whose current policy hash differs is re-evaluated rather
@@ -401,6 +481,11 @@ type DecisionModelStatus struct {
 	// PhaseTransitionTime is when Phase last changed. Used for progress timeouts.
 	// +optional
 	PhaseTransitionTime *metav1.Time `json:"phaseTransitionTime,omitempty"`
+
+	// LastPromotionTime is when a candidate was most recently promoted to stable.
+	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Last Promotion Time",xDescriptors={"urn:alm:descriptor:text"}
+	// +optional
+	LastPromotionTime *metav1.Time `json:"lastPromotionTime,omitempty"`
 
 	// ObservedGeneration is the generation last processed by the controller.
 	// +optional
@@ -461,12 +546,16 @@ type DecisionModelStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=dm
-// +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.spec.model`
-// +kubebuilder:printcolumn:name="Digest",type=string,JSONPath=`.status.stableRevision.digest`,priority=1
-// +kubebuilder:printcolumn:name="Device",type=string,JSONPath=`.spec.device`
+// +kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.stableRevision.model`
+// +kubebuilder:printcolumn:name="Candidate",type=string,JSONPath=`.status.candidateRevision.model`
+// +kubebuilder:printcolumn:name="Accuracy",type=string,JSONPath=`.status.evaluation.accuracy`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.replicas.modelReady`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="Digest",type=string,JSONPath=`.status.stableRevision.digest`,priority=1
+// +kubebuilder:printcolumn:name="Device",type=string,JSONPath=`.status.stableRevision.device`,priority=1
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.replicas.modelReady`,priority=1
+// +kubebuilder:printcolumn:name="Promoted",type=date,JSONPath=`.status.lastPromotionTime`,priority=1
 
 // DecisionModel is the Schema for the decisionmodels API.
 //

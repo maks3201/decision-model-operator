@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -263,7 +264,12 @@ var _ = Describe("Eval-gated rollout", func() {
 		Expect(dm.Status.StableRevision.Hash).To(Equal(rev))
 		Expect(dm.Status.Evaluation).NotTo(BeNil())
 		Expect(dm.Status.Evaluation.Accuracy).To(Equal("1.0000"))
+		Expect(dm.Status.Evaluation.Result).To(Equal(decisionmodelv1alpha1.EvaluationPassed))
+		Expect(dm.Status.Evaluation.MinAccuracy).To(Equal("0.90"), "the applied gate is echoed")
 		Expect(meta_IsTrue(dm, decisionmodelv1alpha1.ConditionEvaluated)).To(BeTrue())
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionEvaluated).Reason).To(Equal(reasonEvaluationPassed))
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionPromoted).Reason).To(Equal(reasonPromoted))
+		Expect(dm.Status.LastPromotionTime).NotTo(BeNil())
 
 		// EvaluationPassed and Promoted each fire exactly once.
 		fr := r.Recorder.(*events.FakeRecorder)
@@ -300,9 +306,30 @@ var _ = Describe("Eval-gated rollout", func() {
 		dm := getDM("ev2")
 		Expect(dm.Status.StableRevision).To(BeNil())
 		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Reason).To(Equal(reasonEvaluationFailed))
+		Expect(dm.Status.FailedRevision.Message).NotTo(BeEmpty())
+		Expect(dm.Status.FailedRevision.FailedAt).NotTo(BeNil())
+		Expect(dm.Status.Evaluation).NotTo(BeNil())
+		Expect(dm.Status.Evaluation.Result).To(Equal(decisionmodelv1alpha1.EvaluationFailed))
+		Expect(dm.Status.Evaluation.Reason).To(ContainSubstring("minAccuracy"))
 		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
 		Expect(deg).NotTo(BeNil())
 		Expect(deg.Reason).To(Equal(reasonEvaluationFailed))
+
+		// The EvaluationFailed Event names the model and short digest, not a bare hash.
+		fr := r.Recorder.(*events.FakeRecorder)
+		var failEvent string
+		for drained := false; !drained; {
+			select {
+			case e := <-fr.Events:
+				if strings.Contains(e, eventEvaluationFailed) {
+					failEvent = e
+				}
+			default:
+				drained = true
+			}
+		}
+		Expect(failEvent).To(ContainSubstring("@sha256:"), "the failure Event names model@sha256:<short>, not a bare hash")
 	})
 
 	It("fails when the engine does not support evaluation", func() {
@@ -515,6 +542,114 @@ var _ = Describe("Eval-gated rollout", func() {
 		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
 		Expect(deg).NotTo(BeNil())
 		Expect(deg.Message).To(ContainSubstring("maxECEIncrease"))
+	})
+
+	// A dataset ConfigMap created AFTER the DecisionModel must not permanently
+	// fail the revision: the candidate holds in Evaluating and resumes once the
+	// ConfigMap exists, without a spec change or retry annotation.
+	It("holds on a missing dataset and resumes when it is created", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		createEvalDM("hold1", "golden-late", nil) // ConfigMap does not exist yet
+
+		driveToEvaluating(r, "hold1")
+
+		dm := getDM("hold1")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+		Expect(dm.Status.FailedRevision).To(BeNil(), "a missing dataset must not fail the revision")
+		ev := meta_Find(dm, decisionmodelv1alpha1.ConditionEvaluated)
+		Expect(ev).NotTo(BeNil())
+		Expect(ev.Status).To(Equal(metav1.ConditionFalse))
+		Expect(ev.Reason).To(Equal(reasonDatasetNotFound))
+		// The candidate Deployment is kept while held.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "hold1-" + dm.Status.CandidateRevision.Hash,
+		}, &appsv1.Deployment{})).To(Succeed())
+
+		// Create the dataset: the next reconciles resume and promote.
+		datasetCM("golden-late", allChoice(10, 10))
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			return pollReconcile(r, "hold1")
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM("hold1").Status.FailedRevision).To(BeNil())
+	})
+
+	// A missing key in an existing ConfigMap holds with DatasetKeyNotFound.
+	It("holds on a missing dataset key", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-nokey"},
+			Data:       map[string]string{"other.jsonl": "x"},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		createEvalDM("hold2", "golden-nokey", nil)
+
+		driveToEvaluating(r, "hold2")
+		dm := getDM("hold2")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+		Expect(dm.Status.FailedRevision).To(BeNil())
+		ev := meta_Find(dm, decisionmodelv1alpha1.ConditionEvaluated)
+		Expect(ev.Reason).To(Equal(reasonDatasetKeyNotFound))
+	})
+
+	// An unlabelled dataset Secret holds (SecretNotAllowed) and resumes once the
+	// label is added, rather than permanently failing the revision.
+	It("holds on an unlabelled dataset Secret and resumes when labelled", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		sec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-secret"},
+			Data:       map[string][]byte{"cases.jsonl": []byte(allChoice(10, 10))},
+		}
+		Expect(k8sClient.Create(ctx, sec)).To(Succeed())
+		createEvalDM("hold3", "golden-secret", func(s *decisionmodelv1alpha1.EvaluationSpec) {
+			s.DatasetRef = decisionmodelv1alpha1.DatasetRef{
+				SecretRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden-secret", Key: "cases.jsonl"},
+			}
+		})
+
+		driveToEvaluating(r, "hold3")
+		dm := getDM("hold3")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+		Expect(dm.Status.FailedRevision).To(BeNil(), "an unlabelled dataset Secret must not fail the revision")
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionEvaluated).Reason).To(Equal(reasonSecretNotAllowed))
+
+		// Label the Secret: the hold is released and the rollout promotes.
+		Expect(func() error {
+			s := &corev1.Secret{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "golden-secret"}, s); err != nil {
+				return err
+			}
+			s.Labels = map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"}
+			return k8sClient.Update(ctx, s)
+		}()).To(Succeed())
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			return pollReconcile(r, "hold3")
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+	})
+
+	// Once the Evaluating timeout expires while held, the candidate is rolled
+	// back (fail-closed) with the hold reason recorded on failedRevision.
+	It("rolls back a held candidate once the evaluation timeout expires", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		clock := newSafeClock()
+		r.Now = clock.now
+		createEvalDM("hold4", "golden-never", nil) // ConfigMap never created
+
+		driveToEvaluating(r, "hold4")
+		Expect(getDM("hold4").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+
+		clock.add(evalDeadline + time.Minute)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			return pollReconcile(r, "hold4")
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseFailed))
+
+		dm := getDM("hold4")
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Reason).To(Equal(reasonDatasetNotFound))
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded).Reason).To(Equal(reasonDatasetNotFound))
 	})
 })
 
