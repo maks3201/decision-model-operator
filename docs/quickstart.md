@@ -399,8 +399,17 @@ holds), `score` (expected level over an ordered scale).
 
 ## Supported models
 
-Any model served by the Ollaya runtime works — there is no built-in allow-list
-of model names. Reference a model by `name:tag`:
+There is no built-in allow-list of model names: any model in an Ollaya registry
+can be referenced. What has been verified so far:
+
+| Models | Status |
+|---|---|
+| `laya:en` | E2E on every change (kind, CPU), and once on a T4 GPU (EKS, runtime 0.7.3) |
+| `laya:multilingual`, `nli:latest`, `gliclass:latest` | Pulled, served and measured (see [sizing](sizing.md)) |
+| GGUF models on the llama.cpp runner (`winnow`, `jevk5`, `jeb`, `cygnet`, …) | Not verified yet: the readiness gate has not been checked against their `/api/ps` output |
+| Large models (`nimble`, `clef`, `jeeves`, ~18–19 GB) | Not verified: size `spec.cache.size` and the GPU yourself |
+
+Reference a model by `name:tag`:
 
 - **An explicit tag is required.** A bare name (`laya`) resolves to `:latest`, a
   different and heavier artifact; the operator rejects a model without a tag
