@@ -1,0 +1,34 @@
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata:
+  name: intent-router
+  labels:
+    app.kubernetes.io/part-of: decision-model-operator
+    app.kubernetes.io/component: demo
+spec:
+  engine: ollaya
+  # The stable model: laya:en routes English support tickets well on the golden
+  # dataset (see examples/demo/README.md for the measured scores). The demo later
+  # patches spec.model to a weaker candidate (rejected) and a strong one (promoted).
+  model: laya:en
+  device: cpu
+  replicas: 1
+  resources:
+    requests:
+      cpu: "1"
+      memory: 3500Mi
+    limits:
+      memory: 4Gi
+  rollout:
+    evaluation:
+      # The gate: a candidate must score at least minAccuracy on the golden
+      # dataset AND must not drop more than maxAccuracyDrop below the stable
+      # revision's score on the same dataset. A candidate that fails either check
+      # never receives production traffic.
+      datasetRef:
+        configMapRef:
+          name: intent-router-golden
+          key: cases.jsonl
+      minAccuracy: "0.90"
+      maxAccuracyDrop: "0.05"
+      maxCases: 500
