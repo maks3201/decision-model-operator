@@ -8,8 +8,9 @@
 #   4. patch spec.model to a WEAKER candidate — the operator evaluates it, it misses
 #      the accuracy gate, and the rollout is RolledBack; the Service selector never
 #      moves and the stable model keeps answering;
-#   5. patch spec.model to a STRONG candidate — it passes the gate, is promoted, and
-#      the old revision's Deployment is garbage-collected after the grace;
+#   5. patch spec.model to a STRONG candidate — it passes the gate and is promoted;
+#      the previous revision is kept for a stabilization window (instant rollback) and
+#      then collected (a Stabilized event);
 #   6. `hack/demo.sh clean` deletes the cluster.
 #
 # Models and gate (measured on examples/demo/dataset.yaml, 40 English support
@@ -222,8 +223,18 @@ run() {
   info "The Service now routes to the promoted revision ${new_rev}:"
   info "  decisionmodel.io/revision=$(service_selector)"
 
-  step "5/5  The old revision's Deployment is garbage-collected after the grace"
-  info "Waiting for only the promoted revision's Deployment to remain..."
+  step "5/5  The previous revision is kept for a stabilization window, then collected"
+  info "After promotion the operator keeps the previous revision's Deployment running"
+  info "(out of the Service) for the stabilization window, so it can switch traffic back"
+  info "instantly if the new model turns out unhealthy. Both Deployments are present now:"
+  kc get deploy -l "decisionmodel.io/name=${DM}" -n "${NS}" \
+    -o custom-columns=DEPLOYMENT:.metadata.name,REVISION:.metadata.labels.decisionmodel\\.io/revision --no-headers
+  info ""
+  info "The DecisionModel is Ready and in its stabilization window:"
+  kc get dm "${DM}" -n "${NS}" \
+    -o jsonpath='{"  phase="}{.status.phase}{"  stabilizing="}{.status.conditions[?(@.type=="Stabilizing")].status}{"  previous="}{.status.previousRevision.hash}{" (kept for instant rollback)\n"}'
+  info ""
+  info "Waiting for the stabilization window to pass and the previous revision to be collected..."
   local start now
   start=$(date +%s)
   while :; do
@@ -237,6 +248,10 @@ run() {
     (( now - start > 180 )) && { info "serving Deployments: ${deps}"; break; }
     sleep 3
   done
+  info "The Stabilized event (window elapsed, previous revision collected):"
+  kc get events -n "${NS}" --field-selector reason=Stabilized \
+    -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | tail -1 || true
+  info "Only the promoted revision's Deployment remains:"
   kc get deploy -l "decisionmodel.io/name=${DM}" -n "${NS}" \
     -o custom-columns=DEPLOYMENT:.metadata.name,REVISION:.metadata.labels.decisionmodel\\.io/revision --no-headers
   info ""

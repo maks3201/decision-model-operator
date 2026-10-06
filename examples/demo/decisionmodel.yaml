@@ -20,6 +20,13 @@ spec:
     limits:
       memory: 4Gi
   rollout:
+    # After a promotion the operator keeps the previous revision's Deployment
+    # running (out of the Service) for this window, so it can switch traffic back
+    # instantly if the new model turns out unhealthy. Then the previous revision is
+    # collected (a Stabilized event). The default is 5m; the demo uses the smallest
+    # allowed window (1m) so it ends promptly. ("30s" is rejected: the minimum
+    # non-zero window is 1m.)
+    stabilization: "1m"
     evaluation:
       # The gate: a candidate must score at least minAccuracy on the golden
       # dataset AND must not drop more than maxAccuracyDrop below the stable
