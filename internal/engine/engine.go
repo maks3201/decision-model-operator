@@ -53,6 +53,10 @@ type Params struct {
 	Device string // DeviceCPU | DeviceCUDA
 	// Image overrides the engine default image (optional).
 	Image string
+	// RuntimeVersion selects the runtime release when Image is empty (e.g.
+	// "0.10.0"). Empty means the engine default for this operator build. The
+	// engine validates it and derives the image for Device.
+	RuntimeVersion string
 	// CacheClaimName is the PVC holding the model store.
 	CacheClaimName string
 	// StoreSubPath isolates this revision's model store inside the PVC

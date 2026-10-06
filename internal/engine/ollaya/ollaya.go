@@ -942,14 +942,122 @@ func setAuth(req *http.Request, apiKey string) {
 	}
 }
 
-// Exported runtime image defaults (the ghcr tag is "0.10.0", no "v" prefix;
-// drop-in compatible with the 0.7.3 facts in spike 001, re-verified in spike 006).
+// Runtime version defaults. The ghcr tags are plain MAJOR.MINOR.PATCH (no "v").
+// DefaultImageCPU/CUDA are derived from DefaultRuntimeVersion so a version bump
+// touches one place. 0.10.0 is drop-in compatible with the 0.7.3 facts in spike
+// 001, re-verified in spike 006.
 const (
-	// DefaultImageCPU is the CPU serving/prefetch image.
-	DefaultImageCPU = "ghcr.io/ollaya-dev/ollaya:0.10.0"
-	// DefaultImageCUDA is the CUDA serving image (still amd64-only).
-	DefaultImageCUDA = "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda"
+	// DefaultRuntimeVersion is the Ollaya release this operator build defaults to
+	// when a DecisionModel pins no version and sets no explicit image.
+	DefaultRuntimeVersion = "0.10.0"
+	// MinRuntimeVersion is the oldest release we have verified; older versions are
+	// rejected by ValidateRuntimeVersion.
+	MinRuntimeVersion = "0.7.3"
+
+	imageRepo = "ghcr.io/ollaya-dev/ollaya"
 )
+
+// Exported runtime image defaults, derived from DefaultRuntimeVersion.
+var (
+	// DefaultImageCPU is the CPU serving/prefetch image.
+	DefaultImageCPU = imageRepo + ":" + DefaultRuntimeVersion
+	// DefaultImageCUDA is the CUDA serving image (still amd64-only).
+	DefaultImageCUDA = imageRepo + ":" + DefaultRuntimeVersion + "-cuda"
+)
+
+// runtimeVersionRE matches a plain MAJOR.MINOR.PATCH version (no "v" prefix, no
+// pre-release/build suffix), matching the ghcr tag form.
+var runtimeVersionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// InvalidRuntimeVersionError is returned by ValidateRuntimeVersion for a version
+// the engine will not build an image from. It is a typed error so the controller
+// can recognise it and surface a clear condition.
+type InvalidRuntimeVersionError struct {
+	Version string
+	Reason  string
+}
+
+func (e *InvalidRuntimeVersionError) Error() string {
+	return fmt.Sprintf("ollaya: invalid runtime version %q: %s", e.Version, e.Reason)
+}
+
+// ValidateRuntimeVersion checks that version is a plain MAJOR.MINOR.PATCH string
+// (no "v", no suffix) and not older than MinRuntimeVersion. An empty string is
+// valid and means "the engine default" (DefaultRuntimeVersion). Returns an
+// *InvalidRuntimeVersionError otherwise.
+func ValidateRuntimeVersion(version string) error {
+	if version == "" {
+		return nil // empty = default, resolved later
+	}
+	if !runtimeVersionRE.MatchString(version) {
+		return &InvalidRuntimeVersionError{
+			Version: version,
+			Reason:  "must be MAJOR.MINOR.PATCH with no 'v' prefix or suffix",
+		}
+	}
+	if compareVersions(version, MinRuntimeVersion) < 0 {
+		return &InvalidRuntimeVersionError{
+			Version: version,
+			Reason:  "below the minimum supported version " + MinRuntimeVersion,
+		}
+	}
+	return nil
+}
+
+// compareVersions compares two validated MAJOR.MINOR.PATCH strings numerically.
+// Returns -1, 0 or 1. It assumes both match runtimeVersionRE (callers validate
+// the input; MinRuntimeVersion is a constant that does).
+func compareVersions(a, b string) int {
+	ap := strings.SplitN(a, ".", 3)
+	bp := strings.SplitN(b, ".", 3)
+	for i := 0; i < 3; i++ {
+		x, _ := strconv.Atoi(ap[i])
+		y, _ := strconv.Atoi(bp[i])
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// resolvedRuntimeVersion returns the version an image will be built from: the
+// engine default when p.RuntimeVersion is empty, else p.RuntimeVersion.
+func resolvedRuntimeVersion(p engine.Params) string {
+	if p.RuntimeVersion == "" {
+		return DefaultRuntimeVersion
+	}
+	return p.RuntimeVersion
+}
+
+// ResolvedRuntimeVersion reports the runtime version the engine will serve for
+// these params so the controller can record it in status. It is "" when the
+// image is user-set (spec.image), because the version is then unknown.
+func ResolvedRuntimeVersion(p engine.Params) string {
+	if p.Image != "" {
+		return ""
+	}
+	return resolvedRuntimeVersion(p)
+}
+
+// imageForVersion builds the ghcr image reference for a version and device. An
+// invalid version falls back to DefaultRuntimeVersion (defence in depth: the
+// controller validates with ValidateRuntimeVersion before building specs, but a
+// spec-building method cannot return an error, so it must never emit a malformed
+// tag).
+func imageForVersion(version, device string) string {
+	if ValidateRuntimeVersion(version) != nil {
+		version = DefaultRuntimeVersion
+	} else if version == "" {
+		version = DefaultRuntimeVersion
+	}
+	if device == engine.DeviceCUDA {
+		return imageRepo + ":" + version + "-cuda"
+	}
+	return imageRepo + ":" + version
+}
 
 const (
 	containerName   = "ollaya"
@@ -979,15 +1087,13 @@ const (
 	prefetchMemLim = "1Gi"
 )
 
-// imageFor picks the image: p.Image override, else the device default.
+// imageFor picks the serving image: p.Image override, else the image derived
+// from the resolved runtime version and device.
 func imageFor(p engine.Params) string {
 	if p.Image != "" {
 		return p.Image
 	}
-	if p.Device == engine.DeviceCUDA {
-		return DefaultImageCUDA
-	}
-	return DefaultImageCPU
+	return imageForVersion(p.RuntimeVersion, p.Device)
 }
 
 // ptr returns a pointer to v (Kubernetes API fields want pointers).
@@ -1231,8 +1337,9 @@ var revHashRE = regexp.MustCompile(`^[a-f0-9]{10}$`)
 // successful pull it prunes sibling revision sub-paths not in
 // KeepStoreSubPaths (never when that list is empty).
 func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
-	// Pulling needs no GPU: always use the CPU image unless p.Image overrides.
-	image := DefaultImageCPU
+	// Pulling needs no GPU: always use the CPU image of the same runtime version
+	// unless p.Image overrides.
+	image := imageForVersion(p.RuntimeVersion, engine.DeviceCPU)
 	if p.Image != "" {
 		image = p.Image
 	}
