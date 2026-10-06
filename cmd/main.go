@@ -133,7 +133,7 @@ func validateHFEndpoint(raw string, allowInsecure bool) error {
 		// ok
 	case "http":
 		if !allowInsecure {
-			return fmt.Errorf("http:// requires --allow-insecure-registries")
+			return fmt.Errorf("http:// requires --allow-insecure-registries") // NOSONAR: error text for rejected http:// URLs, not a connection
 		}
 	default:
 		return fmt.Errorf("unsupported scheme %q (only https or http)", u.Scheme)
