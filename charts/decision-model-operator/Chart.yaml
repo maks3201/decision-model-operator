@@ -7,7 +7,8 @@ type: application
 version: 0.3.0
 appVersion: 0.3.0
 kubeVersion: '>=1.29.0-0'
-home: https://github.com/maks3201/decision-model-operator
+home: https://maks3201.github.io/decision-model-operator/
+icon: https://raw.githubusercontent.com/maks3201/decision-model-operator/main/config/manifests/icon.svg
 sources:
   - https://github.com/maks3201/decision-model-operator
 keywords:
@@ -36,11 +37,11 @@ annotations:
         - linux/arm64
   artifacthub.io/links: |
     - name: Documentation
-      url: https://github.com/maks3201/decision-model-operator/tree/main/docs
+      url: https://maks3201.github.io/decision-model-operator/
     - name: Quickstart
-      url: https://github.com/maks3201/decision-model-operator/blob/main/docs/quickstart.md
+      url: https://maks3201.github.io/decision-model-operator/quickstart/
     - name: API reference
-      url: https://github.com/maks3201/decision-model-operator/blob/main/docs/api-reference.md
+      url: https://maks3201.github.io/decision-model-operator/api-reference/
     - name: support
       url: https://github.com/maks3201/decision-model-operator/issues
   artifacthub.io/operator: 'true'
@@ -51,3 +52,17 @@ annotations:
       name: decisionmodels.decisionmodel.io
       displayName: Decision Model
       description: A pinned, prefetched, model-aware System-1 decision model served by Ollaya.
+  artifacthub.io/crdsExamples: |
+    - apiVersion: decisionmodel.io/v1alpha1
+      kind: DecisionModel
+      metadata:
+        name: support-router
+      spec:
+        engine: ollaya
+        model: laya:en
+        device: cpu
+        replicas: 1
+        resources:
+          requests:
+            cpu: "1"
+            memory: 3584Mi

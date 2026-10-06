@@ -2,7 +2,7 @@
 
 Kubernetes Operator for Ollaya-served System-1 decision models (DecisionModel CRD).
 
-**Homepage:** <https://github.com/maks3201/decision-model-operator>
+**Homepage:** <https://maks3201.github.io/decision-model-operator/>
 
 An open-source Kubernetes Operator for Ollaya-served System-1 decision models
 (Laya, Kev, JevK5, …). It pins a model to an immutable digest, prefetches the
