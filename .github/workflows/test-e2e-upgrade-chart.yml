@@ -80,4 +80,5 @@ jobs:
         env:
           # The released chart and operator image are public, so no token is needed.
           KIND_CLUSTER: dmo-chart-upgrade
-        run: ./hack/upgrade-chart-e2e.sh ${{ inputs.from }}
+          FROM_VERSION: ${{ inputs.from }}
+        run: ./hack/upgrade-chart-e2e.sh ${FROM_VERSION:+"$FROM_VERSION"}
