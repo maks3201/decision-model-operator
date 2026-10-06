@@ -129,6 +129,14 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # loads the operator image itself.
 KIND_CLUSTER ?= dmo
 
+# E2E_LABEL_FILTER passes a Ginkgo label filter to the e2e run. Empty (the
+# default) runs every spec. The per-PR workflow sets '!nightly' to skip the
+# heavier specs labelled "nightly" (which the nightly workflow runs in full).
+E2E_LABEL_FILTER ?=
+ifneq ($(strip $(E2E_LABEL_FILTER)),)
+GINKGO_LABEL_FILTER := -ginkgo.label-filter="$(E2E_LABEL_FILTER)"
+endif
+
 .PHONY: kind-up
 kind-up: ## Create the kind cluster '$(KIND_CLUSTER)' and load the Ollaya image (idempotent).
 	KIND_CLUSTER=$(KIND_CLUSTER) ./hack/kind-up.sh
@@ -139,7 +147,7 @@ kind-down: ## Delete the kind cluster '$(KIND_CLUSTER)' (idempotent).
 
 .PHONY: test-e2e
 test-e2e: kind-up manifests generate fmt vet ## Run the e2e tests on kind. Leaves the cluster DOWN.
-	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v -timeout 40m; \
+	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v $(GINKGO_LABEL_FILTER) -timeout 40m; \
 		status=$$?; \
 		$(MAKE) kind-down; \
 		exit $$status
