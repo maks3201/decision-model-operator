@@ -1,18 +1,32 @@
 # decision-model-operator — architecture
 
-Status: implemented in v0.1 (alpha). Module `github.com/maks3201/decision-model-operator`,
+Status: alpha (v0.3). Module `github.com/maks3201/decision-model-operator`,
 API group `decisionmodel.io/v1alpha1` (the domain is not registered; the group may change before v1).
 Engine contract: `internal/engine/engine.go`.
 
 ## 1. Goal
 
-A Kubernetes operator that runs open-source decision / System-1 models (Laya, Kev, JevK5, …)
-as first-class workloads and manages their **model lifecycle**: pin the version → prefetch
-weights → load → verify the model is actually loaded on the expected device → evaluate →
-switch traffic → roll back.
+Safe production rollout of decision models: a new model version is evaluated against a golden
+dataset (and against production) **before** it receives traffic; a regression is blocked or rolled
+back. Running the model server is a means, not the product.
 
-Non-goals: generic model serving (that is KServe), LLM text generation, multi-cluster,
-a custom scheduler, distributed inference.
+```text
+DecisionModel CRD
+       │
+       ▼
+Lifecycle / rollout controller   (internal/controller: state machine, revisions, status)
+       ├── Runtime adapter       (internal/engine: contract; internal/engine/ollaya: Ollaya)
+       ├── Evaluation engine     (internal/controller/evaluator.go, evaluate_flow.go; internal/eval/calibration)
+       └── Promotion / rollback  (internal/controller/promotion.go: Service switch, failed revisions)
+```
+
+The runtime adapter serves the model (workloads, health, what is loaded). The controller owns the
+lifecycle. The evaluation engine decides quality. Promotion decides whether a candidate becomes
+active. Only the adapter knows the runtime.
+
+Non-goals: generic model serving (KServe, KubeAI, Ollama operators), GPU scheduling, autoscaling
+(stay compatible with HPA/KEDA), a model registry, experiment tracking, LLM text generation,
+multi-cluster, distributed inference.
 
 ## 2. Facts the design is built on
 
