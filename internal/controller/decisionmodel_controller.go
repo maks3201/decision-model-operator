@@ -125,6 +125,7 @@ const (
 	reasonStoreLost               = "StoreLost"
 	reasonStorePrefetchFailed     = "StorePrefetchFailed"
 	reasonStoreTerminating        = "StoreTerminating"
+	reasonDownloadTokenInvalid    = "DownloadTokenInvalid"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a
@@ -389,22 +390,24 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	apiKey, err := r.apiKey(ctx, &dm)
 	if err != nil {
 		if errors.Is(err, errSecretNotAllowed) {
-			// The API-key Secret is missing the opt-in label (confused-deputy
-			// guard). This is NOT terminal: there is no Secret watch, so adding the
-			// label would otherwise never retrigger. Keep Ready=False/SecretNotAllowed
-			// and requeue at the regate interval so the fix is picked up within ~60s.
-			// setStatusCondition is idempotent (no LastTransitionTime churn when the
-			// status/reason are unchanged), so repeated requeues cause no churn.
-			setStatusCondition(&dm, metav1.Condition{
-				Type:    decisionmodelv1alpha1.ConditionReady,
-				Status:  metav1.ConditionFalse,
-				Reason:  reasonSecretNotAllowed,
-				Message: err.Error(),
-			})
-			r.setPhase(ctx, &dm, decisionmodelv1alpha1.PhaseDegraded)
-			return r.finish(ctx, &dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+			return r.degradeSecretNotAllowed(ctx, &dm, err)
 		}
 		return r.finish(ctx, &dm, ctrl.Result{}, err)
+	}
+
+	// Validate the optional download-token Secret before any prefetch Job (same
+	// confused-deputy guard as the API key; a cache field, so this runs on both
+	// the candidate and stable-store-recovery paths). The value is not read here;
+	// the engine injects it into the Job from the Secret ref.
+	if err := r.validateDownloadToken(ctx, &dm); err != nil {
+		switch {
+		case errors.Is(err, errSecretNotAllowed):
+			return r.degradeSecretNotAllowed(ctx, &dm, err)
+		case errors.Is(err, errDownloadTokenInvalid):
+			return r.degradeSecretReason(ctx, &dm, reasonDownloadTokenInvalid, err)
+		default:
+			return r.finish(ctx, &dm, ctrl.Result{}, err)
+		}
 	}
 
 	// a new decisionmodel.io/retry token clears a failed revision and
@@ -438,6 +441,31 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.finish(ctx, &dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
 	}
 	return r.reconcileCandidate(ctx, &dm, eng, params, candidate, digest, cacheDegraded, apiKey)
+}
+
+// degradeSecretNotAllowed sets Degraded + Ready=False/SecretNotAllowed and
+// requeues at the regate interval. Used for both the API-key and download-token
+// confused-deputy guard: there is no Secret watch, so adding the label must be
+// picked up by a requeue within ~60s.
+func (r *DecisionModelReconciler) degradeSecretNotAllowed(
+	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, err error,
+) (ctrl.Result, error) {
+	return r.degradeSecretReason(ctx, dm, reasonSecretNotAllowed, err)
+}
+
+// degradeSecretReason sets Degraded + Ready=False with the given reason and
+// requeues at the regate interval (no Secret watch, so a fix must be polled).
+func (r *DecisionModelReconciler) degradeSecretReason(
+	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, reason string, err error,
+) (ctrl.Result, error) {
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: err.Error(),
+	})
+	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseDegraded)
+	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 }
 
 // applyRetryToken handles the decisionmodel.io/retry annotation. A new token

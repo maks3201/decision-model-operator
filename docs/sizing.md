@@ -6,7 +6,10 @@ spikes [001](spikes/001-ollaya-container.md) and
 
 All figures are **CPU / F32**, measured under OrbStack on Apple Silicon. GPU
 (`device: cuda`) and F16 are **unverified** — no GPU on the test hosts. The
-Ollaya runtime image used is `ghcr.io/ollaya-dev/ollaya:0.7.3`.
+Ollaya runtime image used is `ghcr.io/ollaya-dev/ollaya:0.10.0` (the figures were
+measured on 0.7.3 and re-checked on 0.10.0 in
+[spike 006](spikes/006-ollaya-0.10.md); `laya:en` was 3139 MiB on 0.10.0, within
+the same request).
 
 ## Measured per model
 
@@ -15,7 +18,7 @@ loaded and pinned (`keep_alive:-1`), read from `/sys/fs/cgroup/memory.stat`
 inside the container — not `docker stats`, which also counts the page cache left
 by the pull and over-reports by ~0.8–1.7 GiB. Re-measured **2026-10-02**
 (ghcr.io/ollaya-dev/ollaya:0.7.3, OrbStack arm64, F32 / cpu confirmed via
-`/api/ps`).
+`/api/ps`); verified on 0.10.0 in spike 006 (sizing unchanged).
 
 | Model               | Family   | Download | Memory (`anon`, loaded) |
 |---------------------|----------|----------|-------------------------|
@@ -28,7 +31,7 @@ Reproduce (host with Docker; the image has no curl, so port-map and call from th
 host):
 
 ```sh
-docker run -d --name m -p 127.0.0.1:11435:11435 ghcr.io/ollaya-dev/ollaya:0.7.3 serve
+docker run -d --name m -p 127.0.0.1:11435:11435 ghcr.io/ollaya-dev/ollaya:0.10.0 serve
 docker exec m ollaya pull laya:en
 curl -sS -X POST localhost:11435/api/decide -d '{"model":"laya:en","keep_alive":-1}'
 curl -sS localhost:11435/api/ps                       # confirm device cpu, precision F32

@@ -59,6 +59,9 @@ spec:
             {{- with .Values.manager.ollayaRegistry }}
             - --ollaya-registry={{ . }}
             {{- end }}
+            {{- with .Values.manager.ollayaHFEndpoint }}
+            - --ollaya-hf-endpoint={{ . }}
+            {{- end }}
             {{- with .Values.watchNamespaces }}
             - --watch-namespaces={{ join "," . }}
             {{- end }}

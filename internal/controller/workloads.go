@@ -61,6 +61,9 @@ func (r *DecisionModelReconciler) paramsFor(
 	if dm.Spec.Auth != nil {
 		p.APIKey = dm.Spec.Auth.APIKeySecretRef
 	}
+	if dm.Spec.Cache != nil {
+		p.DownloadToken = dm.Spec.Cache.DownloadTokenSecretRef
+	}
 	return p
 }
 
@@ -87,6 +90,9 @@ func (r *DecisionModelReconciler) paramsForRevision(
 	}
 	if dm.Spec.Auth != nil {
 		p.APIKey = dm.Spec.Auth.APIKeySecretRef
+	}
+	if dm.Spec.Cache != nil {
+		p.DownloadToken = dm.Spec.Cache.DownloadTokenSecretRef
 	}
 	return p
 }

@@ -63,6 +63,9 @@ const (
 	// LabelAPIKey must be set to "true" on a Secret before the operator will read
 	// it (engine API key or eval dataset), guarding against confused-deputy use.
 	LabelAPIKey = "decisionmodel.io/api-key"
+	// LabelDownloadToken must be set to "true" on a Secret before the operator
+	// will read it as a download credential (e.g. Hugging Face token).
+	LabelDownloadToken = "decisionmodel.io/download-token"
 )
 
 // MaxNameLength is the longest metadata.name a DecisionModel may have. The

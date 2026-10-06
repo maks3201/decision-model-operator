@@ -66,6 +66,10 @@ type Params struct {
 	KeepStoreSubPaths []string
 	// APIKey, if set, is injected into the runtime and must be used by clients.
 	APIKey *corev1.SecretKeySelector
+	// DownloadToken, if set, is a credential for weight downloads (e.g. a Hugging
+	// Face token for private or gated repositories, or a mirror). It is injected
+	// into the prefetch Job only, never into serving Pods.
+	DownloadToken *corev1.SecretKeySelector
 	// Resources for the serving container. The engine adds nvidia.com/gpu for CUDA
 	// if absent.
 	Resources corev1.ResourceRequirements

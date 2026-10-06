@@ -10,8 +10,10 @@ laptop-scale cluster.
 - `kubectl` pointed at that cluster.
 - A default StorageClass that supports `ReadWriteOnce` (kind ships one). For
   `replicas > 1` across nodes you need `ReadWriteMany` — see [Scaling](#scaling).
-- Egress from the cluster to `https://ollaya.dev` (the model registry) so the
-  prefetch Job can pull weights.
+- Egress from the prefetch Job to `https://ollaya.dev` (the model registry:
+  manifests) and to `https://huggingface.co` plus the Hugging Face CDN it
+  redirects to (`*.hf.co`: the weights). Air-gapped clusters can mirror both, see
+  [Supported models](#supported-models).
 
 ## Install the operator
 
@@ -335,6 +337,7 @@ args, or Helm `manager.*` values):
 | `--allow-image-override` | `false` | Permit `spec.image` to override the engine's default image. |
 | `--max-concurrent-reconciles` | `4` | Max DecisionModels reconciled concurrently. |
 | `--ollaya-registry` | (empty) | Default registry base URL for host-less model names; empty = `OLLAYA_REGISTRY` env, else `https://ollaya.dev`. |
+| `--ollaya-hf-endpoint` | (empty) | Base URL for model-weight downloads (a Hugging Face mirror or enterprise endpoint; the registry still serves manifests). Empty = `OLLAYA_HF_ENDPOINT` env, else Hugging Face. Needs the 0.10.0+ runtime. |
 
 The security defaults are deliberately strict: only `ollaya.dev`, no `http://`,
 and no image override unless you opt in.
@@ -428,6 +431,52 @@ of model names. Reference a model by `name:tag`:
   `--allowed-registries` (Helm `manager.allowedRegistries`, default `ollaya.dev`)
   as an SSRF guard; add your mirror there. `http://` registries need
   `--allow-insecure-registries` (dev only).
+
+- **Weight-download mirror (Hugging Face endpoint):** the prefetch Job contacts
+  **two** distinct hosts: the **model registry** (default `ollaya.dev`, set via
+  `--ollaya-registry`) for manifests and blob digests, and the **weight host**
+  (default Hugging Face) for the model-weight blobs themselves. In an air-gapped
+  cluster you may need mirrors for both. Set the weight-download mirror with
+  `--ollaya-hf-endpoint` (Helm `manager.ollayaHFEndpoint`); the runtime reads it
+  as `OLLAYA_HF_ENDPOINT` (requires runtime v0.10.0+; older runtimes ignore it
+  harmlessly). Serving Pods never receive this variable — they mount the store
+  read-only and never download. When both mirrors are behind a corporate proxy,
+  the proxy env already covers both: the controller copies
+  `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` to the prefetch container, so any request
+  from the CLI — registry or weight host — goes through the proxy.
+
+  ```sh
+  helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator --version <version> \
+    --namespace decision-model-operator-system --create-namespace \
+    --set manager.ollayaRegistry=https://registry.internal \
+    --set manager.ollayaHFEndpoint=https://hf-mirror.internal \
+    --set 'manager.allowedRegistries=registry.internal'
+  ```
+
+- **Download token (private / gated models):** if the weight host (Hugging Face
+  or the mirror) requires authentication, create a Secret with the token and
+  reference it from the DecisionModel:
+
+  ```yaml
+  spec:
+    cache:
+      downloadTokenSecretRef:
+        name: my-hf-token
+        key: token
+  ```
+
+  The Secret **must** carry the label `decisionmodel.io/download-token: "true"`,
+  or the operator refuses to read it (phase `Degraded`, reason
+  `SecretNotAllowed`):
+
+  ```sh
+  kubectl create secret generic my-hf-token --from-literal=token=hf_...
+  kubectl label secret my-hf-token decisionmodel.io/download-token=true
+  ```
+
+  The token is injected into the prefetch Job as `OLLAYA_HF_TOKEN` and sent
+  only to the weight-download endpoint, never to the model registry and never
+  to serving Pods.
 
 See [sizing.md](sizing.md) for measured per-model `resources` and PVC sizes.
 

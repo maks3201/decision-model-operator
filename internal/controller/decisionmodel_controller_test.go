@@ -154,10 +154,24 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 				Containers: []corev1.Container{{
 					Name:  "prefetch",
 					Image: img,
+					Env:   fakeJobEnv(p),
 				}},
 			},
 		},
 	}
+}
+
+// fakeJobEnv mirrors the real engine's download-token injection so envtests can
+// assert Job env content without using the real engine.
+func fakeJobEnv(p engine.Params) []corev1.EnvVar {
+	if p.DownloadToken == nil {
+		return nil
+	}
+	ref := p.DownloadToken.DeepCopy()
+	return []corev1.EnvVar{{
+		Name:      "OLLAYA_HF_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: ref},
+	}}
 }
 
 func (f *fakeEngine) ServicePort() int32 { return fakeServingPort }

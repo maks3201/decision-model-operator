@@ -7,7 +7,7 @@ on:
     inputs:
       ollaya_cuda_image:
         description: "Ollaya CUDA runtime image to load into kind"
-        default: "ghcr.io/ollaya-dev/ollaya:0.7.3-cuda"
+        default: "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda"
         required: false
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 60
     env:
       # C's e2e switch: run the DecisionModel with device: cuda and assert the
-      # cuda-specific status/limits. The operator picks the :0.7.3-cuda image
+      # cuda-specific status/limits. The operator picks the :0.10.0-cuda image
       # from device=cuda, so the CUDA runtime image must be loaded into kind.
       E2E_DEVICE: cuda
       OLLAYA_IMAGE: ${{ github.event.inputs.ollaya_cuda_image }}

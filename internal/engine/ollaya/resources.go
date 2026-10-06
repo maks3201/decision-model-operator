@@ -50,6 +50,7 @@ type modelDefaults struct {
 // page cache) after loading with keep_alive:-1, rounded UP to the next 512Mi.
 // Re-measured 2026-10-02 on ghcr.io/ollaya-dev/ollaya:0.7.3, CPU / F32, OrbStack
 // arm64, reading /sys/fs/cgroup/memory.stat `anon` inside the container;
+// spike 006 re-checked laya:en on 0.10.0 (3139 MiB, within the same request);
 // see docs/sizing.md for the commands):
 //
 //	model              anon (MiB)   request (round up 512Mi)

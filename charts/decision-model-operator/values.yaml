@@ -58,6 +58,8 @@ manager:
   maxConcurrentReconciles: 4
   # -- `--ollaya-registry`: default registry base URL for host-less model names. Empty = the operator default (`OLLAYA_REGISTRY` env, else `https://ollaya.dev`); not rendered when empty.
   ollayaRegistry: ""
+  # -- `--ollaya-hf-endpoint`: base URL for model-weight downloads (a Hugging Face mirror or enterprise endpoint; the model registry still serves manifests). Empty = the runtime default (`OLLAYA_HF_ENDPOINT` env, else Hugging Face); not rendered when empty. Needs the 0.10.0+ runtime; older runtimes ignore it.
+  ollayaHFEndpoint: ""
 
 # -- Namespaces to watch (`--watch-namespaces`). Empty = cluster-wide (manager ClusterRole/ClusterRoleBinding). When non-empty, the operator watches only these namespaces and the chart renders a namespaced Role+RoleBinding in each instead of the ClusterRole. The CRD stays cluster-scoped and must be installed by a cluster admin.
 watchNamespaces: []

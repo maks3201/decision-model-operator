@@ -79,6 +79,11 @@ type methodTimeouts struct {
 // Engine is the Ollaya implementation of engine.Engine.
 type Engine struct {
 	registryURL string
+	// hfEndpoint, when non-empty, is the base URL Ollaya downloads model weights
+	// from (Hugging Face or a mirror/enterprise endpoint). It is passed to the
+	// prefetch Job as OLLAYA_HF_ENDPOINT; it is distinct from registryURL, which
+	// serves manifests. Empty means the runtime default (huggingface.co).
+	hfEndpoint string
 	// httpClient talks to the model registry (Resolve). It honours the proxy
 	// environment (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) so pulls work in proxied
 	// clusters.
@@ -98,6 +103,20 @@ type Option func(*Engine)
 func WithRegistryURL(url string) Option {
 	return func(e *Engine) {
 		e.registryURL = strings.TrimRight(url, "/")
+	}
+}
+
+// WithHFEndpoint sets the base URL Ollaya downloads model weights from (a
+// Hugging Face mirror or an enterprise endpoint); empty leaves the runtime
+// default (huggingface.co). When set, PrefetchJobSpec adds
+// OLLAYA_HF_ENDPOINT=<url> to the prefetch Job; serving Pods never get it (they
+// do not download). Like WithRegistryURL this only stores the value (trimmed):
+// scheme policy (https:// unless insecure registries are allowed) is enforced by
+// the manager, consistent with how the registry URL is validated upstream, so
+// the engine does not raise here.
+func WithHFEndpoint(url string) Option {
+	return func(e *Engine) {
+		e.hfEndpoint = strings.TrimRight(url, "/")
 	}
 }
 
@@ -370,7 +389,7 @@ const defaultManifestHost = "ollaya.dev"
 // relative to OLLAYA_MODELS: manifests/<host>/<namespace>/<model>/<tag>. The
 // host directory is the registry authority with the scheme stripped and the
 // port separator ':' replaced by '_', exactly how the ollaya CLI lays out the
-// store (verified against ghcr.io/ollaya-dev/ollaya:0.7.3: a pull with
+// store (verified on 0.7.3 and 0.10.0: a pull with
 // OLLAYA_REGISTRY=http://mirror:8080 writes manifests/mirror_8080/...). A
 // host-less name uses defaultHost, which the engine derives from its configured
 // registry so the Job's digest verification reads the file `ollaya pull`
@@ -923,13 +942,13 @@ func setAuth(req *http.Request, apiKey string) {
 	}
 }
 
-// Exported runtime image defaults (decided in spike 001:
-// the ghcr tag is "0.7.3", no "v" prefix).
+// Exported runtime image defaults (the ghcr tag is "0.10.0", no "v" prefix;
+// drop-in compatible with the 0.7.3 facts in spike 001, re-verified in spike 006).
 const (
 	// DefaultImageCPU is the CPU serving/prefetch image.
-	DefaultImageCPU = "ghcr.io/ollaya-dev/ollaya:0.7.3"
-	// DefaultImageCUDA is the CUDA serving image.
-	DefaultImageCUDA = "ghcr.io/ollaya-dev/ollaya:0.7.3-cuda"
+	DefaultImageCPU = "ghcr.io/ollaya-dev/ollaya:0.10.0"
+	// DefaultImageCUDA is the CUDA serving image (still amd64-only).
+	DefaultImageCUDA = "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda"
 )
 
 const (
@@ -999,6 +1018,20 @@ func apiKeyEnv(p engine.Params) *corev1.EnvVar {
 	return &corev1.EnvVar{
 		Name:      "OLLAYA_API_KEY",
 		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: p.APIKey},
+	}
+}
+
+// downloadTokenEnv returns the OLLAYA_HF_TOKEN env var sourced from a Secret, or
+// nil. Used by the prefetch Job only; serving Pods never download weights.
+func downloadTokenEnv(p engine.Params) *corev1.EnvVar {
+	if p.DownloadToken == nil {
+		return nil
+	}
+	ref := p.DownloadToken.DeepCopy()
+	ref.Optional = ptr(false)
+	return &corev1.EnvVar{
+		Name:      "OLLAYA_HF_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: ref},
 	}
 }
 
@@ -1228,7 +1261,7 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	}
 
 	// Point `ollaya pull` at the same registry the resolver used. The Ollaya
-	// 0.7.3 CLI selects its registry for a bare (host-less) name from the
+	// 0.7.3 and 0.10.0 CLI selects its registry for a bare (host-less) name from the
 	// OLLAYA_REGISTRY env var, falling back to ollaya.dev; an explicit host in
 	// the name always overrides it (verified against the image; evidence in the
 	// the spike). The
@@ -1239,6 +1272,20 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	// registry is non-default so the default case renders byte-identically.
 	if !registryIsDefault(e.registryURL) {
 		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: e.registryURL})
+	}
+
+	// Hugging Face / weight mirror: the registry (OLLAYA_REGISTRY) serves manifests,
+	// but the weight blobs are fetched from a separate endpoint (Hugging Face, an
+	// HF mirror, or an enterprise endpoint). When configured, tell the CLI.
+	if e.hfEndpoint != "" {
+		env = append(env, corev1.EnvVar{Name: "OLLAYA_HF_ENDPOINT", Value: e.hfEndpoint})
+	}
+	// Download token: a credential for private/gated model weights on HF or a
+	// mirror. Injected from a Secret ref; never into serving Pods (they never
+	// download). The token is sent to the HF endpoint only, never to the model
+	// registry.
+	if dte := downloadTokenEnv(p); dte != nil {
+		env = append(env, *dte)
 	}
 
 	// Store-root pruning is fail-safe: enabled only when the caller gave a

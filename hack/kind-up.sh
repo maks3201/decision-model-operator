@@ -17,7 +17,7 @@
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-dmo}"
-OLLAYA_IMAGE="${OLLAYA_IMAGE:-ghcr.io/ollaya-dev/ollaya:0.7.3}"
+OLLAYA_IMAGE="${OLLAYA_IMAGE:-ghcr.io/ollaya-dev/ollaya:0.10.0}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 
 # Ensure Docker is reachable (OrbStack on this project). Do not auto-start it

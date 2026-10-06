@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -257,6 +258,214 @@ var _ = Describe("security guards", func() {
 		reconcileOnce(r, "e3b")
 		Expect(getDM("e3b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching),
 			"label fix picked up without a spec change; the rollout proceeds")
+	})
+
+	// a download-token Secret without the opt-in label → Degraded/SecretNotAllowed,
+	// no Job created.
+	It("DT1: download-token Secret without opt-in label → Degraded, no Job", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "hf-nolabel"},
+			Data:       map[string][]byte{"token": []byte("hf_xxx")},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		createDM("dt1", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Cache = &decisionmodelv1alpha1.CacheSpec{
+				DownloadTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "hf-nolabel"},
+					Key:                  "token",
+				},
+			}
+		})
+
+		res, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: "dt1"},
+		})
+		Expect(err).NotTo(HaveOccurred(), "SecretNotAllowed must not be a terminal error")
+		Expect(res.RequeueAfter).To(Equal(regateInterval))
+		Expect(getDM("dt1").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded))
+		Expect(readyReason("dt1")).To(Equal(reasonSecretNotAllowed))
+
+		// No prefetch Job was created.
+		rev := RevisionHash(getDM("dt1").Spec, defaultDigest, fakeImage)
+		job := &batchv1.Job{}
+		err = k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "dt1-prefetch-" + rev,
+		}, job)
+		Expect(err).To(HaveOccurred(), "no Job should exist")
+	})
+
+	// a download-token Secret with the label → Job has OLLAYA_HF_TOKEN env,
+	// serving Deployment has no such env.
+	It("DT2: labelled download-token Secret → Job gets OLLAYA_HF_TOKEN, Deployment does not", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "hf-good",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"},
+			},
+			Data: map[string][]byte{"token": []byte("hf_xxx")},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		createDM("dt2", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Cache = &decisionmodelv1alpha1.CacheSpec{
+				DownloadTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "hf-good"},
+					Key:                  "token",
+				},
+			}
+		})
+
+		// First reconcile: resolves digest, creates PVC + prefetch Job.
+		reconcileOnce(r, "dt2")
+		Expect(getDM("dt2").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching))
+		rev := RevisionHash(getDM("dt2").Spec, defaultDigest, fakeImage)
+
+		// Check the Job: must have OLLAYA_HF_TOKEN env var referencing the Secret.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "dt2-prefetch-" + rev,
+		}, job)).To(Succeed())
+		jobEnv := job.Spec.Template.Spec.Containers[0].Env
+		found := false
+		for _, e := range jobEnv {
+			if e.Name == "OLLAYA_HF_TOKEN" {
+				found = true
+				Expect(e.ValueFrom).NotTo(BeNil())
+				Expect(e.ValueFrom.SecretKeyRef.Name).To(Equal("hf-good"))
+				Expect(e.ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+			}
+		}
+		Expect(found).To(BeTrue(), "prefetch Job must have OLLAYA_HF_TOKEN env var")
+
+		// Complete the prefetch and advance to Starting.
+		markPrefetchComplete(ctx, namespace, "dt2", rev)
+		reconcileOnce(r, "dt2")
+
+		// The serving Deployment must NOT have OLLAYA_HF_TOKEN.
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "dt2-" + rev,
+		}, dep)).To(Succeed())
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			Expect(e.Name).NotTo(Equal("OLLAYA_HF_TOKEN"),
+				"serving Deployment must not contain OLLAYA_HF_TOKEN")
+		}
+	})
+
+	// changing the download-token ref does not create a new revision (it is a
+	// cache field, not a revision field).
+	It("DT3: changing downloadTokenSecretRef does not create a new revision", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		secret1 := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "hf-1",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"},
+			},
+			Data: map[string][]byte{"token": []byte("hf_aaa")},
+		}
+		secret2 := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "hf-2",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"},
+			},
+			Data: map[string][]byte{"token": []byte("hf_bbb")},
+		}
+		Expect(k8sClient.Create(ctx, secret1)).To(Succeed())
+		Expect(k8sClient.Create(ctx, secret2)).To(Succeed())
+		createDM("dt3", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Cache = &decisionmodelv1alpha1.CacheSpec{
+				DownloadTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "hf-1"},
+					Key:                  "token",
+				},
+			}
+		})
+
+		// First reconcile: Caching.
+		reconcileOnce(r, "dt3")
+		revBefore := RevisionHash(getDM("dt3").Spec, defaultDigest, fakeImage)
+		Expect(revBefore).NotTo(BeEmpty())
+
+		// Switch to a different Secret ref.
+		Expect(updateDM(ctx, namespace, "dt3", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Cache.DownloadTokenSecretRef.Name = "hf-2"
+		})).To(Succeed())
+
+		reconcileOnce(r, "dt3")
+		revAfter := RevisionHash(getDM("dt3").Spec, defaultDigest, fakeImage)
+		Expect(revAfter).To(Equal(revBefore), "download-token change must not produce a new revision hash")
+	})
+
+	// a labelled download-token Secret missing the referenced key →
+	// Degraded/DownloadTokenInvalid, no Job.
+	It("DT4: labelled download-token Secret missing the key → DownloadTokenInvalid, no Job", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "hf-nokey",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelDownloadToken: "true"},
+			},
+			Data: map[string][]byte{"other": []byte("x")}, // no "token" key
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		createDM("dt4", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Cache = &decisionmodelv1alpha1.CacheSpec{
+				DownloadTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "hf-nokey"},
+					Key:                  "token",
+				},
+			}
+		})
+
+		res, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: "dt4"},
+		})
+		Expect(err).NotTo(HaveOccurred(), "DownloadTokenInvalid must not be a terminal error")
+		Expect(res.RequeueAfter).To(Equal(regateInterval))
+		Expect(getDM("dt4").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded))
+		Expect(readyReason("dt4")).To(Equal(reasonDownloadTokenInvalid))
+
+		rev := RevisionHash(getDM("dt4").Spec, defaultDigest, fakeImage)
+		job := &batchv1.Job{}
+		err = k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "dt4-prefetch-" + rev,
+		}, job)
+		Expect(err).To(HaveOccurred(), "no Job should exist")
+	})
+
+	// a missing download-token Secret (optional not honoured) → the Secret Get
+	// error surfaces; no Job. The ref is required when set.
+	It("DT5: missing download-token Secret is required (optional ignored), no Job", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		createDM("dt5", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			optTrue := true
+			dm.Spec.Cache = &decisionmodelv1alpha1.CacheSpec{
+				DownloadTokenSecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "absent"},
+					Key:                  "token",
+					Optional:             &optTrue, // must be ignored: ref is required
+				},
+			}
+		})
+
+		// A missing Secret surfaces as an error (not silently skipped).
+		_, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: namespace, Name: "dt5"},
+		})
+		Expect(err).To(HaveOccurred(), "a missing download-token Secret must not be skipped via optional")
+
+		rev := RevisionHash(getDM("dt5").Spec, defaultDigest, fakeImage)
+		job := &batchv1.Job{}
+		gerr := k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: "dt5-prefetch-" + rev,
+		}, job)
+		Expect(gerr).To(HaveOccurred(), "no Job should exist")
 	})
 
 	// an invalid model name (with a valid tag per CRD) fails with InvalidModelName.
