@@ -18,7 +18,9 @@ loaded and pinned (`keep_alive:-1`), read from `/sys/fs/cgroup/memory.stat`
 inside the container — not `docker stats`, which also counts the page cache left
 by the pull and over-reports by ~0.8–1.7 GiB. Re-measured **2026-10-02**
 (ghcr.io/ollaya-dev/ollaya:0.7.3, OrbStack arm64, F32 / cpu confirmed via
-`/api/ps`); verified on 0.10.0 in spike 006 (sizing unchanged).
+`/api/ps`); verified on 0.10.0 in spike 006 (sizing unchanged). `jevk5:latest`
+(the first GGUF model) was measured on 0.10.0, CPU / Q8_0, in
+[spike 007](spikes/007-gguf-models.md).
 
 | Model               | Family   | Download | Memory (`anon`, loaded) |
 |---------------------|----------|----------|-------------------------|
@@ -26,6 +28,7 @@ by the pull and over-reports by ~0.8–1.7 GiB. Re-measured **2026-10-02**
 | `laya:multilingual` | laya     | ~683 MB  | ~1.85 GiB (1894 MiB)    |
 | `gliclass:latest`   | gliclass | ~1.77 GB | ~2.42 GiB (2474 MiB)    |
 | `nli:latest`        | nli      | ~884 MB  | ~3.62 GiB (3711 MiB)    |
+| `jevk5:latest`      | jevk5 (GGUF, Q8_0) | ~4.48 GB | ~4.85 GiB (4966 MiB) |
 
 Reproduce (host with Docker; the image has no curl, so port-map and call from the
 host):
@@ -62,12 +65,13 @@ that key with a limit either, the Ollaya engine fills the request from a built-i
 table. The table is keyed by the **exact** model `name:tag` on the default Ollaya
 registry and `library` namespace — only the tags actually measured get a default:
 
-| model (CPU / F32) | cpu request | memory request |
+| model (CPU) | cpu request | memory request |
 |-------------------|-------------|----------------|
 | `laya:en`           | 1 | 3584Mi (3.5Gi) |
 | `laya:multilingual` | 1 | 2048Mi (2Gi)   |
 | `gliclass:latest`   | 1 | 2560Mi (2.5Gi) |
 | `nli:latest`        | 1 | 4096Mi (4Gi)   |
+| `jevk5:latest`      | 1 | 5120Mi (5Gi)   |
 
 The memory request is the measured `anon` rounded **up** to the next 512Mi. The
 table lives in `internal/engine/ollaya/resources.go` with a source comment per
@@ -117,6 +121,13 @@ resources:
   limits:   { cpu: "2", memory: "5632Mi" }
 cache:
   size: 2Gi
+
+# jevk5:latest  (GGUF Q8_0, download ~4.48 GB, anon ~4.85 GiB)
+resources:
+  requests: { cpu: "1", memory: "5120Mi" }
+  limits:   { cpu: "2", memory: "7Gi" }
+cache:
+  size: 6Gi
 ```
 
 ## Disk during rollout

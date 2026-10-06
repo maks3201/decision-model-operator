@@ -58,6 +58,7 @@ type modelDefaults struct {
 //	laya:multilingual  1894         2048Mi
 //	nli:latest         3711         4096Mi
 //	gliclass:latest    2474         2560Mi
+//	jevk5:latest       4966         5120Mi   (first GGUF entry, Q8_0, measured on 0.10.0; spike 007)
 //
 // No memory limit, no CPU limit (the user sizes the limit).
 var cpuDefaults = map[string]modelDefaults{
@@ -65,6 +66,7 @@ var cpuDefaults = map[string]modelDefaults{
 	"laya:multilingual": {cpuRequest: "1", memRequest: "2048Mi"}, // anon ~1.85 GiB
 	"nli:latest":        {cpuRequest: "1", memRequest: "4096Mi"}, // anon ~3.62 GiB
 	"gliclass:latest":   {cpuRequest: "1", memRequest: "2560Mi"}, // anon ~2.42 GiB
+	"jevk5:latest":      {cpuRequest: "1", memRequest: "5120Mi"}, // anon ~4.85 GiB (GGUF Q8_0, 0.10.0)
 }
 
 // cudaDefaults is keyed by the same measured "model:tag". Host RAM on CUDA is
@@ -76,6 +78,7 @@ var cudaDefaults = map[string]modelDefaults{
 	"laya:multilingual": {cpuRequest: "1"},
 	"nli:latest":        {cpuRequest: "1"},
 	"gliclass:latest":   {cpuRequest: "1"},
+	"jevk5:latest":      {cpuRequest: "1"},
 }
 
 // defaultsFor returns the modelDefaults for a model name on a device, and
