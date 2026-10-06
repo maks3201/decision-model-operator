@@ -223,6 +223,7 @@ _Appears in:_
 | `maxCases` _integer_ | MaxCases caps how many dataset cases are used (first N). | 500 | Maximum: 5000 <br />Minimum: 1 <br />Optional: \{\} <br /> |
 | `maxECE` _string_ | MaxECE is the maximum tolerated Expected Calibration Error (decimal string<br />in [0,1], e.g. "0.10"). Empty disables the absolute ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
 | `maxECEIncrease` _string_ | MaxECEIncrease is the maximum tolerated ECE increase vs the stable baseline<br />(decimal string). Only enforced when a stable revision exists to provide a<br />baseline; empty disables the relative ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
+| `scoreTolerance` _string_ | ScoreTolerance is the correctness band for "score" questions (decimal<br />string): a predicted expected-value level counts as correct when it is<br />within this many levels of the golden integer level. A case may override it<br />per question via a "tolerance" map. Empty means the default (0.5, "rounds to<br />the expected level"). |  | Pattern: `^[0-9]+(\.[0-9]+)?$` <br />Optional: \{\} <br /> |
 
 
 #### EvaluationStatus
@@ -253,6 +254,8 @@ _Appears in:_
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `datasetDigest` _string_ | DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was<br />produced from. Together with policyHash it is the result's identity: if the<br />dataset content changes (same ConfigMap/Secret, edited in place) a parked<br />candidate is re-evaluated rather than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `approvalId` _string_ | ApprovalID is the identity a manual approval must name: the first 12 hex of<br />sha256(revisionHash + policyHash + datasetDigest). Set the annotation<br />decisionmodel.io/promote to this value to promote. It changes whenever the<br />revision, policy or dataset changes, so an approval cannot carry over a<br />re-evaluation. |  | Optional: \{\} <br /> |
 | `completedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | CompletedAt is when the evaluation finished. |  | Optional: \{\} <br /> |
 
 
