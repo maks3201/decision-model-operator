@@ -74,9 +74,10 @@ const (
 
 // Rollout result label values.
 const (
-	rolloutPromoted   = "promoted"
-	rolloutRolledBack = "rolled_back"
-	rolloutFailed     = "failed"
+	rolloutPromoted                 = "promoted"
+	rolloutRolledBack               = "rolled_back"
+	rolloutFailed                   = "failed"
+	rolloutRolledBackAfterPromotion = "rolled_back_after_promotion"
 )
 
 // Probe result label values.

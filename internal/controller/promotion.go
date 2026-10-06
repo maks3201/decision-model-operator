@@ -300,7 +300,7 @@ func (r *DecisionModelReconciler) promote(
 		dm.Status.LastPromotionTime = &now
 		if prevStable != nil {
 			dm.Status.PreviousRevision = &decisionmodelv1alpha1.PreviousRevisionStatus{
-				Hash: prevStable.Hash, PromotedAt: &now,
+				Hash: prevStable.Hash, PromotedAt: &now, Revision: prevStable.DeepCopy(),
 			}
 		}
 		setStatusCondition(dm, metav1.Condition{

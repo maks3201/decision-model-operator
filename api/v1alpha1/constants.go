@@ -52,6 +52,11 @@ const (
 	// is available than the version this DecisionModel is pinned to (set
 	// spec.runtimeVersion to adopt it). Informational: it never blocks serving.
 	ConditionRuntimeUpdateAvailable = "RuntimeUpdateAvailable"
+	// ConditionStabilizing is present during the post-promotion stabilization
+	// window: True while the new stable is being watched, then removed once the
+	// window passes healthy (the previous revision is collected). It flips to
+	// False (PostPromotionUnhealthy) just before an automatic rollback.
+	ConditionStabilizing = "Stabilizing"
 )
 
 // ModelReadyGate is the Pod readiness gate condition type set to True only when

@@ -396,6 +396,10 @@ var _ = Describe("DecisionModel Controller", func() {
 				Model:    model,
 				Device:   "cpu",
 				Replicas: int32Ptr(1),
+				// These scenarios assert the old revision is collected shortly after
+				// promotion; disable the stabilization window so the 5m default does
+				// not keep it alive. (The window has its own dedicated specs.)
+				Rollout: zeroStabilizationRollout(),
 			},
 		}
 		if mutate != nil {

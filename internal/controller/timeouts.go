@@ -58,6 +58,29 @@ func evaluatingTimeout(dm *decisionmodelv1alpha1.DecisionModel) time.Duration {
 	return evalDeadline
 }
 
+// stabilizationFor returns the post-promotion stabilization window: the previous
+// revision is kept running (out of the Service) for this long so traffic can be
+// switched back if the new stable turns out unhealthy. spec.rollout.stabilization
+// overrides it; unset means the default (stabilizationWindow); an explicit "0"
+// disables the window (the previous revision is removed after the endpoint-gap
+// grace, as before).
+func stabilizationFor(dm *decisionmodelv1alpha1.DecisionModel) time.Duration {
+	if dm.Spec.Rollout != nil && dm.Spec.Rollout.Stabilization != nil {
+		return dm.Spec.Rollout.Stabilization.Duration
+	}
+	return stabilizationWindow
+}
+
+// previousRevisionKeep is how long the previous revision's workloads are kept
+// after a promotion: the stabilization window, but never shorter than the
+// endpoint-gap grace (so disabling stabilization still avoids an endpoint gap).
+func previousRevisionKeep(dm *decisionmodelv1alpha1.DecisionModel) time.Duration {
+	if w := stabilizationFor(dm); w > promoteGrace {
+		return w
+	}
+	return promoteGrace
+}
+
 // warmupTimeoutKey carries the background-warmup bound from the controller to
 // the prober through the context, so the Prober interface stays unchanged.
 type warmupTimeoutKey struct{}

@@ -276,6 +276,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `hash` _string_ | Hash is the demoted revision's hash. |  |  |
 | `promotedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | PromotedAt is when the newer revision was promoted (this one demoted). |  | Optional: \{\} <br /> |
+| `revision` _[RevisionStatus](#revisionstatus)_ | Revision is the demoted revision's full recorded identity (engine, model,<br />digest, device, image, resources, placement). It is retained so that, if the<br />new stable turns out unhealthy during the stabilization window, the operator<br />can promote this revision back to stable and render its workloads from its<br />own recorded state rather than from a live Deployment that may already be<br />gone. |  | Optional: \{\} <br /> |
 
 
 #### PromotionPolicy
@@ -328,6 +329,7 @@ describe a different, pending candidate).
 
 _Appears in:_
 - [DecisionModelStatus](#decisionmodelstatus)
+- [PreviousRevisionStatus](#previousrevisionstatus)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
@@ -360,6 +362,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `evaluation` _[EvaluationSpec](#evaluationspec)_ | Evaluation gates promotion on a golden-dataset accuracy check. When unset,<br />a candidate is promoted as soon as all its Pods are model-ready. |  | Optional: \{\} <br /> |
+| `stabilization` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#duration-v1-meta)_ | Stabilization keeps the previous revision's Deployment running (scaled to<br />its replicas, out of the Service) for this long after a promotion, so the<br />operator can switch traffic back instantly if the new stable turns out<br />unhealthy during the window. Default 5m when unset; "0" disables it (the<br />previous revision is removed after a short endpoint-gap grace, as before).<br />Must be between 1m and 24h when set to a non-zero value. |  | MaxLength: 32 <br />Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|ms\|s\|m\|h))+$` <br />Type: string <br />Optional: \{\} <br /> |
 | `promotion` _[PromotionPolicy](#promotionpolicy)_ | Promotion selects how a candidate that passed ModelReady is promoted:<br />  - Automatic: promote as soon as the candidate is model-ready (and, when<br />    evaluation is configured, has passed the gate).<br />  - EvaluationGated: like Automatic but requires rollout.evaluation to be<br />    set (rejected by CEL otherwise); the gate decides promotion.<br />  - Manual: hold the candidate in AwaitingPromotion until a human sets the<br />    annotation decisionmodel.io/promote to the candidate's revision hash<br />    (evaluation still runs when configured).<br />When unset the effective policy is EvaluationGated if rollout.evaluation is<br />set, else Automatic. The deprecated manualPromotion:true is an alias for<br />Manual; setting both promotion and manualPromotion:true to disagreeing<br />values is rejected by CEL. |  | Enum: [Automatic EvaluationGated Manual] <br />Optional: \{\} <br /> |
 | `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to the<br />candidate's revision hash. The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted.<br />Deprecated: use promotion: Manual. manualPromotion:true keeps working as an<br />alias for promotion: Manual. | false | Optional: \{\} <br /> |
 | `timeouts` _[RolloutTimeouts](#rollouttimeouts)_ | Timeouts overrides the progress timeouts of a rollout. Unset fields keep<br />the built-in defaults. Large models (tens of GB) need more than the<br />defaults on a cold node. Not part of the revision hash; a change applies to<br />the phase timeouts immediately, but a prefetch Job that already exists keeps<br />the deadline it was created with. |  | Optional: \{\} <br /> |

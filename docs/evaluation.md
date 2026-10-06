@@ -254,9 +254,12 @@ the API (safe to alert on):
 | `Evaluated` | `DatasetChanged` | the dataset content changed while awaiting promotion; re-evaluating |
 | `Promoted` | `PromotionPending` | a `Manual`-policy candidate passed its gate and waits for approval |
 | `Promoted` | `Promoted` | the candidate was promoted and is serving |
+| `Stabilizing` | `Stabilizing` | the new stable is in its post-promotion stabilization window (previous revision kept) |
+| `Stabilizing` | `PostPromotionUnhealthy` | the new stable looks unhealthy in the window (debouncing before rollback) |
 | `Ready` | `Ready` | the stable revision is serving and healthy |
-| `Ready` | `CandidateRejected` | a candidate was rejected; the stable revision keeps serving |
+| `Ready` | `CandidateRejected` | a candidate was rejected (or rolled back after promotion); the surviving revision keeps serving |
 | `Degraded` | `EvaluationFailed` | the candidate failed a gate (message names it) |
+| `Degraded` | `PostPromotionUnhealthy` | the new stable was rolled back to the previous revision during the stabilization window |
 | `Degraded` | `CacheNotShareable` / `StoreTerminating` / `StoreLost` / `StorePrefetchFailed` | a store issue that does not stop serving |
 | `Degraded` | `SecretNotAllowed` / `DownloadTokenInvalid` | a referenced Secret is not usable |
 
@@ -372,6 +375,52 @@ Caveats:
 How Argo CD and Flux surface `AwaitingPromotion` is described in
 [gitops.md](gitops.md) (Argo CD reports it `Suspended`; a Flux `healthCheckExprs`
 check can treat it as in-progress).
+
+## Post-promotion stabilization
+
+A promotion is not the end of the risk: a new stable can look model-ready at the
+instant of promotion and fall over a minute later. `spec.rollout.stabilization`
+(a Go duration, default `5m`, `0` disables it) keeps the **previous** revision's
+Deployment running — scaled to its replicas but out of the Service — for a window
+after promotion, so the operator can switch traffic back instantly if the new
+stable turns out unhealthy.
+
+```yaml
+spec:
+  rollout:
+    stabilization: "5m"   # keep the previous revision this long after promotion (0 = off)
+```
+
+During the window (condition `Stabilizing=True`), the operator rolls back to the
+previous revision if the new stable:
+
+- drops below the model-ready **quorum** `max(1, ceil(replicas/2))` for longer than
+  a short debounce (30s) — a brief dip during a rolling restart does not trip it; or
+- reports a readiness-gate **`DigestMismatch` / `DeviceMismatch`** (wrong model
+  loaded), or a container in **`CrashLoopBackOff`** — these roll back immediately,
+  no debounce.
+
+On rollback the Service switches back to the previous revision (its Pods are still
+running, so there is no cold start), the new revision is recorded in
+`status.failedRevision` with reason `PostPromotionUnhealthy`, the phase is
+`RolledBack`, a Warning Event `RolledBackAfterPromotion` is emitted, and
+`decisionmodel_rollouts_total{result="rolled_back_after_promotion"}` is
+incremented. The rolled-back revision is not retried automatically (a spec change
+or the `decisionmodel.io/retry` annotation is required).
+
+If the window passes healthy, the operator emits `Stabilized`, drops the
+`Stabilizing` condition, and garbage-collects the previous revision as usual.
+Notes:
+
+- The check runs on each reconcile from persisted status
+  (`status.previousRevision`) and live cluster state, so it is correct across an
+  operator restart and uses no in-memory timers.
+- A spec change during the window starts a new candidate as usual and **ends** the
+  window (the previous revision is then collected normally).
+- `stabilization: 0` restores the previous behaviour: the previous revision is
+  removed after a short endpoint-gap grace, with no rollback window.
+- The previous revision's store PVC lives through the window (so the footprint is
+  ~2× the model during it), the same as during a rollout.
 
 ## Rollout timeouts
 
