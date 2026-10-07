@@ -121,7 +121,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	scoreTol := scoreTolerance(evalSpec)
 
 	// Ensure the candidate evaluation is running / read its result.
-	candKey := evalKey{dm.Namespace, dm.Name, candidate.Hash, dsHash, maxCases}
+	candKey := evalKey{dm.Namespace, dm.Name, candidate.Hash, dsHash, maxCases, scoreTol}
 	// resuming (computed above, before entering Evaluating) is true when a prior
 	// reconcile already advanced *this* candidate into Evaluating and persisted
 	// it — i.e. the manager restarted (or leadership moved) mid-evaluation and the
@@ -397,7 +397,7 @@ func (r *DecisionModelReconciler) baselineResult(
 		return nil, true, false, nil
 	}
 	store := r.evalStoreOrInit()
-	key := evalKey{dm.Namespace, dm.Name, stable.Hash, dsHash, maxCases}
+	key := evalKey{dm.Namespace, dm.Name, stable.Hash, dsHash, maxCases, scoreTol}
 	if e, ok := store.get(key); ok {
 		if e.result.done {
 			if e.result.transport > 0 {
@@ -530,10 +530,10 @@ func evaluationSpec(dm *decisionmodelv1alpha1.DecisionModel) *decisionmodelv1alp
 }
 
 // evalPolicyHash returns a stable hash (16 hex) of the effective evaluation
-// policy: the gate thresholds, the datasetRef identity, and maxCases.
-// A change to any of these means a parked candidate's recorded result is stale
-// and the candidate must be re-evaluated rather than promoted on the old result.
-// Returns "" when there is no evaluation spec.
+// policy: the gate thresholds, the datasetRef identity, maxCases, and the
+// effective score tolerance. A change to any of these means a parked candidate's
+// recorded result is stale and the candidate must be re-evaluated rather than
+// promoted on the old result. Returns "" when there is no evaluation spec.
 func evalPolicyHash(evalSpec *decisionmodelv1alpha1.EvaluationSpec) string {
 	if evalSpec == nil {
 		return ""
@@ -545,9 +545,14 @@ func evalPolicyHash(evalSpec *decisionmodelv1alpha1.EvaluationSpec) string {
 	case evalSpec.DatasetRef.SecretRef != nil:
 		ref = "secret/" + evalSpec.DatasetRef.SecretRef.Name + "/" + evalSpec.DatasetRef.SecretRef.Key
 	}
+	// The tolerance decides which score answers count as correct, so it is part
+	// of the verdict's identity. Hash the EFFECTIVE value in canonical form
+	// (default applied, number formatting normalised) so "0.5", "0.50" and unset
+	// all hash the same, and only a real change (e.g. "1") shifts the hash.
+	tol := strconv.FormatFloat(scoreTolerance(evalSpec), 'f', -1, 64)
 	payload := strings.Join([]string{
 		evalSpec.MinAccuracy, evalSpec.MaxAccuracyDrop, evalSpec.MaxECE, evalSpec.MaxECEIncrease,
-		ref, strconv.Itoa(int(evalSpec.MaxCases)),
+		ref, strconv.Itoa(int(evalSpec.MaxCases)), tol,
 	}, "\x1f")
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])[:16]

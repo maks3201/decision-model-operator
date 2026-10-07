@@ -510,6 +510,100 @@ var _ = Describe("manual promotion", func() {
 		Expect(getDM(name).Annotations).NotTo(HaveKey(promoteKey))
 	})
 
+	// Changing ONLY scoreTolerance while a candidate is parked for approval must
+	// re-evaluate under the new tolerance (it is part of the verdict): the policy
+	// hash and approvalId rotate, the old approvalId no longer promotes, and the
+	// re-scored accuracy actually changes (not just the hash). A score answer of
+	// 2.6 against expected level 2 is correct within tolerance 0.75 but wrong at
+	// the default 0.5.
+	It("re-evaluates on a scoreTolerance change and the re-scored verdict differs", func() {
+		name := "mp-scoretol"
+		fake := newFakeEngine()
+		score := 2.6
+		eng := &deciderFakeEngine{fakeEngine: fake, score: &score}
+		// A score dataset: one case expecting integer level 2.
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-score"},
+			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"score"}},"expected":{"q1":2}}` + "\n"},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		clock = time.Now()
+		m := &mp{
+			name: name,
+			r: &DecisionModelReconciler{
+				Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+				Engines:  map[string]engine.Engine{"ollaya": eng},
+				Prober:   &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}},
+				Recorder: events.NewFakeRecorder(256),
+				Now:      func() time.Time { return clock },
+			},
+			setDigest: func(d string) { fake.mu.Lock(); fake.digest = d; fake.mu.Unlock() },
+		}
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{
+					Promotion: decisionmodelv1alpha1.PromotionManual,
+					Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+						DatasetRef:     decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden-score", Key: "cases.jsonl"}},
+						MinAccuracy:    "0.90",
+						ScoreTolerance: "0.75", // 2.6 vs 2 is correct here
+					},
+				},
+			},
+		})).To(Succeed())
+		// Drive the first revision to Ready (never held).
+		reconcile1(m)
+		m.rev1 = RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		markJobComplete(name, m.rev1)
+		reconcile1(m)
+		createGatedPod(name, m.rev1)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return reconcile1(m) }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseReady))
+
+		// Candidate: passes at tolerance 0.75 and parks for approval (accuracy 1).
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		oldEv := getDM(name).Status.Evaluation
+		Expect(oldEv).NotTo(BeNil())
+		Expect(oldEv.Accuracy).To(Equal("1.0000"), "2.6 within tolerance 0.75 of level 2 is correct")
+		oldID := oldEv.ApprovalID
+		Expect(oldID).NotTo(BeEmpty())
+		oldPolicy := oldEv.PolicyHash
+
+		// Tighten the tolerance to the default AND approve on the old id in one
+		// edit: the operator must re-evaluate under the new tolerance, not promote.
+		Expect(updateDM(ctx, namespace, name, func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Rollout.Evaluation.ScoreTolerance = "0.5"
+			if dm.Annotations == nil {
+				dm.Annotations = map[string]string{}
+			}
+			dm.Annotations[promoteKey] = oldID
+		})).To(Succeed())
+
+		ph := reconcile1(m)
+		Expect(ph).NotTo(Equal(decisionmodelv1alpha1.PhaseReady), "the stale approval must not promote under the new tolerance")
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(m.rev1), "stable unchanged")
+
+		// The policy hash rotated and the re-scored verdict actually changed: at
+		// tolerance 0.5, 2.6 vs 2 is wrong, so accuracy drops to 0 and the gate
+		// fails -> the candidate is rejected (not promoted on the old result).
+		Eventually(func() string {
+			reconcile1(m)
+			ev := getDM(name).Status.Evaluation
+			if ev == nil {
+				return ""
+			}
+			return ev.PolicyHash
+		}, "10s", "50ms").ShouldNot(Equal(oldPolicy))
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return reconcile1(m) }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack), "re-scored accuracy fails the gate under the stricter tolerance")
+		Expect(getDM(name).Status.Evaluation.Accuracy).To(Equal("0.0000"), "re-scored accuracy changed with the tolerance")
+		Expect(getDM(name).Status.FailedRevision).NotTo(BeNil())
+		Expect(getDM(name).Status.FailedRevision.Hash).To(Equal(cand))
+	})
+
 	// Editing the dataset content while parked re-evaluates (DatasetChanged) and
 	// rotates the approvalID; an approval for the OLD identity does not promote.
 	It("re-evaluates on a dataset content change and rotates the approvalID", func() {

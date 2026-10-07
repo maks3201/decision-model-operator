@@ -178,7 +178,7 @@ var _ = Describe("eval blip does not promote", func() {
 var _ = Describe("evalStore snapshot", func() {
 	It("returns a copy from get, not the shared pointer", func() {
 		s := newEvalStore()
-		k := evalKey{"ns", "n", "r", "d", 0}
+		k := evalKey{"ns", "n", "r", "d", 0, 0.5} // tolerance value irrelevant here
 		s.start(k, func() {})
 		s.finish(k, evalResult{done: true, accuracy: 0.5})
 		snap, ok := s.get(k)

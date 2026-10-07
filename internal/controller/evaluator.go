@@ -265,8 +265,9 @@ type evalKey struct {
 	namespace string
 	name      string
 	revision  string
-	dataset   string // dataset content hash
-	maxCases  int    // cases cap (a change re-runs)
+	dataset   string  // dataset content hash
+	maxCases  int     // cases cap (a change re-runs)
+	tolerance float64 // effective score tolerance (a change re-scores -> re-runs)
 }
 
 // evalStore holds evaluation results keyed by evalKey, guarded by a mutex.
