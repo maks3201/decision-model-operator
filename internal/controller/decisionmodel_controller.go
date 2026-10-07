@@ -516,30 +516,37 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	digest string,
 	apiKey, rev string,
 ) (ctrl.Result, error) {
-	// A new candidate supersedes an in-flight post-promotion stabilization window:
-	// end it so a fresh rollout is not entangled with the last one's rollback
-	// target. Only when the window is actually enabled (>0) — with stabilization
-	// disabled the previous revision keeps its short endpoint-gap grace, collected
-	// by GC as before.
-	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
-		dm.Status.PreviousRevision = nil
-		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
-	}
-	// Fleet rollout budget FIRST — before any allocation. A brand-new candidate
-	// waits in Pending/RolloutQueued when the watched scope is already at
+	// Fleet rollout budget FIRST — before any allocation AND before ending the
+	// current stabilization window. A brand-new candidate waits in
+	// Pending/RolloutQueued when the watched scope is already at
 	// --max-concurrent-rollouts; a queued candidate must not create its
-	// per-revision PVC (provision a volume) while it waits. An already-admitted
-	// candidate bypasses the gate so an in-flight rollout cannot deadlock.
+	// per-revision PVC (provision a volume) while it waits, and must keep its
+	// previous revision + Stabilizing condition so the current window still
+	// protects it (an unhealthy stable can still roll back while queued — the
+	// stable path owns that, reached on the next reconcile for a DM with a stable
+	// revision). An already-admitted candidate, or one reusing its own window's
+	// slot, bypasses the gate so an in-flight rollout cannot deadlock.
 	if queued, qres, qerr := r.gateRolloutBudget(ctx, dm, rev); qerr != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, qerr)
 	} else if queued {
 		return qres, nil
 	}
 
-	// Admitted: now create the candidate's per-revision store PVC and run the
-	// cache-sharing guard against it. It builds on this revision's store claim, so
-	// it waits while a previous claim of the same revision is still terminating;
-	// once that is NotFound the next reconcile creates a fresh one.
+	// Admitted: only now end any in-flight post-promotion stabilization window, so
+	// a fresh rollout is not entangled with the last one's rollback target. Only
+	// when the window is actually enabled (>0) — with stabilization disabled the
+	// previous revision keeps its short endpoint-gap grace, collected by GC as
+	// before. Clearing it before admission would drop the rollback protection of a
+	// DM that then sits queued for minutes.
+	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
+		dm.Status.PreviousRevision = nil
+		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
+	}
+
+	// Create the candidate's per-revision store PVC and run the cache-sharing
+	// guard against it. It builds on this revision's store claim, so it waits
+	// while a previous claim of the same revision is still terminating; once that
+	// is NotFound the next reconcile creates a fresh one.
 	pvc, err := r.ensurePVC(ctx, dm, rev)
 	storeTerminating := errors.Is(err, errStoreTerminating)
 	if err != nil && !storeTerminating {

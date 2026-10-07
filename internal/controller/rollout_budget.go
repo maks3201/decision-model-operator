@@ -49,6 +49,14 @@ func (r *DecisionModelReconciler) gateRolloutBudget(
 		r.releaseReservation(dm.Namespace, dm.Name)
 		return false, ctrl.Result{}, nil
 	}
+	// A DM already in its own active stabilization window holds a slot (its
+	// previous revision's Deployment is the one the budget bounds). A new spec on
+	// that DM must reuse that slot, not wait behind itself — otherwise it would
+	// deadlock when the budget is full of its own window. Admit it directly; the
+	// window is ended after admission in reconcileCandidatePath.
+	if r.inStabilizationWindow(dm) {
+		return false, ctrl.Result{}, nil
+	}
 	return r.rolloutBudgetBlocks(ctx, dm, rev)
 }
 
@@ -106,6 +114,13 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 			continue // dm handled separately below
 		}
 		if d.Status.CandidateRevision != nil {
+			active++
+			continue
+		}
+		// A DM still inside its post-promotion stabilization window keeps its
+		// previous revision's Deployment running — the second GPU/disk the budget
+		// bounds — so it counts as an active rollout until the window ends.
+		if r.inStabilizationWindow(d) {
 			active++
 			continue
 		}
