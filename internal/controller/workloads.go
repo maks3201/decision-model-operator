@@ -294,6 +294,7 @@ func (r *DecisionModelReconciler) ensureDeployment(
 	rev string,
 	frozen bool,
 	apiKeyChecksum string,
+	legacyChecksum string,
 	freezeTemplate bool,
 ) error {
 	labels := revisionLabels(dm, rev)
@@ -338,8 +339,17 @@ func (r *DecisionModelReconciler) ensureDeployment(
 			// First observation: keep whatever the live template has (empty for a
 			// legacy Deployment), only record below. No roll.
 			tmplChecksum = liveTmpl
+		case recorded == legacyChecksum && legacyChecksum != "":
+			// Format migration, not a rotation: the recorded value is the old
+			// sha256(key)[:16] form of the SAME current key. Migrate the recorded
+			// Deployment annotation to the HMAC value (metadata only) and keep the
+			// Pod template byte-identical, so an operator upgrade does not roll the
+			// fleet. desiredChecksum (the HMAC) is already what we record below.
+			tmplChecksum = liveTmpl
 		case recorded != desiredChecksum:
-			// Rotation: mirror into the template to roll the Pods.
+			// Rotation: mirror into the template to roll the Pods. (Also covers a
+			// legacy recorded value that does NOT match the current key's old
+			// checksum — the key rotated while the operator was down.)
 			tmplChecksum = desiredChecksum
 		default:
 			// Steady state: preserve the template's current checksum.

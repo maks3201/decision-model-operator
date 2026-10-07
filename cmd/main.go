@@ -111,10 +111,11 @@ func warnSkippedProxyEnv(info func(msg string, keysAndValues ...any), skipped []
 		"variables", skipped)
 }
 
-// validateHFEndpoint checks that the Hugging Face endpoint URL is well-formed,
-// absolute with a host, has no userinfo/query/fragment, and is https (or http
-// when allowInsecure is true). Called at startup so a bad flag fails early.
-func validateHFEndpoint(raw string, allowInsecure bool) error {
+// validateEndpointURL checks that an endpoint URL (the Ollaya registry or the
+// Hugging Face mirror) is well-formed, absolute with a host, has no
+// userinfo/query/fragment, and is https (or http when allowInsecure is true).
+// Called at startup so a bad flag fails early.
+func validateEndpointURL(raw string, allowInsecure bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("cannot parse URL: %w", err)
@@ -398,10 +399,14 @@ func main() {
 	}
 	var ollayaOpts []ollaya.Option
 	if ollayaRegistry != "" {
+		if err := validateEndpointURL(ollayaRegistry, allowInsecureRegistries); err != nil {
+			setupLog.Error(err, "invalid --ollaya-registry")
+			os.Exit(1)
+		}
 		ollayaOpts = append(ollayaOpts, ollaya.WithRegistryURL(ollayaRegistry))
 	}
 	if ollayaHFEndpoint != "" {
-		if err := validateHFEndpoint(ollayaHFEndpoint, allowInsecureRegistries); err != nil {
+		if err := validateEndpointURL(ollayaHFEndpoint, allowInsecureRegistries); err != nil {
 			setupLog.Error(err, "invalid --ollaya-hf-endpoint")
 			os.Exit(1)
 		}

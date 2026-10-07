@@ -428,7 +428,7 @@ var _ = Describe("ensure* conflict and legacy recovery", func() {
 			},
 		})).To(Succeed())
 		params := r().paramsFor(dm, defaultDigest, fakeImage, "r1")
-		Expect(r().ensureDeployment(ctx, dm, r().Engines["ollaya"], params, "r1", false, "", false)).To(MatchError(errResourceConflict))
+		Expect(r().ensureDeployment(ctx, dm, r().Engines["ollaya"], params, "r1", false, "", "", false)).To(MatchError(errResourceConflict))
 
 		two := int32(2)
 		dm.Spec.Replicas = &two

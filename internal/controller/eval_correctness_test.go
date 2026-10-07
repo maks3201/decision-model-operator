@@ -140,6 +140,68 @@ var _ = Describe("eval blip does not promote", func() {
 		Expect(getDM("blip").Status.StableRevision.Hash).To(Equal(rev))
 	})
 
+	// A case the runtime rejects (engine.ErrRequestRejected) means the golden
+	// dataset is broken: the evaluator must NOT retry it like a transport blip. The
+	// candidate is held in Evaluating with Evaluated=False/DatasetInvalid naming the
+	// line, rolls back only at the timeout, and a dataset fix (new content) re-runs.
+	It("holds on a rejected case, does not retry, and re-runs after a dataset fix", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		eng.rejectErr.Store(true)
+		clock := newSafeClock()
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		r.Now = clock.now
+		// Two cases; the runtime rejects on the first Decide (line 1).
+		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-rej"},
+			Data: map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n" +
+				`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"},
+		})).To(Succeed())
+		dm := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rej"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+					DatasetRef:  decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden-rej", Key: "cases.jsonl"}},
+					MinAccuracy: "0.90",
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
+		rec(r, "rej")
+		rev := RevisionHash(getDM("rej").Spec, defaultDigest, fakeImage)
+		markJob("rej", rev)
+		rec(r, "rej")
+		createReadyPod("rej", rev, "rej-pod-0")
+
+		// The eval runs, hits the rejected case, and holds in Evaluating with
+		// DatasetInvalid naming line 1 — never promotes, never rolls back (within
+		// the window).
+		Eventually(func() string {
+			rec(r, "rej")
+			c := meta_Find(getDM("rej"), decisionmodelv1alpha1.ConditionEvaluated)
+			if c == nil {
+				return ""
+			}
+			return c.Reason
+		}, "5s", "50ms").Should(Equal(reasonDatasetInvalid))
+		cond := meta_Find(getDM("rej"), decisionmodelv1alpha1.ConditionEvaluated)
+		Expect(cond.Message).To(ContainSubstring("line 1"))
+		Expect(getDM("rej").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
+		Expect(getDM("rej").Status.StableRevision).To(BeNil(), "held, not promoted")
+		Expect(getDM("rej").Status.FailedRevision).To(BeNil(), "held, not rolled back")
+
+		// Fix the dataset (new content -> new eval key); the runtime now accepts it.
+		eng.rejectErr.Store(false)
+		cm := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "golden-rej"}, cm)).To(Succeed())
+		cm.Data["cases.jsonl"] = `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"
+		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "rej")
+			return getDM("rej").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady), "a dataset fix re-runs the eval and promotes")
+	})
+
 	// every condition carries ObservedGeneration, updated on a spec change.
 	It("stamps ObservedGeneration on conditions and updates it on a spec change", func() {
 		eng := newFakeEngine()

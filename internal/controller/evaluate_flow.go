@@ -160,6 +160,18 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	if candRes.timedOut {
 		return r.rollbackOrFail(ctx, dm, candidate, reasonEvaluationTimeout, "evaluation timed out")
 	}
+	// A case the runtime rejected means the golden dataset itself is broken.
+	// Retrying cannot help, but a transient dataset edit can: hold the candidate
+	// in Evaluating (Evaluated=False/DatasetInvalid naming the line) and roll back
+	// only at the evaluation timeout — exactly like a missing dataset. A dataset
+	// content change produces a new evalKey and re-runs automatically. The run is
+	// not retried in between (the rejected result is cached under this dataset
+	// hash). Emit the Event once (on the condition reason/message transition).
+	if candRes.rejected {
+		msg := fmt.Sprintf("golden dataset case on line %d rejected by the runtime: %s",
+			candRes.rejectedLine, candRes.rejectedDetail)
+		return r.holdForDataset(ctx, dm, candidate, reasonDatasetInvalid, errors.New(msg))
+	}
 	if candRes.err != nil {
 		return r.rollbackOrFail(ctx, dm, candidate, reasonEvaluationFailed, candRes.err.Error())
 	}

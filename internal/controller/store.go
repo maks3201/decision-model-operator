@@ -68,7 +68,8 @@ func (r *DecisionModelReconciler) maintainStable(
 		return nil
 	}
 	stableParams := r.stableParams(ctx, dm, stable, claim)
-	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, apiKeyChecksum(apiKey), terminating); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, keyChecksum, legacyChecksum, terminating); err != nil {
 		return err
 	}
 	if err := r.ensurePDB(ctx, dm, stable.Hash); err != nil {

@@ -204,7 +204,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 
 		r := newRec(hideGet(&appsv1.Deployment{}, "adopt-dep-r9"), newProber())
 		params := r.paramsFor(dm, defaultDigest, fakeImage, "r9")
-		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r9", false, "", false)).To(Succeed())
+		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r9", false, "", "", false)).To(Succeed())
 
 		got := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "adopt-dep-r9"}, got)).To(Succeed())
@@ -388,7 +388,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		d1 := getDM("retry")
 		exhaust(d1, "f1-")
 		d1.Annotations = map[string]string{decisionmodelv1alpha1.AnnotationRetry: "t1"}
-		r.applyRetryToken(d1, true)
+		r.applyRetryToken(ctx, d1, true)
 		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "new token clears the exhausted latch")
 		Expect(d1.Status.LastRetryToken).To(Equal("t1"), "token recorded (consumed once)")
 
@@ -396,12 +396,12 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		// -> no reset.
 		exhaust(d1, "f2-")
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t1"
-		r.applyRetryToken(d1, true) // d1.Status.LastRetryToken == "t1"
+		r.applyRetryToken(ctx, d1, true) // d1.Status.LastRetryToken == "t1"
 		Expect(storeRecoverExhausted(d1)).To(BeTrue(), "the same token does not restart recovery")
 
 		// A different token resets again.
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t2"
-		r.applyRetryToken(d1, true)
+		r.applyRetryToken(ctx, d1, true)
 		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "a new token restarts recovery again")
 		Expect(d1.Status.LastRetryToken).To(Equal("t2"))
 
@@ -552,7 +552,7 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 		params := r.paramsFor(dm, defaultDigest, fakeImage, "r1")
 
 		// Seed a stable Deployment carrying key-v1 in the template.
-		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("key-v1"), false)).To(Succeed())
+		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("sec-uid", "key-v1"), "", false)).To(Succeed())
 		dep := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "frz-r1"}, dep)).To(Succeed())
 		tmplBefore := dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]
@@ -560,7 +560,7 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 
 		// A key rotation WHILE the store is Terminating (freezeTemplate=true) must
 		// not touch the Pod template, even though it would otherwise roll it.
-		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("key-v2"), true)).To(Succeed())
+		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("sec-uid", "key-v2"), "", true)).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "frz-r1"}, dep)).To(Succeed())
 		Expect(dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]).
 			To(Equal(tmplBefore), "template frozen while the store is Terminating")
@@ -568,13 +568,13 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 		// Replicas may still be applied while frozen.
 		two := int32(2)
 		dm.Spec.Replicas = &two
-		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("key-v2"), true)).To(Succeed())
+		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("sec-uid", "key-v2"), "", true)).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "frz-r1"}, dep)).To(Succeed())
 		Expect(*dep.Spec.Replicas).To(Equal(two))
 		Expect(dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]).To(Equal(tmplBefore), "still frozen")
 
 		// After recovery (freezeTemplate=false), the rotation is finally applied.
-		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("key-v2"), false)).To(Succeed())
+		Expect(r.ensureDeployment(ctx, dm, r.Engines["ollaya"], params, "r1", true, apiKeyChecksum("sec-uid", "key-v2"), "", false)).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "frz-r1"}, dep)).To(Succeed())
 		Expect(dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]).
 			NotTo(Equal(tmplBefore), "template rolls once the store is recovered")

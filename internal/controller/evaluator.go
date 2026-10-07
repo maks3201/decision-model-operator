@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -54,6 +55,10 @@ type evalCase struct {
 	// Tolerance optionally overrides the score-question correctness band per
 	// question id (levels). Absent entries fall back to the spec scoreTolerance.
 	Tolerance map[string]float64 `json:"tolerance,omitempty"`
+	// Line is the 1-based source line of this case in the dataset, set during
+	// parsing (not from JSON). Reported when the runtime rejects the case so the
+	// user can find the offending line.
+	Line int `json:"-"`
 }
 
 // datasetHash returns a stable content hash for a dataset (bare hex, 16 chars).
@@ -85,6 +90,7 @@ func parseDataset(raw []byte, maxCases int) ([]evalCase, error) {
 		if len(c.Expected) == 0 {
 			return nil, fmt.Errorf("line %d: no expected answers", line)
 		}
+		c.Line = line
 		cases = append(cases, c)
 		if maxCases > 0 && len(cases) >= maxCases {
 			break
@@ -176,8 +182,15 @@ type evalResult struct {
 	calibratedCases int // scored questions that fed ECE/Brier (len(preds))
 	transport       int // number of per-case transport errors (not scored as answers)
 	done            bool
-	err             error // non-nil on dataset/timeout/transport failure
+	err             error // non-nil on dataset/timeout/transport/rejected failure
 	timedOut        bool
+	// rejected is set when the runtime rejected a case as invalid
+	// (engine.ErrRequestRejected): the golden dataset itself is broken. The run
+	// stops at once (no retry); rejectedLine/rejectedDetail name the offending
+	// case and the runtime's error for the Evaluated=False/DatasetInvalid message.
+	rejected       bool
+	rejectedLine   int
+	rejectedDetail string
 }
 
 // runEvaluation scores every case sequentially against a single Pod baseURL.
@@ -208,6 +221,21 @@ func runEvaluation(
 		if err != nil {
 			if ctx.Err() != nil {
 				return evalResult{done: true, timedOut: true, err: ctx.Err()}
+			}
+			// A rejected case is the dataset's fault, not the transport's: the
+			// runtime says this case is invalid (bad schema, unknown question
+			// type, …). Retrying cannot help, and scoring it would silently change
+			// accuracy. Stop at once and report which line and why; the caller
+			// holds the candidate in Evaluating until the dataset is fixed (a
+			// dataset change re-runs it).
+			if errors.Is(err, engine.ErrRequestRejected) {
+				return evalResult{
+					done:           true,
+					rejected:       true,
+					rejectedLine:   c.Line,
+					rejectedDetail: err.Error(),
+					err:            fmt.Errorf("case on line %d rejected by the runtime: %v", c.Line, err),
+				}
 			}
 			// A transport error is NOT an answer: scoring it as a wrong, zero-
 			// confidence prediction would silently drive accuracy/calibration down

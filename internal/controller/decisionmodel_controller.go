@@ -197,6 +197,7 @@ const (
 	eventRolledBackPromo       = "RolledBackAfterPromotion"
 	eventCandidateRejected     = "CandidateRejected"
 	eventCandidateSuperseded   = "CandidateSuperseded"
+	eventRetryNoop             = "RetryNoop"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -446,10 +447,10 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	apiKey, err := r.apiKey(ctx, &dm)
 	if err != nil {
 		if errors.Is(err, errSecretNotAllowed) {
-			return r.degradeSecretNotAllowed(ctx, &dm, err)
+			return r.maintainStableForSecret(ctx, &dm, eng, reasonSecretNotAllowed, err)
 		}
 		if errors.Is(err, errAPIKeyInvalid) {
-			return r.degradeSecretReason(ctx, &dm, reasonAPIKeyInvalid, err)
+			return r.maintainStableForSecret(ctx, &dm, eng, reasonAPIKeyInvalid, err)
 		}
 		return r.finish(ctx, &dm, ctrl.Result{}, err)
 	}
@@ -461,9 +462,9 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.validateDownloadToken(ctx, &dm); err != nil {
 		switch {
 		case errors.Is(err, errSecretNotAllowed):
-			return r.degradeSecretNotAllowed(ctx, &dm, err)
+			return r.maintainStableForSecret(ctx, &dm, eng, reasonSecretNotAllowed, err)
 		case errors.Is(err, errDownloadTokenInvalid):
-			return r.degradeSecretReason(ctx, &dm, reasonDownloadTokenInvalid, err)
+			return r.maintainStableForSecret(ctx, &dm, eng, reasonDownloadTokenInvalid, err)
 		default:
 			return r.finish(ctx, &dm, ctrl.Result{}, err)
 		}
@@ -472,7 +473,7 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// a new decisionmodel.io/retry token clears a failed revision and
 	// resets an exhausted stable-store recovery (consumed once); a stale/absent
 	// token clears failedRevision only when the spec returned to the stable revision.
-	r.applyRetryToken(&dm, isStable)
+	r.applyRetryToken(ctx, &dm, isStable)
 
 	// Do not automatically retry a revision that already failed. A spec change
 	// produces a new revision hash, which clears this guard. This path is
@@ -481,7 +482,6 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if dm.Status.FailedRevision != nil && dm.Status.FailedRevision.Hash == rev && !isStable {
 		return r.reconcileFailedRevision(ctx, &dm, eng, stable, apiKey, cacheDegraded)
 	}
-
 	// 9. In-place path: revision already stable.
 	if isStable {
 		// A lost or terminating stable store routes to recoverStableStore inside
@@ -554,18 +554,11 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	return r.reconcileCandidate(ctx, dm, eng, params, candidate, digest, cacheDegraded, apiKey)
 }
 
-// degradeSecretNotAllowed sets Degraded + Ready=False/SecretNotAllowed and
-// requeues at the regate interval. Used for both the API-key and download-token
-// confused-deputy guard: there is no Secret watch, so adding the label must be
-// picked up by a requeue within ~60s.
-func (r *DecisionModelReconciler) degradeSecretNotAllowed(
-	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, err error,
-) (ctrl.Result, error) {
-	return r.degradeSecretReason(ctx, dm, reasonSecretNotAllowed, err)
-}
-
-// degradeSecretReason sets Degraded + Ready=False with the given reason and
+// degradeSecretReason reports a Secret problem (missing/invalid API key or
+// download token, or a confused-deputy label violation) with the given reason and
 // requeues at the regate interval (no Secret watch, so a fix must be polled).
+// With a stable revision serving, use maintainStableForSecret instead so the
+// stable keeps serving; this variant (no stable) sets Ready=False + Degraded.
 func (r *DecisionModelReconciler) degradeSecretReason(
 	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, reason string, err error,
 ) (ctrl.Result, error) {
@@ -579,19 +572,47 @@ func (r *DecisionModelReconciler) degradeSecretReason(
 	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 }
 
+// maintainStableForSecret handles a Secret problem (missing/invalid API key or
+// download token) while a stable revision is serving: it keeps the stable
+// maintained (empty key tolerated — ensureDeployment preserves the recorded
+// checksum, the prober may get a transient 401) and marks Degraded with the
+// reason so the user sees it, without failing the object. The stable path owns
+// Ready/replica status. Falls back to degradeSecretReason when there is no stable.
+func (r *DecisionModelReconciler) maintainStableForSecret(
+	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, eng engine.Engine, reason string, err error,
+) (ctrl.Result, error) {
+	stable := dm.Status.StableRevision
+	if stable == nil {
+		return r.degradeSecretReason(ctx, dm, reason, err)
+	}
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: err.Error(),
+	})
+	// Maintain the stable with an empty key; cacheDegraded=true preserves the
+	// Degraded condition set above through applyStableReadiness.
+	return r.reconcileStablePath(ctx, dm, eng, stable, "", true)
+}
+
 // applyRetryToken handles the decisionmodel.io/retry annotation. A new token
 // (!= status.lastRetryToken) is the user's "I fixed the cause, try again" signal:
-// it clears a failed revision AND resets an exhausted stable-store recovery (the
-// in-memory latch), and is consumed once (lastRetryToken recorded). A stale or
-// absent token clears a failed revision only when the spec has returned to the
-// stable revision (existing failed-revision semantics).
-func (r *DecisionModelReconciler) applyRetryToken(dm *decisionmodelv1alpha1.DecisionModel, isStable bool) {
+// it clears a failed revision AND resets an exhausted stable-store recovery, and
+// is consumed once (lastRetryToken recorded) WHETHER OR NOT there was anything to
+// retry — otherwise a token set when nothing is failing would stay armed and
+// silently auto-retry a later, unrelated failure without the user acting. When
+// there was nothing to retry it is a no-op plus one "nothing to retry" Event. A
+// stale or absent token clears a failed revision only when the spec has returned
+// to the stable revision (existing failed-revision semantics).
+func (r *DecisionModelReconciler) applyRetryToken(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, isStable bool) {
 	tok := dm.Annotations[decisionmodelv1alpha1.AnnotationRetry]
 	newRetry := tok != "" && tok != dm.Status.LastRetryToken
+	acted := false
 	if dm.Status.FailedRevision != nil {
 		if newRetry {
 			dm.Status.FailedRevision = nil
-			dm.Status.LastRetryToken = tok
+			acted = true
 		} else if isStable {
 			dm.Status.FailedRevision = nil
 		}
@@ -602,7 +623,16 @@ func (r *DecisionModelReconciler) applyRetryToken(dm *decisionmodelv1alpha1.Deci
 	// recreated as usual).
 	if newRetry && storeRecoverExhausted(dm) {
 		clearStoreRecover(dm)
+		acted = true
+	}
+	// Consume a new token on first observation regardless of whether it did
+	// anything, so it cannot arm a future failure. Announce a no-op once.
+	if newRetry {
 		dm.Status.LastRetryToken = tok
+		if !acted {
+			r.event(ctx, dm, corev1.EventTypeNormal, eventRetryNoop,
+				"retry annotation observed but nothing to retry; consuming it")
+		}
 	}
 }
 
@@ -917,7 +947,8 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	}
 
 	stableParams := r.stableParams(ctx, dm, stable, claim)
-	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, apiKeyChecksum(apiKey), storeTerminating); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, keyChecksum, legacyChecksum, storeTerminating); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	if err := r.ensureService(ctx, dm, eng, stable.Hash); err != nil {
@@ -1132,7 +1163,8 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 	if err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
-	if err := r.ensureDeployment(ctx, dm, eng, params, rev, false, apiKeyChecksum(apiKey), false); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, params, rev, false, keyChecksum, legacyChecksum, false); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	if !depExisted {
@@ -1225,7 +1257,8 @@ func (r *DecisionModelReconciler) reconcileStable(
 	// the live spec which describes the failed candidate.
 	claim, _ := r.storeClaimForStable(ctx, dm, stable)
 	params := r.stableParams(ctx, dm, stable, claim)
-	if err := r.ensureDeployment(ctx, dm, eng, params, stable.Hash, true, apiKeyChecksum(apiKey), false); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, params, stable.Hash, true, keyChecksum, legacyChecksum, false); err != nil {
 		return 0, err
 	}
 	if err := r.ensureService(ctx, dm, eng, stable.Hash); err != nil {

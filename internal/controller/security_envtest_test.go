@@ -439,8 +439,10 @@ var _ = Describe("security guards", func() {
 		Expect(err).To(HaveOccurred(), "no Job should exist")
 	})
 
-	// a missing download-token Secret (optional not honoured) → the Secret Get
-	// error surfaces; no Job. The ref is required when set.
+	// a missing download-token Secret (optional not honoured) → surfaced as a
+	// Degraded=DownloadTokenInvalid condition (user-fixable), held with a requeue
+	// rather than a raw reconcile error with backoff; no Job. The ref is required
+	// when set.
 	It("DT5: missing download-token Secret is required (optional ignored), no Job", func() {
 		eng := newFakeEngine()
 		r := newR(eng)
@@ -455,11 +457,17 @@ var _ = Describe("security guards", func() {
 			}
 		})
 
-		// A missing Secret surfaces as an error (not silently skipped).
+		// A missing Secret is surfaced as a condition (no error, held), not skipped.
 		_, err := r.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Namespace: namespace, Name: "dt5"},
 		})
-		Expect(err).To(HaveOccurred(), "a missing download-token Secret must not be skipped via optional")
+		Expect(err).NotTo(HaveOccurred(), "a missing download-token Secret is a condition, not a reconcile error")
+		dm := getDM("dt5")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded))
+		ready := meta_Find(dm, decisionmodelv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal(reasonDownloadTokenInvalid))
+		Expect(ready.Message).To(ContainSubstring("absent"), "names the Secret")
 
 		rev := RevisionHash(getDM("dt5").Spec, defaultDigest, fakeImage)
 		job := &batchv1.Job{}

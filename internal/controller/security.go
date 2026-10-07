@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -137,29 +138,63 @@ func (r *DecisionModelReconciler) guardSecurity(
 
 // apiKey reads the engine API key from the referenced Secret, if any.
 func (r *DecisionModelReconciler) apiKey(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel) (string, error) {
+	value, _, err := r.apiKeyWithUID(ctx, dm)
+	return value, err
+}
+
+// apiKeyWithUID reads the engine API key value and the referenced Secret's UID.
+// The UID keys the Pod-template rotation trigger (apiKeyChecksum) so the trigger
+// is not an offline-verifiable hash of the key value. uid is "" when there is no
+// auth Secret.
+func (r *DecisionModelReconciler) apiKeyWithUID(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel) (value string, uid types.UID, err error) {
 	if dm.Spec.Auth == nil || dm.Spec.Auth.APIKeySecretRef == nil {
-		return "", nil
+		return "", "", nil
 	}
 	ref := dm.Spec.Auth.APIKeySecretRef
 	rdr, err := r.reader()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var secret corev1.Secret
 	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
-		return "", err
+		if apierrors.IsNotFound(err) {
+			// A missing Secret is a user-fixable configuration error, not a
+			// transient API failure: surface it as APIKeyInvalid (holds/Degraded
+			// with a requeue), naming the Secret but never its content.
+			return "", "", fmt.Errorf("%w: Secret %s/%s not found", errAPIKeyInvalid, dm.Namespace, ref.Name)
+		}
+		return "", "", err
 	}
 	if err := requireAPIKeyLabel(secret.Labels); err != nil {
-		return "", err
+		return "", "", err
 	}
 	// The referenced key must exist: optional is rejected by CEL, and a labelled
 	// Secret missing the key would leave the prober and the serving Pod reading
 	// different keys (empty vs real). Surface it instead of silently using "".
 	if _, ok := secret.Data[ref.Key]; !ok {
-		return "", fmt.Errorf("%w: Secret %s/%s has no key %q",
+		return "", "", fmt.Errorf("%w: Secret %s/%s has no key %q",
 			errAPIKeyInvalid, dm.Namespace, ref.Name, ref.Key)
 	}
-	return string(secret.Data[ref.Key]), nil
+	return string(secret.Data[ref.Key]), secret.UID, nil
+}
+
+// apiKeyTrigger returns the Pod-template rotation trigger for dm's API key: the
+// UID-keyed HMAC of the key value (current) and the legacy sha256(key)[:16] form
+// (legacy). It re-reads the auth Secret's UID through the uncached reader (one
+// get; the value was already read this reconcile). An unreadable Secret or empty
+// key yields "","" so the caller leaves the live template untouched
+// (ensureDeployment preserves the recorded checksum on an empty trigger). legacy
+// lets ensureDeployment migrate an existing Deployment that recorded the old
+// checksum form to the HMAC value without rolling the Pods.
+func (r *DecisionModelReconciler) apiKeyTrigger(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, apiKey string) (current, legacy string) {
+	if apiKey == "" {
+		return "", ""
+	}
+	_, uid, err := r.apiKeyWithUID(ctx, dm)
+	if err != nil || uid == "" {
+		return "", ""
+	}
+	return apiKeyChecksum(uid, apiKey), legacyAPIKeyChecksum(apiKey)
 }
 
 // validateDownloadToken checks the download-token Secret referenced by
@@ -183,8 +218,13 @@ func (r *DecisionModelReconciler) validateDownloadToken(
 	}
 	var secret corev1.Secret
 	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
-		// optional is not supported; treat a missing Secret the same as a missing
-		// label so the operator never creates a Job that cannot start.
+		if apierrors.IsNotFound(err) {
+			// A missing download-token Secret is a user-fixable config error, not a
+			// transient API failure: surface it as DownloadTokenInvalid (naming the
+			// Secret, never its content) instead of a raw NotFound with backoff.
+			return fmt.Errorf("%w: Secret %s/%s not found", errDownloadTokenInvalid, dm.Namespace, ref.Name)
+		}
+		// Other API errors stay transient (workqueue backoff).
 		return err
 	}
 	if err := requireDownloadTokenLabel(secret.Labels); err != nil {
