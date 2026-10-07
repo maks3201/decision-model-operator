@@ -188,8 +188,18 @@ func crashLoopingContainer(pod *corev1.Pod) bool {
 	return false
 }
 
-// rollbackToPrevious switches the Service back to the previous revision, promotes
-// it back to stable, records the failed (new) revision, and ends the window.
+// rollbackToPrevious ends the stabilization window by rolling the new stable
+// back to the previous revision. The order is durability-first: it builds the
+// new status (stable = previous, failed = new, previousRevision = nil) and
+// PERSISTS it before touching the Service or deleting any workload. If the write
+// loses an optimistic-lock race or errors, nothing in the cluster is changed and
+// the next reconcile redoes the whole decision from fresh state — so a failed
+// write can never leave status saying stable=<failed> while the Service and
+// workloads have already been rolled back (which would re-create the bad model
+// as stable). Only after a durable write does it switch the Service back and
+// delete the failed revision; both are idempotent, and if either fails here the
+// normal stable path converges them on a later reconcile (ensureService re-points
+// to the recorded stable, gcRevisions collects the no-longer-kept failed hash).
 func (r *DecisionModelReconciler) rollbackToPrevious(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -198,20 +208,9 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	prev *decisionmodelv1alpha1.PreviousRevisionStatus,
 	detail string,
 ) stabilizationResult {
-	// The previous revision's Deployment is still running (kept through the
-	// window), so switching the Service back is instant.
 	msg := fmt.Sprintf("new stable %s unhealthy during the stabilization window (%s); rolling back to %s",
 		modelRef(failed), detail, prev.Hash)
 
-	// Point the Service back at the previous revision (its Pods are still up).
-	if err := r.ensureService(ctx, dm, eng, prev.Hash); err != nil {
-		return stabilizationResult{rolledBack: false, res: ctrl.Result{}, err: err}
-	}
-
-	// Delete the new (failed) revision's workloads and record it as failed.
-	if err := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); err != nil {
-		return stabilizationResult{err: err}
-	}
 	failedAt := metav1.NewTime(r.now())
 	rolledBack := failed.DeepCopy()
 	rolledBack.Reason = reasonPostPromotionUnhealthy
@@ -220,7 +219,7 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 
 	// Promote the previous revision back to stable from its own recorded identity
 	// (retained in previousRevision.revision), so the stable path re-renders its
-	// workloads exactly as they were.
+	// workloads exactly as they were — never from the live spec (ARCHITECTURE §7).
 	restored := prev.Revision
 	if restored == nil {
 		// Defensive: a previousRevision recorded by an older operator had only the
@@ -246,9 +245,34 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 		Reason:  reasonCandidateRejected,
 		Message: fmt.Sprintf("rolled back to %s; it keeps serving", prev.Hash),
 	})
+	// Buffer the Event and metric: finish() flushes them only on a successful
+	// status write, so a conflicting/failed write emits nothing and the retry
+	// reconcile does not duplicate them.
 	r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBackPromo, "%s", msg)
 	bufferRollout(ctx, rolloutRolledBackAfterPromotion)
 
-	res, err := r.finish(ctx, dm, ctrl.Result{RequeueAfter: time.Second}, nil)
-	return stabilizationResult{rolledBack: true, res: res, err: err}
+	// Persist first. On conflict nothing was stored and no Event/metric was
+	// emitted; requeue and redo the decision from fresh state next reconcile.
+	persisted, conflict, err := r.persistStatus(ctx, dm)
+	if conflict {
+		return stabilizationResult{rolledBack: true, res: ctrl.Result{RequeueAfter: time.Second}}
+	}
+	if err != nil {
+		return stabilizationResult{rolledBack: true, err: err}
+	}
+	if !persisted {
+		return stabilizationResult{rolledBack: true, res: ctrl.Result{}}
+	}
+
+	// Only now, with the rollback durably recorded, move the Service back to the
+	// previous revision (its Pods are still up — kept through the window) and
+	// delete the failed revision's workloads. If either fails, the stable path
+	// converges it on the next reconcile; so requeue rather than block.
+	if err := r.ensureService(ctx, dm, eng, prev.Hash); err != nil {
+		return stabilizationResult{rolledBack: true, err: err}
+	}
+	if err := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); err != nil {
+		return stabilizationResult{rolledBack: true, err: err}
+	}
+	return stabilizationResult{rolledBack: true, res: ctrl.Result{RequeueAfter: time.Second}}
 }

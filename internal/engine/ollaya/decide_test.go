@@ -19,6 +19,7 @@ package ollaya
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,14 @@ func TestDecideMapsAllAnswerTypes(t *testing.T) {
 	if urg.Confidence != 0.3418 {
 		t.Errorf("urgency confidence = %v", urg.Confidence)
 	}
+	// Score answers must carry per-level probabilities (keys "0".."n-1") so the
+	// evaluator's score ECE/Brier has data.
+	if urg.Probabilities["0"] != 0.1203 || urg.Probabilities["1"] != 0.5612 || urg.Probabilities["2"] != 0.3185 {
+		t.Errorf("score probabilities not copied: %+v", urg.Probabilities)
+	}
+	if urg.Choice != "" || urg.Noul != nil {
+		t.Errorf("score must not set choice/noul: %+v", urg)
+	}
 
 	ref := resp.Answers["refund"]
 	if ref.Type != "noul" || ref.Noul == nil || *ref.Noul != 0.9127 {
@@ -185,6 +194,91 @@ func TestDecideErrorCodes(t *testing.T) {
 			}
 			if !contains(err.Error(), tt.wantText) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantText)
+			}
+		})
+	}
+}
+
+// TestDecideScoreProbabilitiesKept checks the mapping layer directly: a score
+// answer's per-level probabilities are copied (keys "0".."n-1"), a choice answer
+// keeps its per-choice probabilities, and a noul answer carries none. Verified
+// against the runtime, a score answer's probabilities look like
+// {"0":0.0125,"1":0.0915,"2":0.896} (0-based, summing to ~1).
+func TestDecideScoreProbabilitiesKept(t *testing.T) {
+	body := `{"answers":{
+		"sc":{"type":"score","score":1.88,"confidence":0.84,"probabilities":{"0":0.0125,"1":0.0915,"2":0.896}},
+		"ch":{"type":"choice","choice":"a","confidence":0.5,"probabilities":{"a":0.6,"b":0.4}},
+		"nl":{"type":"noul","noul":0.3,"probabilities":{"ignored":1.0}}
+	}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	e := New()
+	resp, err := e.Decide(context.Background(), srv.URL, "", decideReq())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	sc := resp.Answers["sc"]
+	if sc.Probabilities["0"] != 0.0125 || sc.Probabilities["1"] != 0.0915 || sc.Probabilities["2"] != 0.896 {
+		t.Errorf("score probabilities = %+v, want 0/1/2 kept", sc.Probabilities)
+	}
+	if sc.Score == nil || *sc.Score != 1.88 {
+		t.Errorf("score value = %+v", sc.Score)
+	}
+
+	ch := resp.Answers["ch"]
+	if ch.Choice != "a" || ch.Probabilities["a"] != 0.6 || ch.Probabilities["b"] != 0.4 {
+		t.Errorf("choice fields = %+v", ch)
+	}
+
+	// noul maps no probabilities (the contract field is for choice/score).
+	if nl := resp.Answers["nl"]; nl.Probabilities != nil {
+		t.Errorf("noul must carry no probabilities, got %+v", nl.Probabilities)
+	}
+}
+
+// TestDecideRejectedStatusClassification pins which statuses wrap
+// engine.ErrRequestRejected (permanent) and which stay transient. Status codes
+// and bodies match the real runtime (0.10.0): 404 MODEL_NOT_FOUND, 422
+// INVALID_REQUEST, 400 INVALID_JSON are rejected; 401 UNAUTHORIZED is not.
+func TestDecideRejectedStatusClassification(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		rejected bool
+	}{
+		{"400 invalid json", 400, `{"error":"invalid JSON","code":"INVALID_JSON"}`, true},
+		{"404 model not found", 404, `{"error":"not found","code":"MODEL_NOT_FOUND"}`, true},
+		{"413 payload too large", 413, `{"error":"too big","code":"PAYLOAD_TOO_LARGE"}`, true},
+		{"422 invalid request", 422, `{"error":"bad field","code":"INVALID_REQUEST"}`, true},
+		{"418 other 4xx", 418, `{"error":"teapot","code":"TEAPOT"}`, true},
+		{"400 unparseable body", 400, `not json at all`, true},
+		{"401 unauthorized", 401, `{"error":"no key","code":"UNAUTHORIZED"}`, false},
+		{"403 forbidden", 403, `{"error":"nope","code":"FORBIDDEN"}`, false},
+		{"408 request timeout", 408, `{"error":"slow","code":"TIMEOUT"}`, false},
+		{"409 conflict", 409, `{"error":"busy","code":"CONFLICT"}`, false},
+		{"429 rate limited", 429, `{"error":"slow down","code":"RATE_LIMITED"}`, false},
+		{"500 internal", 500, `{"error":"boom","code":"INTERNAL"}`, false},
+		{"502 non-json", 502, `bad gateway`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+			e := New()
+			_, err := e.Decide(context.Background(), srv.URL, "", decideReq())
+			if err == nil {
+				t.Fatalf("expected error")
+			}
+			if got := errors.Is(err, engine.ErrRequestRejected); got != tt.rejected {
+				t.Errorf("errors.Is(err, ErrRequestRejected) = %v, want %v (err: %v)", got, tt.rejected, err)
 			}
 		})
 	}

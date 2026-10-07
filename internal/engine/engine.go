@@ -91,6 +91,11 @@ type Loaded struct {
 // ErrNotFound is returned by Resolve when the model/tag does not exist.
 var ErrNotFound = errors.New("model not found")
 
+// ErrRequestRejected is wrapped by Decider.Decide when the runtime rejected the
+// request itself (a 4xx other than auth, timeout, conflict or rate limiting):
+// sending the same request again cannot succeed, so callers must not retry it.
+var ErrRequestRejected = errors.New("request rejected by the runtime")
+
 // Engine builds Kubernetes objects for a runtime and inspects running Pods.
 type Engine interface {
 	// Name of the engine, matches DecisionModel spec.engine (e.g. "ollaya").
@@ -167,7 +172,7 @@ type DecideRequest struct {
 type Answer struct {
 	Type          string             // "choice" | "noul" | "score"
 	Choice        string             // for choice
-	Probabilities map[string]float64 // for choice
+	Probabilities map[string]float64 // for choice (per choice) and score (per level)
 	Noul          *float64           // probability of "yes" for noul
 	Score         *float64           // expected level for score
 	Confidence    float64

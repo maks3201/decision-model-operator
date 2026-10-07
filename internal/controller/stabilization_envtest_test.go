@@ -28,9 +28,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -283,5 +287,108 @@ var _ = Describe("post-promotion stabilization window", func() {
 		clock = clock.Add(5 * time.Minute)
 		Eventually(func() bool { rec(r2, "s-restart"); return depExists("s-restart", rev1) }, "10s", "50ms").Should(BeFalse())
 		Expect(serviceRev("s-restart")).To(Equal(rev2))
+	})
+
+	// Durability-first: if the status write loses an optimistic-lock race, the
+	// rollback must NOT touch the Service or delete the failed revision — otherwise
+	// the persisted status (still stable=<failed>) and the cluster would disagree
+	// and the next reconcile would re-create the bad model as stable. The next
+	// reconcile then redoes the whole rollback from fresh state.
+	It("does not move the Service or delete workloads when the status write conflicts", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-conflict", nil)
+
+		// The new stable loses the model: the next reconcile wants to roll back.
+		prober.set(rev2, engine.Loaded{Name: "kev:en", Digest: "deadbeef", Device: "cpu"})
+		clock = clock.Add(2 * time.Minute)
+
+		// A client that fails the first status write with a Conflict, then behaves
+		// normally. recoverable: only the status subresource write is intercepted.
+		var failOnce bool
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		c := interceptor.NewClient(wc, interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object,
+				patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, isDM := obj.(*decisionmodelv1alpha1.DecisionModel); sub == "status" && isDM && !failOnce {
+					failOnce = true
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: decisionmodelv1alpha1.GroupVersion.Group, Resource: "decisionmodels"},
+						"s-conflict", fmt.Errorf("stale"))
+				}
+				return cl.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		})
+		rc := newRec(prober)
+		rc.Client = c
+
+		// Reconcile with the conflicting write: the rollback decision is made but
+		// the status write fails, so Service and the failed Deployment are intact.
+		_, _ = rc.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "s-conflict"}})
+		Expect(failOnce).To(BeTrue(), "the status write was attempted and conflicted")
+		Expect(serviceRev("s-conflict")).To(Equal(rev2), "Service unchanged on a conflicting write")
+		Expect(depExists("s-conflict", rev2)).To(BeTrue(), "failed revision not deleted on a conflicting write")
+		Expect(getDM("s-conflict").Status.StableRevision.Hash).To(Equal(rev2), "persisted stable unchanged")
+
+		// Next reconcile (same client, no more failures) completes the rollback.
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			_, _ = rc.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "s-conflict"}})
+			return getDM("s-conflict").Status.Phase
+		}, "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-conflict")).To(Equal(rev1), "rollback completed on the retry")
+		Expect(getDM("s-conflict").Status.StableRevision.Hash).To(Equal(rev1))
+		Expect(getDM("s-conflict").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	// A crash after the durable status write but before the Service switch / delete
+	// must still converge: the next reconcile runs the normal stable path from the
+	// persisted status (stable=previous, failed=new) and points the Service back
+	// and GCs the failed revision.
+	It("converges when a crash lands after the status write but before Service and delete", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-crash", nil)
+
+		prober.set(rev2, engine.Loaded{Name: "kev:en", Digest: "deadbeef", Device: "cpu"})
+		clock = clock.Add(2 * time.Minute)
+
+		// A client that lets the status write through but fails the Service Update
+		// (and any workload Delete) once, simulating a crash right after the write.
+		var crashed bool
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		c := interceptor.NewClient(wc, interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*corev1.Service); ok && !crashed {
+					crashed = true
+					return fmt.Errorf("simulated crash after status write")
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		})
+		rc := newRec(prober)
+		rc.Client = c
+
+		// The reconcile persists the rollback status, then "crashes" on the Service
+		// switch. Status is durable; Service and the failed Deployment are not yet
+		// converged.
+		_, _ = rc.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "s-crash"}})
+		Expect(crashed).To(BeTrue(), "the Service switch was attempted after the status write")
+		Expect(getDM("s-crash").Status.StableRevision.Hash).To(Equal(rev1), "rollback status is durable")
+		Expect(getDM("s-crash").Status.FailedRevision.Hash).To(Equal(rev2))
+		Expect(getDM("s-crash").Status.PreviousRevision).To(BeNil())
+
+		// A fresh reconciler (normal client) runs the stable path from the
+		// persisted status and converges: Service back to previous, failed GCed.
+		r2 := newRec(prober)
+		Eventually(func() string {
+			_, _ = r2.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "s-crash"}})
+			return serviceRev("s-crash")
+		}, "10s", "50ms").Should(Equal(rev1), "Service converges to the previous revision")
+		Eventually(func() bool {
+			_, _ = r2.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "s-crash"}})
+			return depExists("s-crash", rev2)
+		}, "10s", "50ms").Should(BeFalse(), "the failed revision is collected")
 	})
 })
