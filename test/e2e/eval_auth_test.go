@@ -65,7 +65,7 @@ func deptQuestion() map[string]any {
 	}
 }
 
-var _ = Describe("API-key auth", Ordered, func() {
+var _ = Describe("API-key auth", Label("auth"), Ordered, func() {
 	const dm = "auth-router"
 	const secretName = "dm-key"
 	const badSecretName = "dm-key-unlabelled"
@@ -267,7 +267,7 @@ spec:
 	})
 })
 
-var _ = Describe("Eval-gated rollout", Ordered, func() {
+var _ = Describe("Eval-gated rollout", Label("eval"), Ordered, func() {
 	const dm = evalDM
 	// verified maps each state to the label laya:en actually returns (learned live).
 	var verified []string

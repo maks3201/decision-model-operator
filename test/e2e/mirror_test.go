@@ -46,7 +46,7 @@ var mirrorImage = envOr("MIRROR_IMAGE", "dmo-e2e-mirror:laya-en")
 // --ollaya-registry, and it must be on the --allowed-registries list.
 var mirrorHost = fmt.Sprintf("mirror.%s.svc", mirrorNS)
 
-var _ = Describe("Registry mirror", Ordered, func() {
+var _ = Describe("Registry mirror", Label("mirror"), Ordered, func() {
 	const dm = "mirror-router"
 
 	BeforeAll(func() {

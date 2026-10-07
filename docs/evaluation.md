@@ -255,6 +255,7 @@ the API (safe to alert on):
 | `Promoted` | `PromotionPending` | a `Manual`-policy candidate passed its gate and waits for approval |
 | `Promoted` | `Promoted` | the candidate was promoted and is serving |
 | `Stabilizing` | `Stabilizing` | the new stable is in its post-promotion stabilization window (previous revision kept) |
+| `Stabilizing` | `StableRolling` | a quorum shortfall is ignored because the stable Deployment is mid-rollout (replicas scale-up, key rotation, scheduling change, restart) |
 | `Stabilizing` | `PostPromotionUnhealthy` | the new stable looks unhealthy in the window (debouncing before rollback) |
 | `Ready` | `Ready` | the stable revision is serving and healthy |
 | `Ready` | `CandidateRejected` | a candidate was rejected (or rolled back after promotion); the surviving revision keeps serving |
@@ -399,6 +400,22 @@ previous revision if the new stable:
 - reports a readiness-gate **`DigestMismatch` / `DeviceMismatch`** (wrong model
   loaded), or a container in **`CrashLoopBackOff`** — these roll back immediately,
   no debounce.
+
+A quorum shortfall caused by an **intentional in-place rollout** of the stable
+(replicas scale-up, API-key rotation, scheduling change, or `kubectl rollout
+restart`) is **not** treated as a failure: while the stable Deployment is
+mid-rollout — `generation` not yet observed, or the `Progressing` condition is
+`True` with a reason other than `NewReplicaSetAvailable` (e.g. `ReplicaSetUpdated`)
+— the condition is `Stabilizing=True` with reason **`StableRolling`** and the
+debounce does not advance. A completed rollout settles to `Progressing=True,
+NewReplicaSetAvailable` and stays there even if its Pods later go unready, so a
+post-rollout health failure is **not** masked and still rolls back after the
+debounce. Immediate failures (gate mismatch, crash loop) always roll back.
+Protection stays bounded: a rollout that exceeds its Deployment
+`progressDeadlineSeconds` (`Progressing=False, ProgressDeadlineExceeded`) is counted
+as a failure and rolled back. If the stabilization window elapses while a rollout
+is still in progress, the window is extended (the previous revision is kept) until
+the rollout settles healthy or trips the progress deadline.
 
 On rollback the Service switches back to the previous revision (its Pods are still
 running, so there is no cold start), the new revision is recorded in
