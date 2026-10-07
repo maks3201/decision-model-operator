@@ -50,7 +50,7 @@ const modelReadyGate = "decisionmodel.io/model-ready"
 // billingState is a support message that should be routed to the billing dept.
 const billingState = "I was charged twice for my subscription this month, please refund the extra charge."
 
-var _ = Describe("DecisionModel lifecycle", Ordered, func() {
+var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() {
 	BeforeAll(func() {
 		installOperator()
 

@@ -21,6 +21,12 @@ concurrency:
     startsWith(github.event.head_commit.message, 'chore(main): release') && format('-{0}', github.sha) || '' }}
   cancel-in-progress: true
 
+env:
+  # The pinned Ollaya runtime image; kept in sync with hack/kind-up.sh and
+  # internal/engine/ollaya DefaultRuntimeVersion. Cached across runs (keyed by
+  # this ref) so a shard does not re-pull it every time.
+  OLLAYA_IMAGE: ghcr.io/ollaya-dev/ollaya:0.10.0
+
 jobs:
   # Decide whether the heavy E2E matrix needs to run. A docs-only change (only
   # docs/** or *.md) skips it; the gate job below still reports success so a
@@ -61,8 +67,14 @@ jobs:
             echo "code=false" >>"$GITHUB_OUTPUT"
           fi
 
+  # The !nightly suite is split into parallel shards by Ginkgo Describe label so
+  # the slow serial kustomize leg (every spec loads a model) runs in parallel
+  # instead of one ~16-minute job. Each shard gets its own kind cluster. The helm
+  # shard runs only the lifecycle container (the Go suite Skips the rest on helm).
+  # The full serial suite still runs nightly (test-e2e-nightly.yml) to catch
+  # cross-spec interactions a split can hide.
   test-e2e:
-    name: kind (${{ matrix.install }}, CPU, laya:en)
+    name: ${{ matrix.name }}
     needs: changes
     # Run when code changed, except on the Release Please PR branch: that bot PR
     # only touches CHANGELOG/Chart.yaml/manifest, its pull_request runs sit in
@@ -73,17 +85,47 @@ jobs:
       (github.event_name != 'pull_request' ||
        github.head_ref != 'release-please--branches--main--components--decision-model-operator')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        install: [kustomize, helm]
+        include:
+          # kustomize shards: the !nightly containers split by label. Sum of
+          # labels == the full !nightly kustomize set (lifecycle+mirror, eval, auth).
+          - name: kind (kustomize lifecycle+mirror, CPU, laya:en)
+            install: kustomize
+            label: "!nightly && (lifecycle || mirror)"
+            mirror: "1"
+            cluster: dmo-e2e-life
+            free_disk: "true"
+          - name: kind (kustomize eval, CPU, laya:en)
+            install: kustomize
+            label: "!nightly && eval"
+            mirror: ""
+            cluster: dmo-e2e-eval
+            free_disk: "false"
+          - name: kind (kustomize auth, CPU, laya:en)
+            install: kustomize
+            label: "!nightly && auth"
+            mirror: ""
+            cluster: dmo-e2e-auth
+            free_disk: "false"
+          # helm shard: the Go suite runs only the lifecycle container on helm.
+          - name: kind (helm, CPU, laya:en)
+            install: helm
+            label: "!nightly"
+            mirror: ""
+            cluster: dmo-e2e-helm
+            free_disk: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # Cache the Go build + module cache across runs (key includes go.sum);
+          # the operator image is compiled from this cache in BeforeSuite.
+          cache-dependency-path: go.sum
 
       - name: Install kind
         run: |
@@ -96,12 +138,35 @@ jobs:
         if: matrix.install == 'helm'
         run: helm version
 
-      # The mirror spec (kustomize job) adds a ~0.85 GiB mirror image plus a second
-      # copy of the model to the kind node; the stock ubuntu-latest free space is
-      # not enough and E2E failed with "No space left on device". Reclaim
+      # Cache the Ollaya runtime image tarball across runs, keyed by its pinned
+      # ref, so each shard loads it from cache instead of pulling ~168 MiB from
+      # GHCR every time. On a cache miss we pull and save it for the next run.
+      - name: Cache Ollaya runtime image
+        id: ollaya-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: /tmp/ollaya-image.tar
+          key: ollaya-image-${{ env.OLLAYA_IMAGE }}
+
+      - name: Load or fetch the Ollaya runtime image
+        env:
+          IMG: ${{ env.OLLAYA_IMAGE }}
+          HIT: ${{ steps.ollaya-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ "$HIT" = "true" ] && [ -f /tmp/ollaya-image.tar ]; then
+            docker load -i /tmp/ollaya-image.tar
+          else
+            docker pull "$IMG"
+            docker save "$IMG" -o /tmp/ollaya-image.tar
+          fi
+
+      # Shards that build the mirror image (~0.85 GiB) plus a second copy of the
+      # model to the kind node need the extra space; the stock ubuntu-latest free
+      # space is not enough and E2E failed with "No space left on device". Reclaim
       # the large preinstalled toolchains we do not use. df before/after is logged.
       - name: Free disk space
-        if: matrix.install == 'kustomize'
+        if: matrix.free_disk == 'true'
         run: |
           echo "disk before:"; df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -112,17 +177,20 @@ jobs:
       - name: Run e2e
         env:
           E2E_INSTALL: ${{ matrix.install }}
-          # Run the registry-mirror spec (kustomize job only; the Go setup guards
-          # on install method). Builds + loads the mirror image in BeforeSuite.
-          E2E_MIRROR: "1"
-          # Skip specs labelled "nightly" on PRs to keep the run fast; the nightly
-          # workflow runs them in full.
-          E2E_LABEL_FILTER: "!nightly"
+          # Build+load the mirror image and run the offline mirror spec only on the
+          # shard that owns the mirror label (kustomize). Empty elsewhere.
+          E2E_MIRROR: ${{ matrix.mirror }}
+          # This shard's Ginkgo label filter. Shards never overlap and together
+          # cover the whole !nightly set.
+          E2E_LABEL_FILTER: ${{ matrix.label }}
+          # Per-shard kind cluster so the parallel shards do not collide.
+          KIND_CLUSTER: ${{ matrix.cluster }}
         run: make test-e2e
 
   # Always-reporting gate. This is the stable name for branch protection: it
-  # passes when the matrix succeeded or was skipped (docs-only, or the Release
-  # Please bot PR), and fails only when a matrix job failed or was cancelled.
+  # passes when every shard succeeded or the whole matrix was skipped (docs-only,
+  # or the Release Please bot PR), and fails when any shard failed or was
+  # cancelled. For a matrix, needs.test-e2e.result aggregates all legs.
   e2e-required:
     name: e2e-required
     needs: [changes, test-e2e]
