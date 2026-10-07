@@ -63,6 +63,10 @@ type deciderFakeEngine struct {
 	// decideErr, when set, makes Decide return a transport error. Atomic so a
 	// test can clear it between reconciles to simulate a blip that recovers.
 	decideErr atomic.Bool
+	// rejectErr, when set, makes Decide return an engine.ErrRequestRejected (the
+	// runtime rejected the case as invalid). Atomic so a test can clear it after a
+	// dataset "fix".
+	rejectErr atomic.Bool
 }
 
 func (d *deciderFakeEngine) Decide(
@@ -70,6 +74,9 @@ func (d *deciderFakeEngine) Decide(
 	_, _ string,
 	req engine.DecideRequest,
 ) (engine.DecideResponse, error) {
+	if d.rejectErr.Load() {
+		return engine.DecideResponse{}, fmt.Errorf("%w: 422 bad case schema", engine.ErrRequestRejected)
+	}
 	if d.decideErr.Load() {
 		return engine.DecideResponse{}, fmt.Errorf("boom: transport error")
 	}

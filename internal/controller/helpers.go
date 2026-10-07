@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -459,9 +461,31 @@ func ownedBy(obj metav1.Object, dm *decisionmodelv1alpha1.DecisionModel) bool {
 	return c != nil && c.UID == dm.UID
 }
 
-// apiKeyChecksum returns a short hash of the API key value, or "" for an empty
-// key (no auth). Only the hash is placed on the Pod template, never the value.
-func apiKeyChecksum(key string) string {
+// apiKeyChecksum returns the Pod-template rotation trigger for an API key, or ""
+// for an empty key (no auth). It is HMAC-SHA256 keyed by the auth Secret's UID
+// over the key value, truncated to 16 hex chars. The HMAC key (the Secret UID)
+// is as protected as the key value itself — a reader of the serving Deployment
+// (e.g. the view role, which cannot read Secrets) has neither the UID nor the
+// value, so the trigger cannot be used to verify a guess offline, unlike a bare
+// sha256(key). It still changes when the key value changes (drives the in-place
+// roll) and is deterministic across operator restarts and leader changes (no
+// spurious fleet roll). It also changes if the Secret is deleted and recreated
+// (new UID) — a legitimate rotation.
+func apiKeyChecksum(uid types.UID, key string) string {
+	if key == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(uid))
+	mac.Write([]byte(key))
+	return hex.EncodeToString(mac.Sum(nil))[:16]
+}
+
+// legacyAPIKeyChecksum is the pre-HMAC rotation trigger: an unsalted
+// sha256(key)[:16]. It is kept only to recognise an existing Deployment that
+// recorded this old form, so the recorded annotation can be migrated to the HMAC
+// value without rolling the Pods (a value match means the key did not change —
+// only the checksum format did). Never written to a new object.
+func legacyAPIKeyChecksum(key string) string {
 	if key == "" {
 		return ""
 	}

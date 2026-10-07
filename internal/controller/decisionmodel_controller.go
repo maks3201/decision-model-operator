@@ -481,7 +481,6 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if dm.Status.FailedRevision != nil && dm.Status.FailedRevision.Hash == rev && !isStable {
 		return r.reconcileFailedRevision(ctx, &dm, eng, stable, apiKey, cacheDegraded)
 	}
-
 	// 9. In-place path: revision already stable.
 	if isStable {
 		// A lost or terminating stable store routes to recoverStableStore inside
@@ -917,7 +916,8 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	}
 
 	stableParams := r.stableParams(ctx, dm, stable, claim)
-	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, apiKeyChecksum(apiKey), storeTerminating); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, keyChecksum, legacyChecksum, storeTerminating); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	if err := r.ensureService(ctx, dm, eng, stable.Hash); err != nil {
@@ -1132,7 +1132,8 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 	if err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
-	if err := r.ensureDeployment(ctx, dm, eng, params, rev, false, apiKeyChecksum(apiKey), false); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, params, rev, false, keyChecksum, legacyChecksum, false); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	if !depExisted {
@@ -1225,7 +1226,8 @@ func (r *DecisionModelReconciler) reconcileStable(
 	// the live spec which describes the failed candidate.
 	claim, _ := r.storeClaimForStable(ctx, dm, stable)
 	params := r.stableParams(ctx, dm, stable, claim)
-	if err := r.ensureDeployment(ctx, dm, eng, params, stable.Hash, true, apiKeyChecksum(apiKey), false); err != nil {
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, params, stable.Hash, true, keyChecksum, legacyChecksum, false); err != nil {
 		return 0, err
 	}
 	if err := r.ensureService(ctx, dm, eng, stable.Hash); err != nil {
