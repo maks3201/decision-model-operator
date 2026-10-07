@@ -228,7 +228,8 @@ type RolloutSpec struct {
 	//   - EvaluationGated: like Automatic but requires rollout.evaluation to be
 	//     set (rejected by CEL otherwise); the gate decides promotion.
 	//   - Manual: hold the candidate in AwaitingPromotion until a human sets the
-	//     annotation decisionmodel.io/promote to the candidate's revision hash
+	//     annotation decisionmodel.io/promote to status.evaluation.approvalId (or,
+	//     without evaluation, the candidate's revision hash for one release)
 	//     (evaluation still runs when configured).
 	// When unset the effective policy is EvaluationGated if rollout.evaluation is
 	// set, else Automatic. The deprecated manualPromotion:true is an alias for
@@ -240,8 +241,9 @@ type RolloutSpec struct {
 
 	// ManualPromotion holds a candidate that passed its gate (model-ready, plus
 	// evaluation when configured) in phase AwaitingPromotion until a human
-	// approves it by setting the annotation decisionmodel.io/promote to the
-	// candidate's revision hash. The stable revision keeps serving meanwhile.
+	// approves it by setting the annotation decisionmodel.io/promote to
+	// status.evaluation.approvalId (or, without evaluation, the candidate's
+	// revision hash for one release). The stable revision keeps serving meanwhile.
 	// There is no progress timeout while waiting. The very first revision of a
 	// DecisionModel (no stable revision yet) is promoted without approval, since
 	// there is no traffic to protect. The approval annotation is removed once the

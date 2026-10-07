@@ -236,7 +236,9 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		driveToJob(rr, dm, stable, claim)
 		job := getJob(dm)
 		markFailed(job)
-		// A failed prefetch Pod carrying a permanent (DigestMismatch) message.
+		// A failed prefetch Pod carrying a permanent (DigestMismatch) message,
+		// controlled by the current prefetch Job (trusted by UID, not labels).
+		yes := true
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: prefetchName(dm, "r1") + "-xyz",
@@ -245,6 +247,10 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 					decisionmodelv1alpha1.LabelPrefetchRevision: "r1",
 					"job-name": prefetchName(dm, "r1"),
 				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
+					Controller: &yes, BlockOwnerDeletion: &yes,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
 		}

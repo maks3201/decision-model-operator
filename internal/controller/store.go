@@ -987,13 +987,23 @@ func (r *DecisionModelReconciler) prefetchFailureReason(
 // exit code of the most recently started failed Pod of a revision's prefetch
 // Job. Prefetch Pods carry LabelName + LabelPrefetchRevision (never
 // LabelRevision, which is a serving selector), so they are in the operator's
-// name-scoped Pod cache. found is false when no such Pod/termination is
-// available.
+// name-scoped Pod cache. Those labels can be set by anyone with Pod create
+// rights in the namespace, so a Pod is trusted only when its controller
+// OwnerReference is the current prefetch Job's UID, and that Job is itself owned
+// by this DecisionModel. found is false when the Job is missing or not ours, or
+// when no owned Pod has a usable termination.
 func (r *DecisionModelReconciler) newestFailedPrefetchTermination(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	rev string,
 ) (message string, exitCode int32, found bool) {
+	var job batchv1.Job
+	if err := r.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: prefetchName(dm, rev)}, &job); err != nil {
+		return "", 0, false
+	}
+	if !ownedBy(&job, dm) {
+		return "", 0, false
+	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(dm.Namespace),
 		client.MatchingLabels{
@@ -1006,8 +1016,10 @@ func (r *DecisionModelReconciler) newestFailedPrefetchTermination(
 	var newestStart time.Time
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		// Second guard: only the Job's own Pods (it sets job-name).
-		if p.Labels["job-name"] != prefetchName(dm, rev) {
+		// Trust ownership, not labels: only Pods controlled by the current Job's
+		// UID. A foreign Pod with matching labels/job-name, or a previous Job's
+		// Pod reusing the name with a different UID, is ignored.
+		if c := metav1.GetControllerOf(p); c == nil || c.Kind != "Job" || c.UID != job.UID {
 			continue
 		}
 		term := terminatedContainer(p)
