@@ -250,18 +250,70 @@ var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() 
 	})
 
 	It("keeps the stable revision serving when a new revision fails to resolve", func() {
+		// A candidate that fails preflight (here: an unknown tag that does not
+		// resolve) must never stop the serving stable. The DecisionModel stays
+		// Ready and Ready=True; the failure is surfaced only on Resolved=False
+		// (reason ModelNotFound) plus one Warning Event, and no new revision is
+		// started. Restoring the original model clears the condition with no
+		// rollout, since it resolves back to the stable's digest.
+		By("recording the stable revision hash before the bad patch")
+		stableHashBefore, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableHashBefore).NotTo(BeEmpty(), "no stable revision recorded before the test")
+
 		By("pointing spec.model at a missing tag")
-		_, err := utils.Kubectl("patch", "decisionmodel", dmName, "-n", testNamespace,
+		_, err = utils.Kubectl("patch", "decisionmodel", dmName, "-n", testNamespace,
 			"--type=merge", "-p", fmt.Sprintf(`{"spec":{"model":"%s:does-not-exist"}}`, modelBase()))
 		Expect(err).NotTo(HaveOccurred())
 
-		By("expecting the phase to go Failed/RolledBack")
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
-		}, 5*time.Minute, 5*time.Second).Should(BeElementOf("Failed", "RolledBack"),
-			"phase should reflect the failed rollout")
+		By("expecting Resolved=False with reason ModelNotFound")
+		Eventually(func(g Gomega) {
+			status, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+				"{.status.conditions[?(@.type=='Resolved')].status}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status).To(Equal("False"), "Resolved should go False on the bad tag")
+			reason, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+				"{.status.conditions[?(@.type=='Resolved')].reason}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(reason).To(Equal("ModelNotFound"))
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("verifying the stable revision still answers (blue-green keeps stable)")
+		By("verifying phase stays Ready with Ready=True (the stable keeps serving)")
+		phase, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(phase).To(Equal("Ready"), "a rejected candidate must not stop the serving stable")
+		readyStatus, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.conditions[?(@.type=='Ready')].status}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(readyStatus).To(Equal("True"), "Ready should stay True")
+
+		By("verifying the stable revision is unchanged and no candidate was started")
+		stableHashNow, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableHashNow).To(Equal(stableHashBefore), "stable revision hash must not change")
+		candidate, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.candidateRevision}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidate).To(BeEmpty(), "no candidate revision should be recorded")
+
+		By("verifying no new revision Deployment was created")
+		deploys, err := utils.Kubectl("get", "deploy", "-l", "decisionmodel.io/name="+dmName,
+			"-n", testNamespace, "-o", "jsonpath={.items[*].metadata.name}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Fields(deploys)).To(HaveLen(1),
+			"exactly one (stable) revision Deployment should exist, got: %s", deploys)
+
+		By("verifying exactly one Warning Event with reason CandidateRejected")
+		eventTypes, err := utils.Kubectl("get", "events", "-n", testNamespace,
+			"--field-selector=involvedObject.name="+dmName+",reason=CandidateRejected",
+			"-o", "jsonpath={.items[*].type}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Fields(eventTypes)).To(Equal([]string{"Warning"}),
+			"expected one Warning CandidateRejected Event, got: %s", eventTypes)
+
+		By("verifying the stable Service still answers")
 		stop := make(chan struct{})
 		local := portForward(dmName, testNamespace, 11435, stop)
 		defer close(stop)
@@ -272,13 +324,24 @@ var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() 
 			g.Expect(out).To(Equal("200"), "stable Service stopped answering")
 		}, 1*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("restoring a valid model for the scaling test")
+		By("restoring the original model and expecting Resolved=True with no rollout")
 		_, err = utils.Kubectl("patch", "decisionmodel", dmName, "-n", testNamespace,
 			"--type=merge", "-p", fmt.Sprintf(`{"spec":{"model":"%s"}}`, testModel))
 		Expect(err).NotTo(HaveOccurred())
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
-		}, 8*time.Minute, 5*time.Second).Should(Equal("Ready"))
+		Eventually(func(g Gomega) {
+			status, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+				"{.status.conditions[?(@.type=='Resolved')].status}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status).To(Equal("True"), "Resolved should recover on the valid tag")
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		phase, err = utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(phase).To(Equal("Ready"))
+		stableHashAfter, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableHashAfter).To(Equal(stableHashBefore),
+			"restoring the original model must not roll the stable (same digest)")
 	})
 
 	It("scales to 2 model-ready Pods", func() {
