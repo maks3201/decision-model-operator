@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -169,6 +170,67 @@ var _ = Describe("ownership and store recovery", func() {
 		Expect(r.gcLegacyStore(ctx, getDM("conflict-store"))).To(Succeed())
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "conflict-store-store"},
 			&corev1.PersistentVolumeClaim{})).To(Succeed(), "foreign legacy store survives GC")
+	})
+
+	// gcLegacyStore must not delete the populated legacy store under a stable
+	// whose Deployment was just (re)created but is not yet in the cache: a cache
+	// lag on the Deployment List must not be read as "no live reference".
+	It("keeps the legacy store the current stable mounts despite a cache-lagged List", func() {
+		createDM("leg-race")
+		dm := getDM("leg-race")
+		stable := &decisionmodelv1alpha1.RevisionStatus{
+			Hash: "r1", Engine: "ollaya", Model: "laya:en", Digest: defaultDigest, Device: "cpu", Image: fakeImage,
+		}
+		// Record the stable and create the legacy shared PVC it mounts.
+		Expect(updateDMStatus(ctx, namespace, "leg-race", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.StableRevision = stable
+		})).To(Succeed())
+		legacy := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "leg-race-store", Labels: map[string]string{decisionmodelv1alpha1.LabelName: "leg-race"}},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dm, legacy, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, legacy)).To(Succeed())
+		// The stable Deployment mounting the legacy store (just (re)created).
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "leg-race-r1", Labels: map[string]string{decisionmodelv1alpha1.LabelName: "leg-race", decisionmodelv1alpha1.LabelRevision: "r1"}},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: int32Ptr(1),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{decisionmodelv1alpha1.LabelName: "leg-race", decisionmodelv1alpha1.LabelRevision: "r1"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{decisionmodelv1alpha1.LabelName: "leg-race", decisionmodelv1alpha1.LabelRevision: "r1"}},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}},
+						Volumes:    []corev1.Volume{{Name: "store", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "leg-race-store"}}}},
+					},
+				},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dm, dep, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+
+		// A client whose Deployment List is empty (models a cache that has not yet
+		// observed the just-created Deployment). r.APIReader stays the real client.
+		wc, werr := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(werr).NotTo(HaveOccurred())
+		lagging := interceptor.NewClient(wc, interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*appsv1.DeploymentList); ok {
+					return nil // empty: cache lag
+				}
+				return c.List(ctx, list, opts...)
+			},
+		})
+		r := newReconciler(lagging, newFakeEngine(), &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}})
+		Expect(r.gcLegacyStore(ctx, getDM("leg-race"))).To(Succeed())
+
+		got := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "leg-race-store"}, got)).
+			To(Succeed(), "legacy store the stable mounts survives a cache-lagged GC")
+		Expect(got.DeletionTimestamp).To(BeNil(), "no deletion was issued")
 	})
 
 	// a lost per-revision stable store is recreated and prefetched; stable

@@ -21,10 +21,14 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
@@ -66,11 +70,45 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 	elapsed := r.now().Sub(p.PromotedAt.Time)
 
 	unhealthy, immediate, detail := r.newStableUnhealthy(ctx, dm, stable, ready)
-	if unhealthy && (immediate || r.unhealthyDebounceElapsed(dm)) {
+
+	// Tell an intentional in-place rollout of the stable (replicas scale-up,
+	// API-key rotation, scheduling change, manual restart) from a model-health
+	// failure. A non-immediate quorum shortfall during a rollout is expected while
+	// new Pods start and load the model, so it must NOT start/advance the rollback
+	// debounce. Immediate failures (gate DigestMismatch/DeviceMismatch,
+	// CrashLoopBackOff) still roll back regardless. A rollout that blows its
+	// progressDeadline (Progressing=False, ProgressDeadlineExceeded) is itself a
+	// failure and rolls back.
+	rollout := r.stableRolloutState(ctx, dm, stable)
+	rollingShortfall := unhealthy && !immediate && rollout == rolloutInProgress
+	if unhealthy && !immediate && rollout == rolloutDeadlineExceeded {
+		immediate = true
+		detail = fmt.Sprintf("%s; the stable rollout exceeded its progress deadline", detail)
+	}
+
+	if unhealthy && !rollingShortfall && (immediate || r.unhealthyDebounceElapsed(dm)) {
 		return r.rollbackToPrevious(ctx, dm, eng, stable, p, detail)
 	}
 
 	if elapsed >= window {
+		// Window elapsed.
+		if rollingShortfall {
+			// The stable is below quorum only because it is mid-rollout, not
+			// because the model is unhealthy. Do NOT roll back and do NOT announce
+			// Stabilized (which would let GC collect the rollback target while the
+			// new stable is not yet proven healthy). Extend the window: keep the
+			// previous revision and requeue. A stuck rollout is still bounded —
+			// progressDeadline turns it into rolloutDeadlineExceeded above, which
+			// rolls back.
+			r.markStableRolling(dm, window, detail)
+			return stabilizationResult{}
+		}
+		if unhealthy {
+			// Unhealthy at the boundary for a non-rollout reason (e.g. a quorum
+			// shortfall with no rollout in flight): the window has no more time to
+			// give the new stable, so roll back now rather than serve below quorum.
+			return r.rollbackToPrevious(ctx, dm, eng, stable, p, detail)
+		}
 		// Window passed healthy: announce stabilization once, drop the condition,
 		// and let gcRevisions (called next on the stable path) collect the
 		// previous revision.
@@ -83,17 +121,21 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 		return stabilizationResult{}
 	}
 
-	// Still in the window. Record Stabilizing: True (watching) when healthy, False
-	// (PostPromotionUnhealthy) when unhealthy-but-not-yet-past-debounce — its
-	// LastTransitionTime is the idempotent debounce clock.
-	if unhealthy {
+	// Still in the window. Record Stabilizing: True (watching, or StableRolling
+	// while a rollout masks the shortfall) when healthy-enough; False
+	// (PostPromotionUnhealthy) when a genuine shortfall is debouncing toward a
+	// rollback — its LastTransitionTime is the idempotent debounce clock.
+	switch {
+	case rollingShortfall:
+		r.markStableRolling(dm, window, detail)
+	case unhealthy:
 		setStatusCondition(dm, metav1.Condition{
 			Type:    decisionmodelv1alpha1.ConditionStabilizing,
 			Status:  metav1.ConditionFalse,
 			Reason:  reasonPostPromotionUnhealthy,
 			Message: detail,
 		})
-	} else {
+	default:
 		setStatusCondition(dm, metav1.Condition{
 			Type:    decisionmodelv1alpha1.ConditionStabilizing,
 			Status:  metav1.ConditionTrue,
@@ -102,6 +144,101 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 		})
 	}
 	return stabilizationResult{}
+}
+
+// markStableRolling sets Stabilizing=True/StableRolling, explaining that the
+// quorum shortfall is being ignored because the stable Deployment is mid-rollout.
+// It clears any prior PostPromotionUnhealthy debounce so a rollout that starts
+// after a brief dip does not inherit a stale clock.
+func (r *DecisionModelReconciler) markStableRolling(
+	dm *decisionmodelv1alpha1.DecisionModel, window time.Duration, detail string,
+) {
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionStabilizing,
+		Status:  metav1.ConditionTrue,
+		Reason:  reasonStableRolling,
+		Message: fmt.Sprintf("stable rollout in progress (%s); not counting the quorum shortfall as a failure during the %s window", detail, window),
+	})
+}
+
+// rolloutState classifies the stable Deployment's rollout progress.
+type rolloutState int
+
+const (
+	rolloutIdle             rolloutState = iota // fully rolled out (or Deployment absent)
+	rolloutInProgress                           // a template/scale change is still being applied
+	rolloutDeadlineExceeded                     // Progressing=False, ProgressDeadlineExceeded
+)
+
+// stableRolloutState reads the stable serving Deployment and reports whether it
+// is mid-rollout, has exceeded its progress deadline, or is idle. It is a
+// best-effort signal: a Deployment that cannot be read (missing, or a lookup
+// error) is treated as rolloutIdle so a genuine health shortfall is never masked
+// by a read failure.
+//
+// "In progress" means the Deployment controller is actively applying a change,
+// NOT merely "fewer Pods are available than desired" (which is true of every
+// quorum shortfall, including a new stable whose Pods never become ready). The
+// signals are the ones the deployment controller sets on the Progressing
+// condition (k8s pkg/controller/deployment/util/deployment_util.go):
+//   - generation != status.observedGeneration — the latest spec change (template
+//     or replicas) is not yet observed; or
+//   - Progressing=True with a reason OTHER than NewReplicaSetAvailable, i.e.
+//     NewReplicaSetCreated / FoundNewReplicaSet / ReplicaSetUpdated — a rollout
+//     is underway. A completed rollout settles to Progressing=True,
+//     NewReplicaSetAvailable and stays there even if Pods later go unready, so a
+//     post-rollout health failure is correctly NOT classified as "rolling".
+//   - Progressing=False, ProgressDeadlineExceeded — the rollout is stuck; a
+//     failure, so protection is bounded.
+func (r *DecisionModelReconciler) stableRolloutState(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+) rolloutState {
+	var dep appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: revisionName(dm, stable.Hash)}, &dep); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).V(1).Info("stabilization: could not read stable Deployment", "error", err)
+		}
+		return rolloutIdle
+	}
+	if c := metav1.GetControllerOf(&dep); c == nil || c.UID != dm.UID {
+		return rolloutIdle // not ours; do not infer rollout state from it
+	}
+	progressing := findDeploymentCondition(&dep, appsv1.DeploymentProgressing)
+	if progressing != nil &&
+		progressing.Status == corev1.ConditionFalse && progressing.Reason == deployTimedOutReason {
+		return rolloutDeadlineExceeded
+	}
+	// The spec change has not been observed yet: definitely rolling.
+	if dep.Generation != dep.Status.ObservedGeneration {
+		return rolloutInProgress
+	}
+	// A rollout is underway while Progressing=True for any reason other than the
+	// terminal NewReplicaSetAvailable. Do NOT use availableReplicas/updatedReplicas:
+	// those are below spec for every quorum shortfall, not just a rollout.
+	if progressing != nil && progressing.Status == corev1.ConditionTrue &&
+		progressing.Reason != deployNewRSAvailableReason {
+		return rolloutInProgress
+	}
+	return rolloutIdle
+}
+
+// Deployment Progressing-condition reasons set by the k8s deployment controller.
+const (
+	deployNewRSAvailableReason = "NewReplicaSetAvailable" // rollout complete
+	deployTimedOutReason       = "ProgressDeadlineExceeded"
+)
+
+// findDeploymentCondition returns the Deployment condition of the given type, or
+// nil.
+func findDeploymentCondition(dep *appsv1.Deployment, t appsv1.DeploymentConditionType) *appsv1.DeploymentCondition {
+	for i := range dep.Status.Conditions {
+		if dep.Status.Conditions[i].Type == t {
+			return &dep.Status.Conditions[i]
+		}
+	}
+	return nil
 }
 
 // unhealthyDebounceElapsed reports whether the Stabilizing condition has been

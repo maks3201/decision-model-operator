@@ -154,6 +154,11 @@ const (
 	reasonStabilizing               = "Stabilizing"
 	reasonStabilized                = "Stabilized"
 	reasonPostPromotionUnhealthy    = "PostPromotionUnhealthy"
+	// reasonStableRolling marks the Stabilizing condition True while a quorum
+	// shortfall is being ignored because the stable Deployment is mid-rollout (an
+	// intentional in-place change: replicas scale-up, API-key rotation, scheduling
+	// or a manual restart), not a model-health failure.
+	reasonStableRolling = "StableRolling"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a

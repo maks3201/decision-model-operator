@@ -160,10 +160,11 @@ func (r *DecisionModelReconciler) gcStaleByRevision(
 }
 
 // gcLegacyStore deletes the legacy shared <dm>-store PVC once no live Deployment
-// of this DM still mounts it (legacy store migration). It re-lists Deployments so a
-// Deployment just deleted earlier in the same gcRevisions pass is not counted as
-// a live reference. It is a no-op when the PVC does not exist or is still
-// referenced.
+// of this DM still mounts it (legacy store migration). It refuses to delete the
+// claim the current stable resolves to, and reads Deployments through the
+// uncached APIReader so a Deployment just (re)created in this same reconcile is
+// seen as a live reference. It is a no-op when the PVC does not exist, is not
+// ours, or is still referenced.
 func (r *DecisionModelReconciler) gcLegacyStore(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -182,8 +183,25 @@ func (r *DecisionModelReconciler) gcLegacyStore(
 	if !ownedBy(pvc, dm) {
 		return nil
 	}
+	// Authoritative guard: never delete the claim the CURRENT stable mounts,
+	// independent of any List. storeClaimForStable is the same resolver the stable
+	// path uses, so if the stable (still) resolves to the legacy shared store this
+	// PVC is in use even when the cache has not yet observed a just-recreated
+	// Deployment. This closes the race where the Deployment is deleted out of
+	// band, re-created in this reconcile, and the cached List below has not caught
+	// up — which previously deleted the populated legacy store under the stable.
+	if stable := dm.Status.StableRevision; stable != nil {
+		if claim, _ := r.storeClaimForStable(ctx, dm, stable); claim == legacy {
+			return nil
+		}
+	}
+	// Secondary live-reference check through the UNCACHED APIReader so a
+	// Deployment created earlier in this same reconcile is visible (the manager
+	// cache can lag its own write). The extra uncached List is bounded: it runs
+	// only when the legacy shared PVC still exists, i.e. during migration of a
+	// pre-per-revision stable — rare and transient, not on the steady-state path.
 	var deps appsv1.DeploymentList
-	if err := r.List(ctx, &deps, client.InNamespace(dm.Namespace),
+	if err := r.APIReader.List(ctx, &deps, client.InNamespace(dm.Namespace),
 		client.MatchingLabels{decisionmodelv1alpha1.LabelName: dm.Name}); err != nil {
 		return err
 	}
