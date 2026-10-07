@@ -69,7 +69,8 @@ jobs:
 
   # The !nightly suite is split into parallel shards by Ginkgo Describe label so
   # the slow serial kustomize leg (every spec loads a model) runs in parallel
-  # instead of one ~16-minute job. Each shard gets its own kind cluster. The helm
+  # instead of one ~16-minute job. Each shard gets its own kind cluster: the
+  # kustomize containers split into lifecycle, mirror, eval and auth; the helm
   # shard runs only the lifecycle container (the Go suite Skips the rest on helm).
   # The full serial suite still runs nightly (test-e2e-nightly.yml) to catch
   # cross-spec interactions a split can hide.
@@ -91,12 +92,20 @@ jobs:
       matrix:
         include:
           # kustomize shards: the !nightly containers split by label. Sum of
-          # labels == the full !nightly kustomize set (lifecycle+mirror, eval, auth).
-          - name: kind (kustomize lifecycle+mirror, CPU, laya:en)
+          # labels == the full !nightly kustomize set (lifecycle, mirror, eval, auth).
+          - name: kind (kustomize lifecycle, CPU, laya:en)
             install: kustomize
-            label: "!nightly && (lifecycle || mirror)"
-            mirror: "1"
+            label: "!nightly && lifecycle"
+            mirror: ""
             cluster: dmo-e2e-life
+            free_disk: "false"
+          # The mirror spec builds an extra ~0.85 GiB image and loads a second copy
+          # of the model, so it runs alone on its own shard with the free-disk step.
+          - name: kind (kustomize mirror, CPU, laya:en)
+            install: kustomize
+            label: "!nightly && mirror"
+            mirror: "1"
+            cluster: dmo-e2e-mirror
             free_disk: "true"
           - name: kind (kustomize eval, CPU, laya:en)
             install: kustomize

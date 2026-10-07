@@ -14,7 +14,8 @@ make test-e2e E2E_LABEL_FILTER='!nightly'
 # One shard / one container while iterating (fast):
 make test-e2e E2E_LABEL_FILTER='!nightly && eval'      KIND_CLUSTER=dmo-e2e-eval
 make test-e2e E2E_LABEL_FILTER='!nightly && auth'      KIND_CLUSTER=dmo-e2e-auth
-make test-e2e E2E_LABEL_FILTER='!nightly && (lifecycle || mirror)' E2E_MIRROR=1 KIND_CLUSTER=dmo-e2e-life
+make test-e2e E2E_LABEL_FILTER='!nightly && lifecycle' KIND_CLUSTER=dmo-e2e-life
+make test-e2e E2E_LABEL_FILTER='!nightly && mirror' E2E_MIRROR=1 KIND_CLUSTER=dmo-e2e-mirror
 ```
 
 `make test-e2e` leaves the cluster **down** afterwards. Run one cluster at a time on a laptop

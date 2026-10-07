@@ -37,10 +37,12 @@
 #                   minimum supported version, chosen so it differs from the stable's
 #                   current runtime and therefore forces exactly one blue-green roll)
 #   KEEP_CLUSTER    non-empty: do not delete the kind cluster on exit (debugging)
+#   GITHUB_TOKEN    optional; authenticates the releases-API tag lookup (CI sets it)
 #
 # Requires: kind, kubectl, docker, helm, make, curl, jq. The released chart and
-# operator image are public, so no GitHub token is needed. Run from anywhere; the
-# script cd's to the repo root.
+# operator image are public, so no GitHub token is needed to pull them; GITHUB_TOKEN
+# is used only to authenticate the releases-API tag lookup when set (optional).
+# Run from anywhere; the script cd's to the repo root.
 set -euo pipefail
 
 REPO="${REPO:-maks3201/decision-model-operator}"
@@ -75,13 +77,23 @@ note() { echo "=== $* ==="; }
 fail() { echo "FAIL: $*" >&2; kc get decisionmodel,deploy,pod -n "${NS}" -o wide >&2 || true; exit 1; }
 
 # from-version: explicit arg or the latest GitHub release tag (strip a leading 'v').
-# Resolve via the public releases API with curl (no auth needed; the repo is public),
-# so this works both in CI and locally without touching any GitHub token.
+# Resolve via the public releases API with curl. The repo is public, so no auth is
+# required to read it, but an unauthenticated call shares the low 60/h IP rate limit
+# and has flaked in CI; when GITHUB_TOKEN is set (CI) the call is authenticated to
+# use the much higher per-token limit. One retry absorbs a transient blip. Works
+# locally with or without a token.
 from_arg="${1:-}"
 if [[ -z "${from_arg}" ]]; then
-  from_arg="$(curl -sS --proto '=https' --tlsv1.2 \
-    "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-    | jq -r '.tag_name // empty')"
+  releases_url="https://api.github.com/repos/${REPO}/releases/latest"
+  auth_header=()
+  [[ -n "${GITHUB_TOKEN:-}" ]] && auth_header=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  for attempt in 1 2; do
+    from_arg="$(curl -sS --proto '=https' --tlsv1.2 \
+      -H "Accept: application/vnd.github+json" "${auth_header[@]}" \
+      "${releases_url}" 2>/dev/null | jq -r '.tag_name // empty')"
+    [[ -n "${from_arg}" ]] && break
+    [[ "${attempt}" = 1 ]] && { note "release lookup failed, retrying in 5s"; sleep 5; }
+  done
   [[ -n "${from_arg}" ]] || fail "could not resolve the latest release tag; pass one explicitly"
 fi
 from_ver="${from_arg#v}"
