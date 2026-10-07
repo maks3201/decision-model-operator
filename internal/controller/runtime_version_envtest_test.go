@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -234,6 +235,102 @@ var _ = Describe("runtime version and rollout budget", func() {
 		revB := RevisionHash(getDM("b").Spec, defaultDigest, fakeImage)
 		driveReady(r, "b", revB)
 		Expect(getDM("b").Status.StableRevision.Hash).To(Equal(revB))
+	})
+
+	// Race-free admission: many DecisionModels reconciled concurrently through one
+	// reconciler (as the manager does with MaxConcurrentReconciles > 1) must admit
+	// exactly --max-concurrent-rollouts of them; the rest queue. Without the
+	// serialized count+decide+reserve they would all see active=0 and all admit.
+	admittedCount := func(names []string) int {
+		n := 0
+		for _, nm := range names {
+			if getDM(nm).Status.CandidateRevision != nil {
+				n++
+			}
+		}
+		return n
+	}
+	raceAdmit := func(count int) {
+		r := newR(RuntimeVersionPinned, 1)
+		names := make([]string, count)
+		for i := 0; i < count; i++ {
+			names[i] = fmt.Sprintf("race%d-%d", count, i)
+			createDM(names[i], nil)
+		}
+		var wg sync.WaitGroup
+		for _, nm := range names {
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
+			}(nm)
+		}
+		wg.Wait()
+		// Exactly one admitted this wave; a second reconcile of each must not
+		// admit more while the first still holds the only slot.
+		for _, nm := range names {
+			_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: nm}})
+		}
+		Expect(admittedCount(names)).To(Equal(1), "exactly one rollout admitted under max 1")
+	}
+
+	It("admits exactly one of two concurrently reconciled rollouts", func() {
+		raceAdmit(2)
+	})
+
+	It("admits exactly one of five concurrently reconciled rollouts", func() {
+		raceAdmit(5)
+	})
+
+	// A queued rollout must not allocate: no per-revision PVC and no prefetch Job
+	// while it waits; both appear once the slot frees.
+	It("creates no PVC or prefetch Job for a queued rollout until it is admitted", func() {
+		r := newR(RuntimeVersionPinned, 1)
+		createDM("q-a", nil)
+		createDM("q-b", nil)
+		revA := RevisionHash(getDM("q-a").Spec, defaultDigest, fakeImage)
+
+		rec(r, "q-a") // admitted -> has a candidate (and its PVC)
+		Expect(getDM("q-a").Status.CandidateRevision).NotTo(BeNil())
+		rec(r, "q-b") // queued
+		Expect(getDM("q-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending))
+
+		revB := RevisionHash(getDM("q-b").Spec, defaultDigest, fakeImage)
+		pvcB := types.NamespacedName{Namespace: namespace, Name: "q-b-store-" + revB}
+		jobB := types.NamespacedName{Namespace: namespace, Name: "q-b-prefetch-" + revB}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, pvcB, &corev1.PersistentVolumeClaim{}))).
+			To(BeTrue(), "queued rollout provisions no store PVC")
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, jobB, &batchv1.Job{}))).
+			To(BeTrue(), "queued rollout starts no prefetch Job")
+
+		// Free the slot by finishing A; B is then admitted and gets both.
+		driveReady(r, "q-a", revA)
+		rec(r, "q-b")
+		Expect(getDM("q-b").Status.CandidateRevision).NotTo(BeNil())
+		Expect(k8sClient.Get(ctx, pvcB, &corev1.PersistentVolumeClaim{})).To(Succeed(), "admitted rollout gets its PVC")
+		rec(r, "q-b")
+		Expect(k8sClient.Get(ctx, jobB, &batchv1.Job{})).To(Succeed(), "admitted rollout gets its prefetch Job")
+	})
+
+	// The in-memory reservation is released when the DM is deleted, so a leaked
+	// slot cannot block the fleet after a rollout's owner disappears.
+	It("releases the reservation when the DM is deleted", func() {
+		r := newR(RuntimeVersionPinned, 1)
+		createDM("rel-a", nil)
+		createDM("rel-b", nil)
+		rec(r, "rel-a")
+		Expect(getDM("rel-a").Status.CandidateRevision).NotTo(BeNil())
+		// Delete A before its candidate ever became visible would leak a slot; here
+		// A is visible, so its slot is held by candidateRevision. Delete A entirely.
+		Expect(k8sClient.Delete(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rel-a"}})).To(Succeed())
+		// Reconcile A (now NotFound) -> releaseReservation runs; then B is admitted.
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "rel-a"}})
+		Eventually(func() *decisionmodelv1alpha1.RevisionStatus {
+			rec(r, "rel-b")
+			return getDM("rel-b").Status.CandidateRevision
+		}, "5s", "50ms").ShouldNot(BeNil(), "the freed slot admits the queued rollout")
 	})
 
 	It("does not queue when the budget is unlimited (0)", func() {
