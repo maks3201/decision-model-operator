@@ -167,6 +167,66 @@
     "installCRDs": {
       "type": "boolean",
       "description": "Install the CRD via Helm's crds/ dir."
+    },
+    "prometheusRule": {
+      "type": "object",
+      "description": "Prometheus alerting rules (PrometheusRule CR; requires the Prometheus Operator).",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Create a PrometheusRule with the operator's alerting rules."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Namespace for the PrometheusRule (empty = release namespace)."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Extra labels on the PrometheusRule (e.g. the release label your Prometheus selects on).",
+          "additionalProperties": { "type": "string" }
+        },
+        "runbookUrl": {
+          "type": "string",
+          "description": "Base URL prepended to each alert's runbook_url annotation. When set, must be an http:// or https:// URL.",
+          "pattern": "^$|^https?://"
+        },
+        "windows": {
+          "type": "object",
+          "description": "Per-alert 'for' windows (Prometheus duration strings, e.g. 15m).",
+          "additionalProperties": false,
+          "properties": {
+            "rolloutStuck": { "type": "string", "minLength": 1 },
+            "degraded": { "type": "string", "minLength": 1 },
+            "candidateTimeout": { "type": "string", "minLength": 1 },
+            "operatorDown": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "grafanaDashboard": {
+      "type": "object",
+      "description": "Grafana dashboard shipped as a sidecar-discovered ConfigMap.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Create a ConfigMap holding the operator Grafana dashboard (labelled grafana_dashboard: \"1\")."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Namespace for the dashboard ConfigMap (empty = release namespace)."
+        },
+        "labels": {
+          "type": "object",
+          "description": "Extra labels on the dashboard ConfigMap (the sidecar label grafana_dashboard: \"1\" is always added).",
+          "additionalProperties": { "type": "string" }
+        },
+        "folder": {
+          "type": "string",
+          "description": "Grafana sidecar target-directory annotation; empty = sidecar default."
+        }
+      }
     }
   }
 }

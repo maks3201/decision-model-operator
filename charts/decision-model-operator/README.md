@@ -194,11 +194,25 @@ See
 [GPU CI](https://maks3201.github.io/decision-model-operator/gpu-ci/) for a
 GPU-enabled kind setup and the Pascal/Volta `:cuda12` note.
 
-### Metrics
+### Metrics, alerts and dashboard
 
 `metrics.enabled` (default `true`) exposes controller-runtime metrics on
 `:8443`/HTTPS and creates a metrics Service. The chart does not ship a Prometheus
-`ServiceMonitor`; scrape the Service with your monitoring stack. See
+`ServiceMonitor`; scrape the Service with your monitoring stack.
+
+Optional (both default **off**): `prometheusRule.enabled` ships a `PrometheusRule`
+with symptom-based alerts (each links a runbook under `docs/runbooks/`), and
+`grafanaDashboard.enabled` ships the operator dashboard as a sidecar-discovered
+ConfigMap (`grafana_dashboard: "1"`):
+
+```sh
+helm upgrade dmo ... \
+  --set prometheusRule.enabled=true \
+  --set prometheusRule.labels.release=kube-prometheus-stack \
+  --set grafanaDashboard.enabled=true
+```
+
+The rules alert only on metrics the operator actually exports. See
 [metrics](https://maks3201.github.io/decision-model-operator/metrics/).
 
 ## Verify the chart
@@ -345,4 +359,13 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | proxy.noProxy | string | `""` | `NO_PROXY` for the manager (and the prefetch Job). Set the service CIDR and `.svc,.cluster.local` so the operator's registry/API-server calls go direct, not via the proxy. The pod CIDR is NOT needed: the readiness prober and evaluator reach serving Pod IPs with a separate proxy-less client (the API-key header never traverses the proxy), so readiness does not depend on this value. Example: `10.96.0.0/12,.svc,.cluster.local`. Empty = not set. |
 | proxy.existingSecret | string | `""` | Name of an existing Secret to source the proxy URLs from (keys `httpProxy` / `httpsProxy` / `noProxy`, each optional) instead of the plaintext values above — use this when a proxy URL carries credentials. When set, the plaintext `proxy.httpProxy/httpsProxy/noProxy` values are ignored and the env is rendered with `valueFrom.secretKeyRef` (`optional: true` per key). This only keeps the credential out of the Helm values: a **credentialed** proxy URL is used by the operator for its own registry lookups but is NOT passed to the prefetch Jobs (a Job spec is readable by anyone with `get jobs` in that namespace), and the chart cannot change that. For the Job's egress use an IP-allowlisted or node-level proxy that needs no credentials. `NO_PROXY` is always passed. Empty = use the plaintext values. |
 | installCRDs | bool | `true` | Install the CRD via Helm's `crds/` dir. Set false to manage the CRD out of band. NOTE: Helm never upgrades or deletes CRDs in `crds/` (see the CRD upgrade caveat in this README). |
+| prometheusRule.enabled | bool | `false` | Create a `PrometheusRule` with the operator's alerting rules. Requires the Prometheus Operator CRDs. |
+| prometheusRule.namespace | string | `""` | Namespace for the `PrometheusRule` (empty = release namespace). |
+| prometheusRule.labels | object | `{}` | Extra labels on the `PrometheusRule` (e.g. the `release:` label your Prometheus selects on). |
+| prometheusRule.runbookUrl | string | `"https://github.com/maks3201/decision-model-operator/blob/main/docs/runbooks"` | Base URL prepended to each alert's `runbook_url` annotation (points at the docs site or your fork). |
+| prometheusRule.windows | object | `{"candidateTimeout":"20m","degraded":"10m","operatorDown":"5m","rolloutStuck":"15m"}` | Per-alert `for` windows (how long the symptom must hold before firing). |
+| grafanaDashboard.enabled | bool | `false` | Create a ConfigMap holding the operator Grafana dashboard, labelled for the Grafana sidecar to auto-import. |
+| grafanaDashboard.namespace | string | `""` | Namespace for the dashboard ConfigMap (empty = release namespace; set to where the Grafana sidecar watches). |
+| grafanaDashboard.labels | object | `{}` | Extra labels on the dashboard ConfigMap (the sidecar label `grafana_dashboard: "1"` is always added). |
+| grafanaDashboard.folder | string | `""` | Value of the Grafana sidecar folder annotation (`k8s-sidecar-target-directory`); empty = the sidecar default. |
 

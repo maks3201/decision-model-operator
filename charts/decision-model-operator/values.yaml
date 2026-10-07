@@ -84,3 +84,34 @@ proxy:
 
 # -- Install the CRD via Helm's `crds/` dir. Set false to manage the CRD out of band. NOTE: Helm never upgrades or deletes CRDs in `crds/` (see the CRD upgrade caveat in this README).
 installCRDs: true
+
+# Prometheus alerting rules (PrometheusRule CR, requires the Prometheus Operator).
+# Disabled by default. Alerts fire only on metrics the operator exports today
+# (see docs/metrics.md); each links a runbook under docs/runbooks/.
+prometheusRule:
+  # -- Create a `PrometheusRule` with the operator's alerting rules. Requires the Prometheus Operator CRDs.
+  enabled: false
+  # -- Namespace for the `PrometheusRule` (empty = release namespace).
+  namespace: ""
+  # -- Extra labels on the `PrometheusRule` (e.g. the `release:` label your Prometheus selects on).
+  labels: {}
+  # -- Base URL prepended to each alert's `runbook_url` annotation (points at the docs site or your fork).
+  runbookUrl: "https://github.com/maks3201/decision-model-operator/blob/main/docs/runbooks"
+  # -- Per-alert `for` windows (how long the symptom must hold before firing).
+  windows:
+    rolloutStuck: 15m
+    degraded: 10m
+    candidateTimeout: 20m
+    operatorDown: 5m
+
+# Grafana dashboard shipped as a sidecar-discovered ConfigMap (the Grafana
+# `grafana_dashboard: "1"` label). Disabled by default.
+grafanaDashboard:
+  # -- Create a ConfigMap holding the operator Grafana dashboard, labelled for the Grafana sidecar to auto-import.
+  enabled: false
+  # -- Namespace for the dashboard ConfigMap (empty = release namespace; set to where the Grafana sidecar watches).
+  namespace: ""
+  # -- Extra labels on the dashboard ConfigMap (the sidecar label `grafana_dashboard: "1"` is always added).
+  labels: {}
+  # -- Value of the Grafana sidecar folder annotation (`k8s-sidecar-target-directory`); empty = the sidecar default.
+  folder: ""

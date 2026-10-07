@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -125,12 +126,28 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 	cond := func(name, t string) *metav1.Condition {
 		return meta.FindStatusCondition(getDM(name).Status.Conditions, t)
 	}
+	// countEvents drains the reconciler's recorder and counts events containing substr.
+	countEvents := func(r *DecisionModelReconciler, substr string) int {
+		fr := r.Recorder.(*events.FakeRecorder)
+		n := 0
+		for {
+			select {
+			case e := <-fr.Events:
+				if strings.Contains(e, substr) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
 
 	// assertStableMaintained: delete the stable Pod, reconcile, and assert the
 	// operator recreates it and gates it True (serving/repair continues), the
-	// phase stays Ready and Ready=True, while the given candidate-failure
-	// condition is surfaced.
-	assertStableMaintained := func(r *DecisionModelReconciler, name, revA, failCondType, failReason string) {
+	// phase stays Ready and Ready=True, while the candidate failure is surfaced on
+	// the Resolved condition (never on Degraded, which the stable path owns) and
+	// nothing is marked failed.
+	assertStableMaintained := func(r *DecisionModelReconciler, name, revA, failReason string) {
 		// The stable Pod is deleted (e.g. node drain). Maintenance must recreate it.
 		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name + "-a"}})).To(Succeed())
 		Eventually(func() bool {
@@ -152,13 +169,14 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		ready := cond(name, decisionmodelv1alpha1.ConditionReady)
 		Expect(ready).NotTo(BeNil())
 		Expect(ready.Status).To(Equal(metav1.ConditionTrue), "Ready=True while the stable is model-ready")
-		// The candidate failure is surfaced (never fails the object).
-		fc := cond(name, failCondType)
-		Expect(fc).NotTo(BeNil())
-		if failCondType == decisionmodelv1alpha1.ConditionResolved {
-			Expect(fc.Status).To(Equal(metav1.ConditionFalse))
-		}
-		Expect(cond(name, decisionmodelv1alpha1.ConditionDegraded).Reason).To(Equal(failReason))
+		// The candidate failure is surfaced on Resolved (never fails the object),
+		// and Degraded stays owned by the stable path (healthy here).
+		rc := cond(name, decisionmodelv1alpha1.ConditionResolved)
+		Expect(rc).NotTo(BeNil())
+		Expect(rc.Status).To(Equal(metav1.ConditionFalse))
+		Expect(rc.Reason).To(Equal(failReason))
+		deg := cond(name, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg.Status).To(Equal(metav1.ConditionFalse), "Degraded stays owned by the stable path")
 		Expect(getDM(name).Status.FailedRevision).To(BeNil(), "nothing is marked failed while a stable serves")
 	}
 
@@ -179,7 +197,7 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 			dm.Spec.Model = "laya:does-not-exist"
 		})).To(Succeed())
 
-		assertStableMaintained(r, "missing", revA, decisionmodelv1alpha1.ConditionResolved, reasonModelNotFound)
+		assertStableMaintained(r, "missing", revA, reasonModelNotFound)
 		Expect(cond("missing", decisionmodelv1alpha1.ConditionResolved).Reason).To(Equal(reasonModelNotFound))
 
 		// Fix the spec: a valid model resolves and a normal candidate starts.
@@ -200,7 +218,7 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		Expect(updateDM(ctx, namespace, "registry", func(dm *decisionmodelv1alpha1.DecisionModel) {
 			dm.Spec.Model = "evil.example.com/laya:en"
 		})).To(Succeed())
-		assertStableMaintained(r, "registry", revA, decisionmodelv1alpha1.ConditionReady, reasonRegistryNotAllowed)
+		assertStableMaintained(r, "registry", revA, reasonRegistryNotAllowed)
 	})
 
 	It("keeps serving the stable when spec.runtimeVersion is invalid", func() {
@@ -208,7 +226,7 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		Expect(updateDM(ctx, namespace, "rtver", func(dm *decisionmodelv1alpha1.DecisionModel) {
 			dm.Spec.RuntimeVersion = "0.0.1" // below the engine minimum -> invalid
 		})).To(Succeed())
-		assertStableMaintained(r, "rtver", revA, decisionmodelv1alpha1.ConditionReady, reasonInvalidRuntimeVersion)
+		assertStableMaintained(r, "rtver", revA, reasonInvalidRuntimeVersion)
 	})
 
 	It("still fails when the model tag is missing and there is NO stable", func() {
@@ -247,5 +265,175 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		Expect(rc).NotTo(BeNil())
 		Expect(rc.Status).To(Equal(metav1.ConditionFalse))
 		Expect(rc.Reason).To(Equal(reasonResolveFailed))
+		// A transient blip must not mark the DM Degraded and must stay quiet.
+		Expect(cond("transient", decisionmodelv1alpha1.ConditionDegraded).Status).To(Equal(metav1.ConditionFalse))
+		Expect(countEvents(r, eventCandidateRejected)).To(BeZero(), "a transient resolve blip emits no Warning")
+	})
+
+	It("emits one rejection Event across many reconciles with the same bad spec", func() {
+		r, fake, _, _ := stable("spam", nil)
+		fake.mu.Lock()
+		fake.resolveErr = engine.ErrNotFound
+		fake.mu.Unlock()
+		Expect(updateDM(ctx, namespace, "spam", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Model = "laya:does-not-exist"
+		})).To(Succeed())
+		_ = countEvents(r, "") // drain any setup events
+		for i := 0; i < 5; i++ {
+			reconcile1(r, "spam")
+		}
+		Expect(countEvents(r, eventCandidateRejected)).To(Equal(1), "one Event per transition, not per reconcile")
+	})
+
+	It("keeps a stable-side Degraded reason visible when both a stable problem and a bad candidate exist", func() {
+		// replicas 2 on an RWO store -> CacheNotShareable (a stable-side Degraded).
+		fake := newFakeEngine()
+		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := newR(fake, pr, nil)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "both"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(2),
+				Cache: &decisionmodelv1alpha1.CacheSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+			},
+		})).To(Succeed())
+		reconcile1(r, "both")
+		revA := RevisionHash(getDM("both").Spec, defaultDigest, fakeImage)
+		pr.set(revA, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		markJobComplete("both", revA)
+		reconcile1(r, "both")
+		mkGatedPod("both", revA, "both-a")
+		Eventually(func() string {
+			reconcile1(r, "both")
+			d := cond("both", decisionmodelv1alpha1.ConditionDegraded)
+			if d == nil {
+				return ""
+			}
+			return d.Reason
+		}, "5s", "20ms").Should(Equal(reasonCacheNotShareable), "stable-side Degraded set")
+
+		// Now also break the candidate spec: the stable-side Degraded must stay.
+		fake.mu.Lock()
+		fake.resolveErr = engine.ErrNotFound
+		fake.mu.Unlock()
+		Expect(updateDM(ctx, namespace, "both", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Model = "laya:does-not-exist"
+		})).To(Succeed())
+		reconcile1(r, "both")
+		Expect(cond("both", decisionmodelv1alpha1.ConditionDegraded).Reason).
+			To(Equal(reasonCacheNotShareable), "stable-side Degraded is not overwritten by the candidate reason")
+		Expect(cond("both", decisionmodelv1alpha1.ConditionResolved).Reason).
+			To(Equal(reasonModelNotFound), "the candidate failure is on Resolved")
+	})
+
+	It("does not roll the stable when its API-key Secret becomes unreadable", func() {
+		fake := newFakeEngine()
+		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := newR(fake, pr, nil)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "key", Labels: map[string]string{decisionmodelv1alpha1.LabelAPIKey: "true"}},
+			Data:       map[string][]byte{"token": []byte("s3cr3t")},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "keyroll"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+				Auth: &decisionmodelv1alpha1.AuthSpec{APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "key"}, Key: "token",
+				}},
+			},
+		})).To(Succeed())
+		reconcile1(r, "keyroll")
+		revA := RevisionHash(getDM("keyroll").Spec, defaultDigest, fakeImage)
+		pr.set(revA, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		markJobComplete("keyroll", revA)
+		reconcile1(r, "keyroll")
+		mkGatedPod("keyroll", revA, "keyroll-a")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			reconcile1(r, "keyroll")
+			return getDM("keyroll").Status.Phase
+		},
+			"5s", "20ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+
+		// Capture the stable Deployment's Pod template, then make the Secret
+		// unreadable (lose its capability label) AND break the candidate model.
+		depBefore := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "keyroll-" + revA}, depBefore)).To(Succeed())
+		tmplBefore := depBefore.Spec.Template.DeepCopy()
+
+		Expect(func() error {
+			s := &corev1.Secret{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "key"}, s); err != nil {
+				return err
+			}
+			s.Labels = map[string]string{} // drop the api-key label -> unreadable
+			return k8sClient.Update(ctx, s)
+		}()).To(Succeed())
+		fake.mu.Lock()
+		fake.resolveErr = engine.ErrNotFound
+		fake.mu.Unlock()
+		Expect(updateDM(ctx, namespace, "keyroll", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Model = "laya:does-not-exist"
+		})).To(Succeed())
+
+		reconcile1(r, "keyroll")
+		depAfter := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "keyroll-" + revA}, depAfter)).To(Succeed())
+		Expect(depAfter.Spec.Template).To(Equal(*tmplBefore), "the stable Pod template is unchanged (no roll) when the key is unreadable")
+		// The already-gated Pod stays gated.
+		p := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "keyroll-a"}, p)).To(Succeed())
+		var gated bool
+		for _, c := range p.Status.Conditions {
+			if string(c.Type) == decisionmodelv1alpha1.ModelReadyGate && c.Status == corev1.ConditionTrue {
+				gated = true
+			}
+		}
+		Expect(gated).To(BeTrue(), "already-gated stable Pod stays gated")
+	})
+
+	It("abandons a superseded in-flight candidate when the spec changes to a bad model", func() {
+		r, fake, _, _ := stable("supersede", nil)
+		// Start a valid candidate (new digest) and get it in flight (Caching).
+		fake.mu.Lock()
+		fake.digest = "d0d0290000000000000000000000000000000000000000000000000000000000"
+		fake.mu.Unlock()
+		Expect(updateDM(ctx, namespace, "supersede", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Model = "kev:en"
+		})).To(Succeed())
+		reconcile1(r, "supersede")
+		candA := getDM("supersede").Status.CandidateRevision
+		Expect(candA).NotTo(BeNil(), "a candidate is in flight")
+		// Its per-revision PVC exists (allocates a volume).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: storeNameRev(getDM("supersede"), candA.Hash)}, &corev1.PersistentVolumeClaim{})).To(Succeed())
+
+		// Now edit the spec to a model that cannot resolve.
+		fake.mu.Lock()
+		fake.resolveErr = engine.ErrNotFound
+		fake.mu.Unlock()
+		Expect(updateDM(ctx, namespace, "supersede", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.Model = "laya:does-not-exist"
+		})).To(Succeed())
+		reconcile1(r, "supersede")
+
+		// The superseded candidate is abandoned: candidateRevision cleared and its
+		// workloads GCed; a CandidateSuperseded Event is emitted.
+		Expect(getDM("supersede").Status.CandidateRevision).To(BeNil(), "superseded candidate abandoned")
+		Expect(countEvents(r, eventCandidateSuperseded)).To(BeNumerically(">=", 1))
+		// The candidate Deployment is collected (Deployment deletion is reliable in
+		// envtest; PVC deletion is not, as the pvc-protection finalizer lingers
+		// without the kube-controller-manager, so assert the Delete was issued via
+		// a deletionTimestamp instead).
+		Eventually(func() bool {
+			reconcile1(r, "supersede")
+			return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "supersede-" + candA.Hash}, &appsv1.Deployment{}))
+		}, "5s", "50ms").Should(BeTrue(), "the abandoned candidate's Deployment is collected")
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: storeNameRev(getDM("supersede"), candA.Hash)}, pvc); err == nil {
+			Expect(pvc.DeletionTimestamp).NotTo(BeNil(), "the abandoned candidate's PVC was issued for deletion")
+		} else {
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}
 	})
 })

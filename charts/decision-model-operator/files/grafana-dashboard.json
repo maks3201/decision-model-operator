@@ -1,0 +1,102 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "timezone": "",
+  "title": "decision-model-operator",
+  "uid": "decision-model-operator",
+  "tags": ["decision-model-operator"],
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "type": "stat",
+      "title": "DecisionModels by phase",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "sum by (phase) (decisionmodel_phase == 1)", "legendFormat": "{{phase}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Model-ready vs desired replicas",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "sum(decisionmodel_model_ready_replicas)", "legendFormat": "model-ready"},
+        {"expr": "sum(decisionmodel_desired_replicas)", "legendFormat": "desired"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rollout outcomes (rate)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "sum by (result) (rate(decisionmodel_rollouts_total[5m]))", "legendFormat": "{{result}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Probe results (rate)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "sum by (result) (rate(decisionmodel_probe_results_total[5m]))", "legendFormat": "{{result}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Evaluation accuracy per DecisionModel",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {"expr": "decisionmodel_evaluation_accuracy", "legendFormat": "{{namespace}}/{{name}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Evaluation ECE per DecisionModel",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [
+        {"expr": "decisionmodel_evaluation_ece", "legendFormat": "{{namespace}}/{{name}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reconcile errors (rate)",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "targets": [
+        {"expr": "sum(rate(controller_runtime_reconcile_errors_total{controller=\"decisionmodel\"}[5m]))", "legendFormat": "errors"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Reconcile latency p99",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(controller_runtime_reconcile_time_seconds_bucket{controller=\"decisionmodel\"}[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Workqueue depth",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "targets": [
+        {"expr": "sum(workqueue_depth{name=\"decisionmodel\"})", "legendFormat": "depth"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Registry resolve duration p99",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(decisionmodel_registry_resolve_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Phase duration p90",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "targets": [
+        {"expr": "histogram_quantile(0.90, sum by (le, phase) (rate(decisionmodel_phase_duration_seconds_bucket[30m])))", "legendFormat": "{{phase}}"}
+      ]
+    }
+  ]
+}

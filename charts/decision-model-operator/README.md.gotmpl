@@ -187,11 +187,25 @@ See
 [GPU CI](https://maks3201.github.io/decision-model-operator/gpu-ci/) for a
 GPU-enabled kind setup and the Pascal/Volta `:cuda12` note.
 
-### Metrics
+### Metrics, alerts and dashboard
 
 `metrics.enabled` (default `true`) exposes controller-runtime metrics on
 `:8443`/HTTPS and creates a metrics Service. The chart does not ship a Prometheus
-`ServiceMonitor`; scrape the Service with your monitoring stack. See
+`ServiceMonitor`; scrape the Service with your monitoring stack.
+
+Optional (both default **off**): `prometheusRule.enabled` ships a `PrometheusRule`
+with symptom-based alerts (each links a runbook under `docs/runbooks/`), and
+`grafanaDashboard.enabled` ships the operator dashboard as a sidecar-discovered
+ConfigMap (`grafana_dashboard: "1"`):
+
+```sh
+helm upgrade dmo ... \
+  --set prometheusRule.enabled=true \
+  --set prometheusRule.labels.release=kube-prometheus-stack \
+  --set grafanaDashboard.enabled=true
+```
+
+The rules alert only on metrics the operator actually exports. See
 [metrics](https://maks3201.github.io/decision-model-operator/metrics/).
 
 ## Verify the chart

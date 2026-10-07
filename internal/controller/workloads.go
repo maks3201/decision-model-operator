@@ -322,10 +322,18 @@ func (r *DecisionModelReconciler) ensureDeployment(
 	//   - an empty key (no auth) records and mirrors nothing.
 	desiredChecksum := apiKeyChecksum
 	tmplChecksum := desiredChecksum // create path: new Deployment, no Pods to roll
-	if getErr == nil && desiredChecksum != "" {
+	if getErr == nil {
 		recorded := dep.Annotations[apiKeyChecksumAnnotation]
 		liveTmpl := dep.Spec.Template.Annotations[apiKeyChecksumAnnotation]
 		switch {
+		case desiredChecksum == "":
+			// Empty desired checksum = no auth, OR the key Secret is currently
+			// unreadable (e.g. it lost its label during a candidate-preflight
+			// failure). Either way, never DROP an existing template checksum: that
+			// would roll the running stable for no real key change. Preserve both
+			// the template and the recorded annotation.
+			tmplChecksum = liveTmpl
+			desiredChecksum = recorded
 		case recorded == "":
 			// First observation: keep whatever the live template has (empty for a
 			// legacy Deployment), only record below. No roll.

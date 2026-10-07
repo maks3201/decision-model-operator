@@ -1,0 +1,132 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- $rb := trimSuffix "/" .Values.prometheusRule.runbookUrl }}
+{{- $w := .Values.prometheusRule.windows }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "dmo.fullname" . }}-alerts
+  namespace: {{ .Values.prometheusRule.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: decision-model-operator
+      rules:
+        # A revision whose Pods never become model-ready sits in a non-terminal
+        # progress phase (Resolving/Caching/Starting/Evaluating/Promoting). Fires
+        # when any such phase stays active for the window. Covers CandidateTimeout
+        # (Starting/Evaluating stuck) as the same symptom.
+        - alert: DecisionModelRolloutStuck
+          expr: |
+            max by (namespace, name) (
+              decisionmodel_phase{phase=~"Resolving|Caching|Starting|Evaluating|Promoting"}
+            ) == 1
+          for: {{ $w.rolloutStuck }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} stuck mid-rollout"
+            description: "A DecisionModel has stayed in a non-terminal rollout phase for {{ $w.rolloutStuck }}."
+            runbook_url: "{{ $rb }}/DecisionModelRolloutStuck.md"
+
+        # A candidate specifically wedged in Starting/Evaluating past a longer
+        # window: the model-ready gate or the evaluation never completes.
+        - alert: DecisionModelCandidateTimeout
+          expr: |
+            max by (namespace, name) (
+              decisionmodel_phase{phase=~"Starting|Evaluating"}
+            ) == 1
+          for: {{ $w.candidateTimeout }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} candidate not progressing"
+            description: "A candidate revision has not become ready/evaluated within {{ $w.candidateTimeout }}."
+            runbook_url: "{{ $rb }}/DecisionModelCandidateTimeout.md"
+
+        # Repeated rollbacks or outright failures: a bad candidate, flaky eval,
+        # or a store/probe problem.
+        - alert: DecisionModelRolloutFailures
+          expr: |
+            sum by (namespace, name) (
+              increase(decisionmodel_rollouts_total{result=~"rolled_back|rolled_back_after_promotion|failed"}[15m])
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} failing rollouts"
+            description: "One or more rollbacks/failures in the last 15m."
+            runbook_url: "{{ $rb }}/DecisionModelRolloutFailures.md"
+
+        # Evaluation quality regressed: a completed evaluation with low accuracy
+        # or poor calibration. Only fires once an evaluation has run.
+        - alert: DecisionModelEvaluationPoor
+          expr: |
+            decisionmodel_evaluation_accuracy < 0.9
+            or decisionmodel_evaluation_ece > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} evaluation below target"
+            description: "Last evaluation has accuracy < 0.9 or ECE > 0.1."
+            runbook_url: "{{ $rb }}/DecisionModelEvaluationPoor.md"
+
+        # The stable revision is serving on a subset (or none) of its replicas,
+        # or the store is not shareable for the requested replica count.
+        - alert: DecisionModelDegraded
+          expr: |
+            max by (namespace, name) (decisionmodel_phase{phase="Degraded"}) == 1
+          for: {{ $w.degraded }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} is Degraded"
+            description: "Not all desired replicas are model-ready, or the store is not shareable, for {{ $w.degraded }}."
+            runbook_url: "{{ $rb }}/DecisionModelDegraded.md"
+
+        # Pods pass Kubernetes readiness but load the wrong digest/device (silent
+        # CPU fallback or a moved digest): the model-aware readiness signal.
+        - alert: DecisionModelModelMismatch
+          expr: |
+            sum by (namespace, name) (
+              rate(decisionmodel_probe_results_total{result=~"digest_mismatch|device_mismatch"}[15m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} serving the wrong model/device"
+            description: "Readiness probes report a digest or device mismatch (Pods look healthy but are not serving the pinned model)."
+            runbook_url: "{{ $rb }}/DecisionModelModelMismatch.md"
+
+        # The controller's reconcile loop is erroring repeatedly (controller-runtime
+        # built-in metric). A code bug, RBAC gap, or a wedged dependency.
+        - alert: DecisionModelOperatorReconcileErrors
+          expr: |
+            sum(rate(controller_runtime_reconcile_errors_total{controller="decisionmodel"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "decision-model-operator reconcile errors"
+            description: "The DecisionModel controller is returning reconcile errors."
+            runbook_url: "{{ $rb }}/DecisionModelOperatorReconcileErrors.md"
+
+        # The operator is not scraping / not up: no reconcile activity metric
+        # present. Uses the controller-runtime total as a liveness proxy via absent().
+        - alert: DecisionModelOperatorDown
+          expr: |
+            absent(controller_runtime_reconcile_total{controller="decisionmodel"})
+          for: {{ $w.operatorDown }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "decision-model-operator is not reporting metrics"
+            description: "No controller-runtime reconcile metric for the DecisionModel controller; the operator may be down or unscraped."
+            runbook_url: "{{ $rb }}/DecisionModelOperatorDown.md"
+{{- end }}
