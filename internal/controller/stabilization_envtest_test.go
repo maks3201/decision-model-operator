@@ -93,6 +93,59 @@ var _ = Describe("post-promotion stabilization window", func() {
 		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, &appsv1.Deployment{})
 		return err == nil
 	}
+	// settleDeployment marks a revision's Deployment as a completed rollout, the
+	// way the real deployment controller does: Progressing=True with reason
+	// NewReplicaSetAvailable and observedGeneration == generation. This stays set
+	// even if Pods later go unready, so stableRolloutState reports rolloutIdle.
+	settleDeployment := func(name, rev string) {
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, dep)).To(Succeed())
+		spec := int32(1)
+		if dep.Spec.Replicas != nil {
+			spec = *dep.Spec.Replicas
+		}
+		dep.Status.ObservedGeneration = dep.Generation
+		dep.Status.Replicas = spec
+		dep.Status.UpdatedReplicas = spec
+		dep.Status.AvailableReplicas = spec
+		dep.Status.ReadyReplicas = spec
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue,
+			Reason: "NewReplicaSetAvailable", Message: "ReplicaSet has successfully progressed.",
+		}}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+	}
+	// rollingDeployment marks a revision's Deployment mid-rollout, as the real
+	// controller does during a scale-up or template change: generation bumped
+	// (observedGeneration behind) and Progressing=True with reason ReplicaSetUpdated.
+	rollingDeployment := func(name, rev string, specReplicas int32) {
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, dep)).To(Succeed())
+		// observedGeneration deliberately behind generation: the change is not
+		// observed yet. Also set the Progressing reason the controller uses.
+		dep.Status.ObservedGeneration = dep.Generation - 1
+		dep.Status.Replicas = specReplicas
+		dep.Status.UpdatedReplicas = specReplicas - 1
+		dep.Status.AvailableReplicas = 0
+		dep.Status.ReadyReplicas = 0
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue,
+			Reason: "ReplicaSetUpdated", Message: "ReplicaSet is progressing.",
+		}}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+	}
+	// deadlineExceededDeployment marks a revision's Deployment as a stuck rollout:
+	// Progressing=False, ProgressDeadlineExceeded.
+	deadlineExceededDeployment := func(name, rev string) {
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, dep)).To(Succeed())
+		dep.Status.ObservedGeneration = dep.Generation
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentProgressing, Status: corev1.ConditionFalse,
+			Reason: "ProgressDeadlineExceeded", Message: "progress deadline exceeded",
+		}}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+	}
 
 	// newRec builds a reconciler with a per-revision prober so a test can make the
 	// new stable's Pod lose the model (gate mismatch) during the window.
@@ -163,6 +216,9 @@ var _ = Describe("post-promotion stabilization window", func() {
 		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(rev2))
 		Expect(getDM(name).Status.PreviousRevision).NotTo(BeNil())
 		Expect(getDM(name).Status.PreviousRevision.Hash).To(Equal(rev1))
+		// Mark the new stable fully rolled out, as a real Deployment controller
+		// would once its Pods are ready; stabilizationFor then sees rolloutIdle.
+		settleDeployment(name, rev2)
 		return rev1, rev2
 	}
 
@@ -287,6 +343,196 @@ var _ = Describe("post-promotion stabilization window", func() {
 		}
 		Expect(sawStabilized).To(BeFalse(), "never announced Stabilized while below quorum")
 		Expect(sawRolledBack).To(BeTrue())
+	})
+
+	// An intentional in-place rollout of the stable (replicas scale-up) drops
+	// below quorum while new Pods load the model. That is NOT a health failure, so
+	// it must not roll back; once the rollout settles it stabilizes normally.
+	It("does not roll back a scale-up rollout that is below quorum, then stabilizes", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-scaleup", nil)
+
+		// Scale 1 -> 3; the stable Deployment is mid-rollout (new Pods not ready).
+		Expect(updateDM(ctx, namespace, "s-scaleup", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			three := int32(3)
+			dm.Spec.Replicas = &three
+		})).To(Succeed())
+		clock = clock.Add(1 * time.Minute)
+		rec(r, "s-scaleup") // applies the new replicas to the Deployment
+		rollingDeployment("s-scaleup", rev2, 3)
+
+		// Below quorum (ready=1 of 2) for longer than the debounce: still no
+		// rollback, because the Deployment is mid-rollout.
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		for i := 0; i < 3; i++ {
+			Expect(rec(r, "s-scaleup")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		}
+		st := meta_Find(getDM("s-scaleup"), decisionmodelv1alpha1.ConditionStabilizing)
+		Expect(st).NotTo(BeNil())
+		Expect(st.Status).To(Equal(metav1.ConditionTrue))
+		Expect(st.Reason).To(Equal(reasonStableRolling))
+		Expect(getDM("s-scaleup").Status.PreviousRevision).NotTo(BeNil(), "rollback target still kept")
+
+		// The rollout settles (all 3 Pods ready); the window then completes healthy.
+		for _, ip := range []string{"10.0.0.91", "10.0.0.92"} {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: "s-scaleup-pod-" + rev2 + "-" + ip[len(ip)-2:],
+					Labels: map[string]string{decisionmodelv1alpha1.LabelName: "s-scaleup", decisionmodelv1alpha1.LabelRevision: rev2},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.PodIP = ip
+			pod.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodConditionType(decisionmodelv1alpha1.ModelReadyGate), Status: corev1.ConditionTrue},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+		clock = clock.Add(10 * time.Minute)
+		Eventually(func() bool {
+			// Keep the Deployment reported fully rolled out (envtest has no
+			// Deployment controller; a reconcile may bump its generation).
+			settleDeployment("s-scaleup", rev2)
+			rec(r, "s-scaleup")
+			return depExists("s-scaleup", rev1)
+		}, "10s", "50ms").Should(BeFalse(), "previous collected once the rollout settled healthy")
+		Expect(getDM("s-scaleup").Status.PreviousRevision).To(BeNil())
+		_ = rev1
+	})
+
+	// API-key rotation on an RWO/replicas-1 stable uses Recreate: the only Pod is
+	// gone for a cold load (0 ready) for longer than the debounce. That is an
+	// intentional rollout, not a failure, so it must not roll back.
+	It("does not roll back a key-rotation rollout with zero ready Pods", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-keyrot", nil)
+
+		// Simulate the rolling Recreate: delete the Pod and mark the Deployment
+		// mid-rollout (generation bumped, Progressing=ReplicaSetUpdated).
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-keyrot-pod-" + rev2}})).To(Succeed())
+		rollingDeployment("s-keyrot", rev2, 1)
+
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		for i := 0; i < 3; i++ {
+			Expect(rec(r, "s-keyrot")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		}
+		st := meta_Find(getDM("s-keyrot"), decisionmodelv1alpha1.ConditionStabilizing)
+		Expect(st).NotTo(BeNil())
+		Expect(st.Reason).To(Equal(reasonStableRolling))
+		Expect(getDM("s-keyrot").Status.PreviousRevision).NotTo(BeNil())
+		_ = rev1
+	})
+
+	// A genuine failure during a rollout (new Pods come up with the wrong model)
+	// still rolls back immediately — the rollout mask only covers a quorum
+	// shortfall, never a gate DigestMismatch/DeviceMismatch.
+	It("rolls back immediately on a gate mismatch even while mid-rollout", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-rollfail", nil)
+
+		rollingDeployment("s-rollfail", rev2, 2) // mid-rollout
+		// The serving Pod reports the wrong device: an immediate failure.
+		prober.set(rev2, engine.Loaded{Name: "kev:en", Digest: digest2, Device: "cuda"})
+		clock = clock.Add(1 * time.Minute)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-rollfail") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-rollfail")).To(Equal(rev1))
+		Expect(getDM("s-rollfail").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	// A rollout that never finishes must not suspend protection forever: once the
+	// Deployment reports ProgressDeadlineExceeded, the shortfall is treated as a
+	// failure and rolled back.
+	It("rolls back a stuck rollout that exceeds its progress deadline", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-stuck", nil)
+
+		// Below quorum (Pod gone) AND the rollout is stuck past its deadline.
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-stuck-pod-" + rev2}})).To(Succeed())
+		deadlineExceededDeployment("s-stuck", rev2)
+		clock = clock.Add(1 * time.Minute)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-stuck") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-stuck")).To(Equal(rev1))
+		dm := getDM("s-stuck")
+		Expect(dm.Status.FailedRevision.Hash).To(Equal(rev2))
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("progress deadline"))
+	})
+
+	// Regression: a COMPLETED rollout (Progressing=True NewReplicaSetAvailable,
+	// observedGeneration == generation) whose Pods later go unready has
+	// available < spec but is NOT "rolling" — it must still roll back after the
+	// debounce. This is the case that an availableReplicas-based signal broke.
+	It("rolls back a completed rollout whose Pods go unready, despite available < spec", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-doneunready", nil) // setStable settles rev2
+
+		// The rollout is complete; now its only Pod goes away (available < spec),
+		// but the Deployment keeps Progressing=True NewReplicaSetAvailable, exactly
+		// as a real controller reports a post-rollout health failure.
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-doneunready-pod-" + rev2}})).To(Succeed())
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s-doneunready-" + rev2}, dep)).To(Succeed())
+		dep.Status.ObservedGeneration = dep.Generation
+		dep.Status.AvailableReplicas = 0 // Pods unready, but the rollout already completed
+		dep.Status.ReadyReplicas = 0
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue,
+			Reason: "NewReplicaSetAvailable", Message: "ReplicaSet has successfully progressed.",
+		}}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+		// First reconcile marks it unhealthy (not StableRolling); past the debounce
+		// it rolls back.
+		rec(r, "s-doneunready")
+		st := meta_Find(getDM("s-doneunready"), decisionmodelv1alpha1.ConditionStabilizing)
+		Expect(st).NotTo(BeNil())
+		Expect(st.Reason).To(Equal(reasonPostPromotionUnhealthy), "a completed rollout is not StableRolling")
+		clock = clock.Add(postPromotionDebounce + time.Second)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-doneunready") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-doneunready")).To(Equal(rev1))
+		Expect(getDM("s-doneunready").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	// A scale-up whose new Pods never become ready must not hold forever: the
+	// rollout eventually trips ProgressDeadlineExceeded and rolls back.
+	It("rolls back a scale-up whose new Pods never become ready (deadline)", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-scalestuck", nil)
+
+		Expect(updateDM(ctx, namespace, "s-scalestuck", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			three := int32(3)
+			dm.Spec.Replicas = &three
+		})).To(Succeed())
+		clock = clock.Add(1 * time.Minute)
+		rec(r, "s-scalestuck")
+
+		// While progressing: no rollback.
+		rollingDeployment("s-scalestuck", rev2, 3)
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		Expect(rec(r, "s-scalestuck")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(meta_Find(getDM("s-scalestuck"), decisionmodelv1alpha1.ConditionStabilizing).Reason).
+			To(Equal(reasonStableRolling))
+
+		// The new Pods never come up: the rollout trips its deadline -> rollback.
+		deadlineExceededDeployment("s-scalestuck", rev2)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-scalestuck") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-scalestuck")).To(Equal(rev1))
+		Expect(getDM("s-scalestuck").Status.FailedRevision.Message).To(ContainSubstring("progress deadline"))
 	})
 
 	It("with stabilization 0 collects the previous revision after the short grace", func() {
