@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths-ignore: ["docs/**", "**.md"]
   pull_request:
-    paths-ignore: ["docs/**", "**.md"]
   workflow_dispatch:
 
 permissions:
@@ -23,16 +22,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decide whether the heavy E2E matrix needs to run. A docs-only change (only
+  # docs/** or *.md) skips it; the gate job below still reports success so a
+  # required check never hangs on a docs-only PR.
+  changes:
+    name: detect code changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Filter paths
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "code=true" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          base="$BASE_SHA"
+          [ "$EVENT" = "push" ] && base="$BEFORE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "code=true" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          files="$(git diff --name-only "$base" "$HEAD_SHA")"
+          echo "changed files:"; echo "$files"
+          if echo "$files" | grep -qvE '^(docs/|.*\.md$)'; then
+            echo "code=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "code=false" >>"$GITHUB_OUTPUT"
+          fi
+
   test-e2e:
     name: kind (${{ matrix.install }}, CPU, laya:en)
-    runs-on: ubuntu-latest
-    # Skip E2E on the Release Please PR branch: that bot PR only touches
-    # CHANGELOG/Chart.yaml/manifest, its pull_request runs sit in
+    needs: changes
+    # Run when code changed, except on the Release Please PR branch: that bot PR
+    # only touches CHANGELOG/Chart.yaml/manifest, its pull_request runs sit in
     # action_required (manual approval) and add nothing. E2E still runs on push
     # to main (the merge) and on workflow_dispatch.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.head_ref != 'release-please--branches--main--components--decision-model-operator'
+      needs.changes.outputs.code == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.head_ref != 'release-please--branches--main--components--decision-model-operator')
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -79,3 +119,24 @@ jobs:
           # workflow runs them in full.
           E2E_LABEL_FILTER: "!nightly"
         run: make test-e2e
+
+  # Always-reporting gate. This is the stable name for branch protection: it
+  # passes when the matrix succeeded or was skipped (docs-only, or the Release
+  # Please bot PR), and fails only when a matrix job failed or was cancelled.
+  e2e-required:
+    name: e2e-required
+    needs: [changes, test-e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check result
+        env:
+          RESULT: ${{ needs.test-e2e.result }}
+        run: |
+          set -euo pipefail
+          echo "E2E matrix result: $RESULT"
+          case "$RESULT" in
+            success|skipped) echo "gate OK"; exit 0 ;;
+            *) echo "required job did not succeed"; exit 1 ;;
+          esac
