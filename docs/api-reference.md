@@ -182,6 +182,7 @@ _Appears in:_
 | `failedRevision` _[RevisionStatus](#revisionstatus)_ | FailedRevision is a revision that failed to roll out. The controller does<br />not automatically retry it; a spec change (new revision) is required, or<br />setting the decisionmodel.io/retry annotation to a new token re-attempts<br />the same revision. |  | Optional: \{\} <br /> |
 | `previousRevision` _[PreviousRevisionStatus](#previousrevisionstatus)_ | PreviousRevision is the revision that was stable immediately before the<br />most recent promotion. It may linger for a short grace period after<br />promotedAt so the new revision's endpoints populate before it is removed. |  | Optional: \{\} <br /> |
 | `lastRetryToken` _string_ | LastRetryToken is the value of the decisionmodel.io/retry annotation the<br />controller last consumed to clear a failed revision. |  | Optional: \{\} <br /> |
+| `storeRecovery` _[StoreRecoveryStatus](#storerecoverystatus)_ | StoreRecovery tracks the bounded retries of lost-store recovery for the<br />stable revision. It is persisted so the attempt bound survives an operator<br />restart (an in-memory counter would reset and allow more recreations than<br />the documented limit). |  | Optional: \{\} <br /> |
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
 | `evaluation` _[EvaluationStatus](#evaluationstatus)_ | Evaluation records the most recent eval-gated rollout result. |  | Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#condition-v1-meta) array_ | Conditions represent the latest available observations of the object's state. |  | Optional: \{\} <br /> |
@@ -406,5 +407,25 @@ _Appears in:_
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations allow the Pod to schedule onto nodes with matching taints. |  | Optional: \{\} <br /> |
 | `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#affinity-v1-core)_ | Affinity constrains Pod scheduling. |  | Optional: \{\} <br /> |
 | `runtimeClassName` _string_ | RuntimeClassName selects the RuntimeClass for serving Pods, e.g. "nvidia"<br />when the NVIDIA GPU Operator does not make it the default runtime. It is<br />applied to serving Pods only (the prefetch Job needs no GPU runtime).<br />Because it is part of spec.scheduling, changing it changes the revision's<br />placement hash and therefore starts a new revision (blue-green), like any<br />other scheduling change. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$` <br />Optional: \{\} <br /> |
+
+
+#### StoreRecoveryStatus
+
+
+
+StoreRecoveryStatus is the bounded-retry bookkeeping for lost-store recovery of
+the stable revision. It survives an operator restart so the attempt bound is
+honoured across restarts.
+
+
+
+_Appears in:_
+- [DecisionModelStatus](#decisionmodelstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `attempts` _integer_ | Attempts is the number of failed recovery prefetch Jobs counted so far<br />toward the retry bound. |  | Optional: \{\} <br /> |
+| `lastFailedJob` _string_ | LastFailedJob is the UID of the last failed prefetch Job already counted, so<br />a repeated observation of the same Job (e.g. a stale cache read) is not<br />double-counted. |  | Optional: \{\} <br /> |
+| `exhausted` _boolean_ | Exhausted is true once Attempts reached the bound: recovery stopped with<br />Degraded=StorePrefetchFailed and will not recreate the prefetch Job again<br />until a new revision or a decisionmodel.io/retry token resets it. |  | Optional: \{\} <br /> |
 
 

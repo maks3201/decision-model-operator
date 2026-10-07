@@ -291,6 +291,12 @@ func (r *DecisionModelReconciler) promote(
 	dm.Status.StableRevision = candidate
 	dm.Status.CandidateRevision = nil
 	dm.Status.FailedRevision = nil // successful rollout clears any prior failure
+	// A newly promoted stable has a fresh, populated store, so any lost-store
+	// recovery bookkeeping from a previous stable no longer applies: reset the
+	// bounded-retry count (also the "reset on a new revision" rule).
+	if switching {
+		clearStoreRecover(dm)
+	}
 
 	if switching {
 		// Record the demoted revision so its workloads linger for promoteGrace
@@ -351,15 +357,22 @@ func (r *DecisionModelReconciler) promote(
 // rollbackOrFail handles a failed candidate: RolledBack if a stable revision
 // exists (which keeps serving), else Failed. The failed revision is recorded so
 // it is not automatically retried; a spec change (new hash) clears it.
+//
+// Durability-first (same contract as rollbackToPrevious): it records
+// failedRevision, phase and conditions and PERSISTS them before deleting the
+// candidate's workloads. If the write loses an optimistic-lock race or errors,
+// nothing is deleted and the next reconcile redoes the decision from fresh
+// state — so a crash can never leave the DM with its candidate workloads gone
+// but no failed-revision record, which would restart the same rollout (breaking
+// the "not retried automatically" guarantee). The workload delete after a
+// durable write is idempotent; a partial delete is finished by gcRevisions /
+// the next reconcile.
 func (r *DecisionModelReconciler) rollbackOrFail(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	failed *decisionmodelv1alpha1.RevisionStatus,
 	reason, message string,
 ) (ctrl.Result, error) {
-	if err := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); err != nil {
-		return r.finish(ctx, dm, ctrl.Result{}, err)
-	}
 	dm.Status.CandidateRevision = nil
 	failedAt := metav1.NewTime(r.now())
 	failed.Reason = reason
@@ -393,7 +406,27 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 			"revision %s failed (%s): %s", modelRef(failed), reason, message)
 		bufferRollout(ctx, rolloutFailed)
 	}
-	return r.finish(ctx, dm, ctrl.Result{}, nil)
+
+	// Persist first. On conflict nothing was stored and no Event/metric emitted;
+	// requeue and redo the decision from fresh state next reconcile.
+	persisted, conflict, err := r.persistStatus(ctx, dm)
+	if conflict {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !persisted {
+		return ctrl.Result{}, nil
+	}
+
+	// Only now, with the failure durably recorded, delete the candidate's
+	// workloads. If this fails the failure record stands and gcRevisions / the
+	// next reconcile finish the delete; so requeue rather than block.
+	if derr := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); derr != nil {
+		return ctrl.Result{}, derr
+	}
+	return ctrl.Result{}, nil
 }
 
 // rollbackOrFailPermanent is rollbackOrFail for a permanent failure: after the

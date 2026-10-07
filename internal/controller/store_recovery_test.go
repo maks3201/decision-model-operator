@@ -275,7 +275,7 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		Expect(deg.Message).To(ContainSubstring("permanently"))
 		// It did NOT burn an attempt: the counter is still at zero (a later
 		// transient failure would still get its full budget).
-		Expect(rr.countFailedRecovery(dm.UID, types.UID("probe"))).To(BeFalse(),
+		Expect(rr.countFailedRecovery(dm, types.UID("probe"))).To(BeFalse(),
 			"the permanent give-up did not consume the bounded attempts")
 	})
 
@@ -284,11 +284,11 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		dm := mkDM("once")
 		rr := newRec(k8sClient)
 		jobUID := types.UID("job-uid-1")
-		Expect(rr.countFailedRecovery(dm.UID, jobUID)).To(BeFalse())
-		Expect(rr.countFailedRecovery(dm.UID, jobUID)).To(BeFalse(), "same UID again: no extra attempt")
-		Expect(rr.countFailedRecovery(dm.UID, jobUID)).To(BeFalse())
-		Expect(rr.countFailedRecovery(dm.UID, types.UID("job-uid-2"))).To(BeFalse())
-		Expect(rr.countFailedRecovery(dm.UID, types.UID("job-uid-3"))).To(BeTrue(), "third distinct failure exhausts")
+		Expect(rr.countFailedRecovery(dm, jobUID)).To(BeFalse())
+		Expect(rr.countFailedRecovery(dm, jobUID)).To(BeFalse(), "same UID again: no extra attempt")
+		Expect(rr.countFailedRecovery(dm, jobUID)).To(BeFalse())
+		Expect(rr.countFailedRecovery(dm, types.UID("job-uid-2"))).To(BeFalse())
+		Expect(rr.countFailedRecovery(dm, types.UID("job-uid-3"))).To(BeTrue(), "third distinct failure exhausts")
 	})
 
 	// Exhausted state does not churn: no condition transition and one Event.
@@ -302,7 +302,7 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 
 		driveToJob(rr, dm, stable, claim)
 		for i := 0; i < maxStoreRecoverAttempts; i++ {
-			rr.countFailedRecovery(dm.UID, types.UID("uid-"+itoa(i)))
+			rr.countFailedRecovery(dm, types.UID("uid-"+itoa(i)))
 		}
 		markFailed(getJob(dm))
 

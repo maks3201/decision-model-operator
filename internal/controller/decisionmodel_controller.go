@@ -256,14 +256,6 @@ type DecisionModelReconciler struct {
 	// In memory only; guarded by regateMu.
 	regateMu sync.Mutex
 	regate   regateTracker
-	// storeRecover tracks, per DecisionModel UID, the bounded failed-prefetch retry
-	// count for lost-store recovery: the UID of the last failed prefetch Job
-	// already counted (idempotent counting) and whether the bound is exhausted.
-	// This is a bound, not a safety signal — the restart-safe
-	// "recovering" state lives on the store PVC annotation. In memory only;
-	// guarded by storeRecoverMu.
-	storeRecoverMu sync.Mutex
-	storeRecover   map[types.UID]*storeRecoverState
 	// budgetMu serializes the fleet rollout-budget "count + decide + reserve" so
 	// two DecisionModels reconciled concurrently (MaxConcurrentReconciles > 1)
 	// cannot both see a free slot and both admit. budgetReservations holds
@@ -608,8 +600,8 @@ func (r *DecisionModelReconciler) applyRetryToken(dm *decisionmodelv1alpha1.Deci
 	// (Degraded=StorePrefetchFailed) clears the latch so the stable path starts a
 	// fresh bounded set of prefetch attempts (the failed Job is deleted and
 	// recreated as usual).
-	if newRetry && r.storeRecoverExhausted(dm.UID) {
-		r.clearStoreRecover(dm.UID)
+	if newRetry && storeRecoverExhausted(dm) {
+		clearStoreRecover(dm)
 		dm.Status.LastRetryToken = tok
 	}
 }

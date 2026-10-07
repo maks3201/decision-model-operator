@@ -470,6 +470,28 @@ type ReplicaStatus struct {
 	ModelReady int32 `json:"modelReady,omitempty"`
 }
 
+// StoreRecoveryStatus is the bounded-retry bookkeeping for lost-store recovery of
+// the stable revision. It survives an operator restart so the attempt bound is
+// honoured across restarts.
+type StoreRecoveryStatus struct {
+	// Attempts is the number of failed recovery prefetch Jobs counted so far
+	// toward the retry bound.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// LastFailedJob is the UID of the last failed prefetch Job already counted, so
+	// a repeated observation of the same Job (e.g. a stale cache read) is not
+	// double-counted.
+	// +optional
+	LastFailedJob string `json:"lastFailedJob,omitempty"`
+
+	// Exhausted is true once Attempts reached the bound: recovery stopped with
+	// Degraded=StorePrefetchFailed and will not recreate the prefetch Job again
+	// until a new revision or a decisionmodel.io/retry token resets it.
+	// +optional
+	Exhausted bool `json:"exhausted,omitempty"`
+}
+
 // EvaluationResult is the outcome of applying the evaluation gate.
 type EvaluationResult string
 
@@ -605,6 +627,13 @@ type DecisionModelStatus struct {
 	// controller last consumed to clear a failed revision.
 	// +optional
 	LastRetryToken string `json:"lastRetryToken,omitempty"`
+
+	// StoreRecovery tracks the bounded retries of lost-store recovery for the
+	// stable revision. It is persisted so the attempt bound survives an operator
+	// restart (an in-memory counter would reset and allow more recreations than
+	// the documented limit).
+	// +optional
+	StoreRecovery *StoreRecoveryStatus `json:"storeRecovery,omitempty"`
 
 	// Replicas reports desired and model-ready replica counts.
 	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Replicas",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}

@@ -2220,6 +2220,32 @@ spec:
                       version across operator upgrades under --runtime-version-policy=Pinned.
                     type: string
                 type: object
+              storeRecovery:
+                description: |-
+                  StoreRecovery tracks the bounded retries of lost-store recovery for the
+                  stable revision. It is persisted so the attempt bound survives an operator
+                  restart (an in-memory counter would reset and allow more recreations than
+                  the documented limit).
+                properties:
+                  attempts:
+                    description: |-
+                      Attempts is the number of failed recovery prefetch Jobs counted so far
+                      toward the retry bound.
+                    format: int32
+                    type: integer
+                  exhausted:
+                    description: |-
+                      Exhausted is true once Attempts reached the bound: recovery stopped with
+                      Degraded=StorePrefetchFailed and will not recreate the prefetch Job again
+                      until a new revision or a decisionmodel.io/retry token resets it.
+                    type: boolean
+                  lastFailedJob:
+                    description: |-
+                      LastFailedJob is the UID of the last failed prefetch Job already counted, so
+                      a repeated observation of the same Job (e.g. a stale cache read) is not
+                      double-counted.
+                    type: string
+                type: object
             type: object
         type: object
         x-kubernetes-validations:
