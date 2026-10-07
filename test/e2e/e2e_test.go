@@ -131,7 +131,7 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 
 		if testDevice == "cuda" {
 			By("checking the serving Pod requests a GPU (limits nvidia.com/gpu)")
-			gpu, err := utils.Kubectl("get", "pods", "-l", "decisionmodel.io/name="+dmName,
+			gpu, err := utils.Kubectl("get", "pods", "-l", servingPodSelector(dmName),
 				"-n", testNamespace,
 				"-o", "jsonpath={.items[0].spec.containers[0].resources.limits.nvidia\\.com/gpu}")
 			Expect(err).NotTo(HaveOccurred())
@@ -141,7 +141,7 @@ var _ = Describe("DecisionModel lifecycle", Ordered, func() {
 		By("checking a serving Pod has the model-ready readiness gate True")
 		Eventually(func(g Gomega) {
 			out, err := utils.Kubectl("get", "pods",
-				"-l", "decisionmodel.io/name="+dmName, "-n", testNamespace,
+				"-l", servingPodSelector(dmName), "-n", testNamespace,
 				"-o", fmt.Sprintf(
 					"jsonpath={.items[*].status.conditions[?(@.type=='%s')].status}",
 					modelReadyGate))
@@ -348,6 +348,15 @@ spec:
 	cmd.Stdin = bytes.NewBufferString(manifest)
 	out, err := utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "failed to apply DecisionModel: %s", out)
+}
+
+// servingPodSelector returns a label selector that matches a DecisionModel's
+// serving Pods while excluding its prefetch Job Pods. Prefetch Pods carry
+// decisionmodel.io/name=<dm> too, so a bare name selector also matches the
+// completed (Succeeded) prefetch Pod; the !decisionmodel.io/prefetch-revision
+// clause drops it (serving Pods never carry that label).
+func servingPodSelector(dm string) string {
+	return "decisionmodel.io/name=" + dm + ",!decisionmodel.io/prefetch-revision"
 }
 
 // portForward starts `kubectl port-forward svc/<name> <freeLocal>:<port>` in the
