@@ -44,6 +44,54 @@ import (
 
 // ---------------------------------------------------------------- unit tests
 
+// evalPolicyHash must fold the EFFECTIVE score tolerance into the policy
+// identity in canonical form: unset, "0.5" and "0.50" are the same policy;
+// a real change ("1") is a different policy (so a parked result/approval is
+// stale and the candidate re-evaluates).
+func TestEvalPolicyHashScoreTolerance(t *testing.T) {
+	base := func(tol string) *decisionmodelv1alpha1.EvaluationSpec {
+		return &decisionmodelv1alpha1.EvaluationSpec{
+			DatasetRef:     decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+			MinAccuracy:    "0.90",
+			ScoreTolerance: tol,
+		}
+	}
+	unset := evalPolicyHash(base(""))
+	for _, same := range []string{"0.5", "0.50", "0.500"} {
+		if got := evalPolicyHash(base(same)); got != unset {
+			t.Errorf("tolerance %q: hash %q != unset-default hash %q (effective default must match)", same, got, unset)
+		}
+	}
+	for _, diff := range []string{"1", "0.25", "0.75"} {
+		if got := evalPolicyHash(base(diff)); got == unset {
+			t.Errorf("tolerance %q: hash equals the default; a real change must shift the policy hash", diff)
+		}
+	}
+	// An invalid/negative tolerance falls back to the default, so it hashes as unset.
+	for _, bad := range []string{"-1", "abc"} {
+		if got := evalPolicyHash(base(bad)); got != unset {
+			t.Errorf("tolerance %q: invalid value must fall back to the default hash", bad)
+		}
+	}
+}
+
+// Two eval cache keys that differ only by the score tolerance must not share a
+// result: a result computed under one tolerance is not valid under another.
+func TestEvalKeyToleranceSeparatesCacheEntries(t *testing.T) {
+	s := newEvalStore()
+	k1 := evalKey{"ns", "n", "rev", "dshash", 0, 0.5}
+	k2 := k1
+	k2.tolerance = 0.75
+	s.start(k1, func() {})
+	s.finish(k1, evalResult{done: true, accuracy: 0.9})
+	if _, ok := s.get(k2); ok {
+		t.Fatal("a key differing only by tolerance must not hit the cached result")
+	}
+	if _, ok := s.get(k1); !ok {
+		t.Fatal("the original key must still resolve its own result")
+	}
+}
+
 func TestApplyCUDAArch(t *testing.T) {
 	archIn := func(key string) *corev1.Affinity {
 		return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{

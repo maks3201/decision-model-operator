@@ -53,6 +53,10 @@ type deciderFakeEngine struct {
 	conf        float64
 	confByModel map[string]float64
 	delay       time.Duration
+	// score, when non-nil, makes Decide return a "score" answer with this level
+	// instead of a choice. A test uses it with scoreTolerance to control whether
+	// a case counts as correct (|score - expected| <= tolerance).
+	score *float64
 	// decideErr, when set, makes Decide return a transport error. Atomic so a
 	// test can clear it between reconciles to simulate a blip that recovers.
 	decideErr atomic.Bool
@@ -72,6 +76,12 @@ func (d *deciderFakeEngine) Decide(
 		case <-ctx.Done():
 			return engine.DecideResponse{}, ctx.Err()
 		}
+	}
+	if d.score != nil {
+		// A score answer: correctness depends on the configured scoreTolerance.
+		return engine.DecideResponse{Answers: map[string]engine.Answer{
+			"q1": {Type: "score", Score: d.score},
+		}}, nil
 	}
 	conf := d.conf
 	if c, ok := d.confByModel[req.Model]; ok {
@@ -406,7 +416,7 @@ var _ = Describe("Eval-gated rollout", func() {
 		reconcileOnce(r, "ev6")
 
 		store := r.evalStoreOrInit()
-		_, ok := store.get(evalKey{namespace, "ev6", rev1, datasetHashOf(allChoice(50, 50)), defaultMaxCases})
+		_, ok := store.get(evalKey{namespace, "ev6", rev1, datasetHashOf(allChoice(50, 50)), defaultMaxCases, 0.5})
 		Expect(ok).To(BeFalse(), "rev1 evaluation entry should be forgotten after rev change")
 	})
 
