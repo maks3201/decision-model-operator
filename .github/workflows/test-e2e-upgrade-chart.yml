@@ -115,7 +115,11 @@ jobs:
 
       - name: Chart upgrade e2e
         env:
-          # The released chart and operator image are public, so no token is needed.
+          # The released chart and operator image are public, so no token is
+          # needed to pull them. The GitHub token is used only to authenticate the
+          # releases API lookup (resolve the latest tag) so it is not subject to the
+          # low unauthenticated rate limit, which flaked this job once.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KIND_CLUSTER: dmo-chart-upgrade
           FROM_VERSION: ${{ inputs.from }}
         run: ./hack/upgrade-chart-e2e.sh ${FROM_VERSION:+"$FROM_VERSION"}
