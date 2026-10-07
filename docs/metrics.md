@@ -147,6 +147,10 @@ prometheusRule:
   labels: { release: kube-prometheus-stack }   # match your Prometheus ruleSelector
 grafanaDashboard:
   enabled: true
+metrics:
+  serviceMonitor:
+    enabled: true                              # scrape the metrics Service (HTTPS, bearer token)
+    labels: { release: kube-prometheus-stack } # match your Prometheus serviceMonitorSelector
 ```
 
 The rules fire only on the metrics listed above plus controller-runtime built-ins

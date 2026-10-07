@@ -122,6 +122,12 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 
 	// Ensure the candidate evaluation is running / read its result.
 	candKey := evalKey{dm.Namespace, dm.Name, candidate.Hash, dsHash, maxCases, scoreTol}
+	// Cancel any in-flight evaluation for THIS revision started under a different
+	// eval identity (an in-place dataset edit, a maxCases or tolerance change
+	// mid-Evaluating): forgetExcept only keys on revision, so the stale goroutine
+	// would otherwise keep sending old-dataset requests until the revision
+	// changed. The current candKey entry (if any) is kept.
+	r.evalStoreOrInit().forgetMismatched(candKey)
 	// resuming (computed above, before entering Evaluating) is true when a prior
 	// reconcile already advanced *this* candidate into Evaluating and persisted
 	// it — i.e. the manager restarted (or leadership moved) mid-evaluation and the
@@ -214,7 +220,9 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		Brier:           formatDecimal(candRes.brier),
 		Cases:           int32(candRes.total),
 		FailedCases:     int32(candRes.failedCases),
+		CalibratedCases: int32(candRes.calibratedCases),
 		PolicyHash:      policyHash,
+		ScorerVersion:   int32(scorerVersion),
 		DatasetDigest:   dsDigest,
 		ApprovalID:      approvalID(candidate.Hash, policyHash, dsDigest),
 		CompletedAt:     ptrTime(metav1.NewTime(r.now())),
@@ -229,7 +237,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	}
 
 	// Gate evaluation: accuracy floor, accuracy drop, and calibration (ECE).
-	if failMsg, failed := evalGateFailure(candRes, baseline, evalGates{
+	if failReason, failMsg, failed := evalGateFailure(candRes, baseline, evalGates{
 		minAcc: minAcc, maxDrop: maxDrop, hasDrop: hasDrop,
 		maxECE: maxECE, hasMaxECE: hasMaxECE, maxECEInc: maxECEInc, hasMaxECEInc: hasMaxECEInc,
 	}); failed {
@@ -238,7 +246,7 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		r.event(ctx, dm, corev1.EventTypeWarning, eventEvaluationFailed,
 			"candidate %s failed evaluation: %s; %s keeps serving",
 			modelRef(candidate), failMsg, modelRef(dm.Status.StableRevision))
-		return r.rollbackOrFail(ctx, dm, candidate, reasonEvaluationFailed, failMsg)
+		return r.rollbackOrFail(ctx, dm, candidate, failReason, failMsg)
 	}
 	dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationPassed
 
@@ -301,23 +309,37 @@ type evalGates struct {
 }
 
 // evalGateFailure applies the accuracy floor, accuracy-drop, and calibration
-// (ECE / ECE-increase) gates. It returns a non-empty message and failed=true on
-// the first gate the candidate fails; relative gates apply only when a baseline
-// is available.
-func evalGateFailure(candRes evalResult, baseline *evalResult, g evalGates) (string, bool) {
+// (ECE / ECE-increase) gates. It returns a reason, a non-empty message and
+// failed=true on the first gate the candidate fails; relative gates apply only
+// when a baseline is available. A calibration gate with no calibrated cases
+// (candidate, or baseline for the relative gate) fails as CalibrationUnavailable
+// rather than passing on an ECE of 0 over an empty set.
+func evalGateFailure(candRes evalResult, baseline *evalResult, g evalGates) (reason, msg string, failed bool) {
 	switch {
 	case candRes.accuracy < g.minAcc:
-		return fmt.Sprintf("accuracy %.4f < minAccuracy %.4f", candRes.accuracy, g.minAcc), true
+		return reasonEvaluationFailed,
+			fmt.Sprintf("accuracy %.4f < minAccuracy %.4f", candRes.accuracy, g.minAcc), true
 	case baseline != nil && g.hasDrop && (baseline.accuracy-candRes.accuracy) > g.maxDrop:
-		return fmt.Sprintf("accuracy dropped %.4f (baseline %.4f) > maxAccuracyDrop %.4f",
-			baseline.accuracy-candRes.accuracy, baseline.accuracy, g.maxDrop), true
+		return reasonEvaluationFailed,
+			fmt.Sprintf("accuracy dropped %.4f (baseline %.4f) > maxAccuracyDrop %.4f",
+				baseline.accuracy-candRes.accuracy, baseline.accuracy, g.maxDrop), true
+	case g.hasMaxECE && candRes.calibratedCases == 0:
+		return reasonCalibrationUnavailable,
+			"maxECE is set but no scored case produced a probability distribution (0 calibrated cases); " +
+				"ECE cannot be evaluated", true
+	case baseline != nil && g.hasMaxECEInc && (candRes.calibratedCases == 0 || baseline.calibratedCases == 0):
+		return reasonCalibrationUnavailable,
+			"maxECEIncrease is set but the candidate or baseline produced 0 calibrated cases; " +
+				"the ECE increase cannot be evaluated", true
 	case g.hasMaxECE && candRes.ece > g.maxECE:
-		return fmt.Sprintf("ECE %.4f > maxECE %.4f", candRes.ece, g.maxECE), true
+		return reasonEvaluationFailed,
+			fmt.Sprintf("ECE %.4f > maxECE %.4f", candRes.ece, g.maxECE), true
 	case baseline != nil && g.hasMaxECEInc && (candRes.ece-baseline.ece) > g.maxECEInc:
-		return fmt.Sprintf("ECE increased %.4f (baseline %.4f) > maxECEIncrease %.4f",
-			candRes.ece-baseline.ece, baseline.ece, g.maxECEInc), true
+		return reasonEvaluationFailed,
+			fmt.Sprintf("ECE increased %.4f (baseline %.4f) > maxECEIncrease %.4f",
+				candRes.ece-baseline.ece, baseline.ece, g.maxECEInc), true
 	}
-	return "", false
+	return "", "", false
 }
 
 // ensureEval starts the candidate evaluation if not started, and returns its
@@ -550,9 +572,12 @@ func evalPolicyHash(evalSpec *decisionmodelv1alpha1.EvaluationSpec) string {
 	// (default applied, number formatting normalised) so "0.5", "0.50" and unset
 	// all hash the same, and only a real change (e.g. "1") shifts the hash.
 	tol := strconv.FormatFloat(scoreTolerance(evalSpec), 'f', -1, 64)
+	// scorerVersion covers HOW we score (not just the inputs): a change to the
+	// scoring/calibration/parsing/aggregation code bumps it, so a parked result
+	// computed by an older build is re-evaluated after an upgrade.
 	payload := strings.Join([]string{
 		evalSpec.MinAccuracy, evalSpec.MaxAccuracyDrop, evalSpec.MaxECE, evalSpec.MaxECEIncrease,
-		ref, strconv.Itoa(int(evalSpec.MaxCases)), tol,
+		ref, strconv.Itoa(int(evalSpec.MaxCases)), tol, strconv.Itoa(scorerVersion),
 	}, "\x1f")
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])[:16]

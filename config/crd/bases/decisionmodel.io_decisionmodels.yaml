@@ -1708,6 +1708,14 @@ spec:
                   brier:
                     description: Brier is the candidate's Brier score (decimal string).
                     type: string
+                  calibratedCases:
+                    description: |-
+                      CalibratedCases is the number of scored questions that yielded a usable
+                      probability distribution and therefore contributed to ECE/Brier. A
+                      calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:
+                      ECE over an empty set is 0, which would otherwise look perfectly calibrated.
+                    format: int32
+                    type: integer
                   cases:
                     description: Cases is the number of questions scored.
                     format: int32
@@ -1769,6 +1777,13 @@ spec:
                     description: Revision is the revision hash the evaluation was
                       run against.
                     type: string
+                  scorerVersion:
+                    description: |-
+                      ScorerVersion is the scoring/calibration implementation version this result
+                      was produced by. It is part of policyHash (and so approvalId), so an
+                      operator upgrade that changes scoring re-evaluates a parked candidate.
+                    format: int32
+                    type: integer
                 type: object
               failedRevision:
                 description: |-

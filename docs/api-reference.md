@@ -244,6 +244,7 @@ _Appears in:_
 | `baselineAccuracy` _string_ | BaselineAccuracy is the stable revision's accuracy for this dataset, if known. |  |  |
 | `cases` _integer_ | Cases is the number of questions scored. |  |  |
 | `failedCases` _integer_ | FailedCases is the number of questions that were wrong or unanswerable. |  |  |
+| `calibratedCases` _integer_ | CalibratedCases is the number of scored questions that yielded a usable<br />probability distribution and therefore contributed to ECE/Brier. A<br />calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:<br />ECE over an empty set is 0, which would otherwise look perfectly calibrated. |  | Optional: \{\} <br /> |
 | `ece` _string_ | ECE is the candidate's expected calibration error (decimal string). |  |  |
 | `brier` _string_ | Brier is the candidate's Brier score (decimal string). |  |  |
 | `baselineEce` _string_ | BaselineECE is the stable revision's ECE for this dataset, if known. |  |  |
@@ -254,6 +255,7 @@ _Appears in:_
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `scorerVersion` _integer_ | ScorerVersion is the scoring/calibration implementation version this result<br />was produced by. It is part of policyHash (and so approvalId), so an<br />operator upgrade that changes scoring re-evaluates a parked candidate. |  | Optional: \{\} <br /> |
 | `datasetDigest` _string_ | DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was<br />produced from. Together with policyHash it is the result's identity: if the<br />dataset content changes (same ConfigMap/Secret, edited in place) a parked<br />candidate is re-evaluated rather than promoted on the stale result. |  | Optional: \{\} <br /> |
 | `approvalId` _string_ | ApprovalID is the identity a manual approval must name: the first 12 hex of<br />sha256(revisionHash + policyHash + datasetDigest). Set the annotation<br />decisionmodel.io/promote to this value to promote. It changes whenever the<br />revision, policy or dataset changes, so an approval cannot carry over a<br />re-evaluation. |  | Optional: \{\} <br /> |
 | `completedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | CompletedAt is when the evaluation finished. |  | Optional: \{\} <br /> |

@@ -116,14 +116,15 @@ const (
 	reasonCacheNotShareable  = "CacheNotShareable"
 	reasonCacheSpecImmutable = "CacheSpecImmutable"
 
-	reasonEvaluationUnsupported = "EvaluationUnsupported"
-	reasonDatasetInvalid        = "DatasetInvalid"
-	reasonDatasetNotFound       = "DatasetNotFound"
-	reasonDatasetKeyNotFound    = "DatasetKeyNotFound"
-	reasonEvaluationTimeout     = "EvaluationTimeout"
-	reasonEvaluationFailed      = "EvaluationFailed"
-	reasonBaselineUnavailable   = "BaselineUnavailable"
-	reasonDatasetChanged        = "DatasetChanged"
+	reasonEvaluationUnsupported  = "EvaluationUnsupported"
+	reasonDatasetInvalid         = "DatasetInvalid"
+	reasonDatasetNotFound        = "DatasetNotFound"
+	reasonDatasetKeyNotFound     = "DatasetKeyNotFound"
+	reasonEvaluationTimeout      = "EvaluationTimeout"
+	reasonEvaluationFailed       = "EvaluationFailed"
+	reasonBaselineUnavailable    = "BaselineUnavailable"
+	reasonCalibrationUnavailable = "CalibrationUnavailable"
+	reasonDatasetChanged         = "DatasetChanged"
 
 	// Evaluated-condition reasons that tell the rollout story.
 	reasonEvaluationRunning = "EvaluationRunning"

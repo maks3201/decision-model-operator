@@ -57,6 +57,9 @@ type deciderFakeEngine struct {
 	// instead of a choice. A test uses it with scoreTolerance to control whether
 	// a case counts as correct (|score - expected| <= tolerance).
 	score *float64
+	// scoreProbs, when set, is attached to the score answer so it contributes to
+	// calibration (ECE/Brier); without it a score answer is accuracy-only.
+	scoreProbs map[string]float64
 	// decideErr, when set, makes Decide return a transport error. Atomic so a
 	// test can clear it between reconciles to simulate a blip that recovers.
 	decideErr atomic.Bool
@@ -79,9 +82,14 @@ func (d *deciderFakeEngine) Decide(
 	}
 	if d.score != nil {
 		// A score answer: correctness depends on the configured scoreTolerance.
-		return engine.DecideResponse{Answers: map[string]engine.Answer{
-			"q1": {Type: "score", Score: d.score},
-		}}, nil
+		// scoreProbs, when set, attaches a probability distribution so the answer
+		// contributes to calibration (ECE/Brier); without it the answer is
+		// accuracy-only (0 calibrated cases).
+		ans := engine.Answer{Type: "score", Score: d.score}
+		if d.scoreProbs != nil {
+			ans.Probabilities = d.scoreProbs
+		}
+		return engine.DecideResponse{Answers: map[string]engine.Answer{"q1": ans}}, nil
 	}
 	conf := d.conf
 	if c, ok := d.confByModel[req.Model]; ok {
@@ -481,6 +489,53 @@ var _ = Describe("Eval-gated rollout", func() {
 		Expect(deg).NotTo(BeNil())
 		Expect(deg.Reason).To(Equal(reasonEvaluationFailed))
 		Expect(deg.Message).To(ContainSubstring("maxECE"))
+	})
+
+	// A calibration gate must not pass on an ECE of 0 computed over zero
+	// calibrated cases: an all-score dataset with a decider that returns no
+	// probability distribution yields accuracy but no calibration evidence.
+	It("fails maxECE as CalibrationUnavailable when no case is calibrated", func() {
+		score := 2.0 // exact hit of expected level 2 -> accuracy 1.0, no probabilities
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), score: &score}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		scoreDS := strings.Repeat(`{"state":{},"questions":{"q1":{"type":"score"}},"expected":{"q1":2}}`+"\n", 10)
+		datasetCM("golden-nocal", scoreDS)
+		createEvalDM("cal-nocal", "golden-nocal", func(s *decisionmodelv1alpha1.EvaluationSpec) {
+			s.MaxECE = "0.10"
+		})
+
+		driveToEvaluating(r, "cal-nocal")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			return pollReconcile(r, "cal-nocal")
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseFailed))
+
+		dm := getDM("cal-nocal")
+		Expect(dm.Status.Evaluation.Accuracy).To(Equal("1.0000"))
+		Expect(dm.Status.Evaluation.CalibratedCases).To(Equal(int32(0)))
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Reason).To(Equal(reasonCalibrationUnavailable))
+	})
+
+	// With a probability distribution on the score answers the normal ECE path
+	// applies: calibrated cases > 0 and a well-calibrated candidate passes maxECE.
+	It("takes the normal ECE path for score answers that carry probabilities", func() {
+		score := 2.0
+		eng := &deciderFakeEngine{
+			fakeEngine: newFakeEngine(), score: &score,
+			scoreProbs: map[string]float64{"0": 0.0, "1": 0.0, "2": 1.0}, // confident and correct -> ECE ~0
+		}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		scoreDS := strings.Repeat(`{"state":{},"questions":{"q1":{"type":"score"}},"expected":{"q1":2}}`+"\n", 10)
+		datasetCM("golden-cal", scoreDS)
+		createEvalDM("cal-withprobs", "golden-cal", func(s *decisionmodelv1alpha1.EvaluationSpec) {
+			s.MaxECE = "0.10"
+		})
+
+		driveToEvaluating(r, "cal-withprobs")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			return pollReconcile(r, "cal-withprobs")
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM("cal-withprobs").Status.Evaluation.CalibratedCases).To(Equal(int32(10)))
 	})
 
 	// an ECE increase vs the stable baseline fails maxECEIncrease.

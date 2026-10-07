@@ -490,6 +490,12 @@ type EvaluationStatus struct {
 	Cases int32 `json:"cases,omitempty"`
 	// FailedCases is the number of questions that were wrong or unanswerable.
 	FailedCases int32 `json:"failedCases,omitempty"`
+	// CalibratedCases is the number of scored questions that yielded a usable
+	// probability distribution and therefore contributed to ECE/Brier. A
+	// calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:
+	// ECE over an empty set is 0, which would otherwise look perfectly calibrated.
+	// +optional
+	CalibratedCases int32 `json:"calibratedCases,omitempty"`
 	// ECE is the candidate's expected calibration error (decimal string).
 	ECE string `json:"ece,omitempty"`
 	// Brier is the candidate's Brier score (decimal string).
@@ -521,6 +527,11 @@ type EvaluationStatus struct {
 	// than promoted on the stale result.
 	// +optional
 	PolicyHash string `json:"policyHash,omitempty"`
+	// ScorerVersion is the scoring/calibration implementation version this result
+	// was produced by. It is part of policyHash (and so approvalId), so an
+	// operator upgrade that changes scoring re-evaluates a parked candidate.
+	// +optional
+	ScorerVersion int32 `json:"scorerVersion,omitempty"`
 	// DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was
 	// produced from. Together with policyHash it is the result's identity: if the
 	// dataset content changes (same ConfigMap/Secret, edited in place) a parked

@@ -45,6 +45,12 @@ type ModelRef struct {
 	// Digest is bare lowercase hex sha256 of the model manifest (Ollaya format,
 	// the same value /api/ps reports). Empty means "not resolved yet".
 	Digest string
+	// Manifest is the raw manifest as resolved (sha256(Manifest) == Digest).
+	// Resolve fills it; the controller persists it per revision and passes it
+	// back in Params so the prefetch Job can seed it and rebuild exactly this
+	// digest even after the tag moved upstream. Optional: empty means "pull by
+	// tag and verify" (the behaviour before it existed).
+	Manifest []byte
 }
 
 // Params is everything an engine needs to build workloads for one revision.
@@ -149,6 +155,18 @@ type RuntimeVersioner interface {
 	// RuntimeVersionFromImage returns the release an engine default image was built
 	// for, or "" when the image is not one of the engine's defaults.
 	RuntimeVersionFromImage(image string) string
+}
+
+// RuntimeImagePinner is an optional capability: it reports whether the engine
+// renders the runtime image for a version (and device) by an immutable digest.
+// The controller refuses a candidate whose runtime image would be a mutable tag
+// unless the operator explicitly allows unpinned runtime images, so one revision
+// hash always means one set of runtime bytes. An engine without it is treated as
+// unpinned.
+type RuntimeImagePinner interface {
+	// RuntimeImagePinned reports whether ServingPodSpec/PrefetchJobSpec render the
+	// image for this version ("" = the engine default) and device by digest.
+	RuntimeImagePinned(version, device string) bool
 }
 
 // PrefetchFailureClassifier is an optional capability: it maps a failed prefetch

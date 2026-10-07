@@ -1,0 +1,53 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- $sm := .Values.metrics.serviceMonitor }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "dmo.metricsServiceName" . }}
+  namespace: {{ $sm.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "dmo.labels" . | nindent 4 }}
+    control-plane: controller-manager
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "dmo.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      {{- with $sm.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with $sm.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      # The metrics endpoint is protected by authn/authz; Prometheus authenticates
+      # with its ServiceAccount token (the operator's metrics RBAC authorises the
+      # token-review). The port is HTTPS on 8443.
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        {{- if $sm.tlsVerify }}
+        insecureSkipVerify: false
+        {{- with $sm.tlsServerName }}
+        serverName: {{ . }}
+        {{- end }}
+        {{- with $sm.caSecret }}
+        ca:
+          secret:
+            name: {{ . }}
+            key: ca.crt
+        {{- end }}
+        {{- else }}
+        # The operator serves a self-signed metrics certificate by default; verifying
+        # it requires a cert-manager-issued cert (set serviceMonitor.tlsVerify=true with
+        # tlsServerName + caSecret). Until then, skip verification.
+        insecureSkipVerify: true
+        {{- end }}
+{{- end }}

@@ -92,6 +92,37 @@ func TestEvalKeyToleranceSeparatesCacheEntries(t *testing.T) {
 	}
 }
 
+// forgetMismatched cancels and drops an in-flight evaluation for the same
+// revision whose dataset/maxCases/tolerance differs from the current key (an
+// in-place dataset edit or tolerance change mid-Evaluating), and keeps the
+// current entry.
+func TestForgetMismatchedCancelsStaleSameRevisionRun(t *testing.T) {
+	s := newEvalStore()
+	cur := evalKey{"ns", "n", "rev", "ds-new", 0, 0.5}
+	stale := cur
+	stale.dataset = "ds-old"
+	other := evalKey{"ns", "n", "rev2", "ds-old", 0, 0.5} // different revision: untouched
+	cancelled := false
+	s.start(stale, func() { cancelled = true })
+	s.start(cur, func() {})
+	s.start(other, func() {})
+
+	s.forgetMismatched(cur)
+
+	if !cancelled {
+		t.Error("the stale same-revision run was not cancelled")
+	}
+	if _, ok := s.get(stale); ok {
+		t.Error("the stale entry was not dropped")
+	}
+	if _, ok := s.get(cur); !ok {
+		t.Error("the current entry must be kept")
+	}
+	if _, ok := s.get(other); !ok {
+		t.Error("a different revision's entry must be untouched")
+	}
+}
+
 func TestApplyCUDAArch(t *testing.T) {
 	archIn := func(key string) *corev1.Affinity {
 		return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{

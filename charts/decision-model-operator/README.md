@@ -197,8 +197,11 @@ GPU-enabled kind setup and the Pascal/Volta `:cuda12` note.
 ### Metrics, alerts and dashboard
 
 `metrics.enabled` (default `true`) exposes controller-runtime metrics on
-`:8443`/HTTPS and creates a metrics Service. The chart does not ship a Prometheus
-`ServiceMonitor`; scrape the Service with your monitoring stack.
+`:8443`/HTTPS and creates a metrics Service. `metrics.serviceMonitor.enabled`
+(default off) adds a Prometheus Operator `ServiceMonitor` for it (HTTPS, bearer-token
+auth; keep `tlsVerify: false` with the self-signed metrics cert, or set `tlsVerify: true`
+with `tlsServerName`+`caSecret` when you front it with a cert-manager cert). Without the
+Prometheus Operator, scrape the Service directly.
 
 Optional (both default **off**): `prometheusRule.enabled` ships a `PrometheusRule`
 with symptom-based alerts (each links a runbook under `docs/runbooks/`), and
@@ -344,6 +347,14 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | metrics.enabled | bool | `true` | Expose the metrics endpoint and create a metrics Service (8443/HTTPS). |
 | metrics.bindAddress | string | `":8443"` | Address the metrics server binds to. |
 | metrics.secure | bool | `true` | Serve metrics over HTTPS. |
+| metrics.serviceMonitor.enabled | bool | `false` | Create a `ServiceMonitor` for the metrics Service. Requires `metrics.enabled` and the Prometheus Operator CRDs. |
+| metrics.serviceMonitor.namespace | string | `""` | Namespace for the `ServiceMonitor` (empty = release namespace). |
+| metrics.serviceMonitor.labels | object | `{}` | Extra labels on the `ServiceMonitor` (e.g. the label your Prometheus `serviceMonitorSelector` matches). |
+| metrics.serviceMonitor.interval | string | `""` | Scrape interval (empty = Prometheus default). |
+| metrics.serviceMonitor.scrapeTimeout | string | `""` | Per-scrape timeout (empty = Prometheus default). |
+| metrics.serviceMonitor.tlsVerify | bool | `false` | Verify the metrics server certificate. Keep false with the operator's self-signed metrics cert; set true and provide `tlsServerName`+`caSecret` when you front it with a cert-manager cert (Secret `metrics-server-cert`). |
+| metrics.serviceMonitor.tlsServerName | string | `""` | `tlsConfig.serverName` when `tlsVerify` is true (e.g. `<release>-metrics.<ns>.svc`). |
+| metrics.serviceMonitor.caSecret | string | `""` | Secret name holding `ca.crt` for `tlsConfig.ca` when `tlsVerify` is true (cert-manager writes `metrics-server-cert`). |
 | healthProbeBindAddress | string | `":8081"` | Health/readiness probe bind address. |
 | manager.allowedRegistries | string | `"ollaya.dev"` | `--allowed-registries`: comma-separated registry hosts a `spec.model` may resolve from (SSRF guard). Add your mirror here if you use one. |
 | manager.allowInsecureRegistries | bool | `false` | `--allow-insecure-registries`: permit `http://` model registries (dev only). |
