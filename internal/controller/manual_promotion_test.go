@@ -604,6 +604,47 @@ var _ = Describe("manual promotion", func() {
 		Expect(getDM(name).Status.FailedRevision.Hash).To(Equal(cand))
 	})
 
+	// An operator upgrade that changes the scorer (scorerVersion bump) must
+	// re-evaluate a parked candidate: its recorded policyHash (produced by the old
+	// scorer) no longer matches the current one, so the old approvalId does not
+	// promote and a fresh evaluation runs. The upgrade is simulated by rewriting
+	// the recorded policyHash to a value from a different scorer version (exactly
+	// what a pre-upgrade result looks like after the bump).
+	It("re-evaluates a parked candidate after a scorer-version change and ignores the stale approval", func() {
+		name := "mp-scorer"
+		m := newManual(name, true, true)
+		cand := startCandidate(m, "kev:en", digest2)
+		Eventually(awaiting(m), "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+		recorded := getDM(name).Status.Evaluation
+		Expect(recorded.ScorerVersion).To(Equal(int32(scorerVersion)), "status records the scorer version")
+		oldID := recorded.ApprovalID
+		Expect(oldID).NotTo(BeEmpty())
+
+		// Simulate the pre-upgrade result: a policyHash from a different scorer
+		// version. (scorerVersion is a build constant; a bump changes the hash the
+		// same way this does.) Set the OLD approvalId in the same edit.
+		stalePolicy := recorded.PolicyHash + "x"
+		Expect(updateDMStatus(ctx, namespace, name, func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Status.Evaluation.PolicyHash = stalePolicy
+		})).To(Succeed())
+		annotate(name, oldID)
+
+		ph := reconcile1(m)
+		Expect(ph).NotTo(Equal(decisionmodelv1alpha1.PhaseReady), "the stale approval must not promote after a scorer change")
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(m.rev1))
+		// It re-evaluates and records the current scorer version / a fresh policyHash.
+		Eventually(func() string {
+			reconcile1(m)
+			ev := getDM(name).Status.Evaluation
+			if ev == nil {
+				return ""
+			}
+			return ev.PolicyHash
+		}, "10s", "50ms").ShouldNot(Equal(stalePolicy))
+		Expect(getDM(name).Status.Evaluation.ScorerVersion).To(Equal(int32(scorerVersion)))
+		_ = cand
+	})
+
 	// Editing the dataset content while parked re-evaluates (DatasetChanged) and
 	// rotates the approvalID; an approval for the OLD identity does not promote.
 	It("re-evaluates on a dataset content change and rotates the approvalID", func() {

@@ -39,13 +39,6 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
-// storeRecoverState is the per-DecisionModel lost-store recovery bookkeeping.
-type storeRecoverState struct {
-	attempts      int       // failed prefetch Jobs counted so far
-	lastFailedJob types.UID // UID of the last failed Job already counted (idempotency)
-	exhausted     bool      // retries exhausted; StorePrefetchFailed already emitted
-}
-
 // maintainStable keeps the recorded stable revision healthy while a candidate is
 // mid-rollout. It restores a deleted stable Deployment, applies an
 // API-key rotation (checksum), keeps the PDB, and regates the stable Pods — all
@@ -163,7 +156,7 @@ func (r *DecisionModelReconciler) recoverStableStore(
 	// Degraded=StoreTerminating through applyStableReadiness. ---
 	if !st.pvcMissing && !st.recovering {
 		if !st.terminating {
-			r.clearStoreRecover(dm.UID)
+			clearStoreRecover(dm)
 		}
 		return false, st.terminating, ctrl.Result{}, nil
 	}
@@ -172,7 +165,7 @@ func (r *DecisionModelReconciler) recoverStableStore(
 	// hold Degraded and keep the store being (re)filled. ---
 	// Once recovery is exhausted, StorePrefetchFailed owns the Degraded condition;
 	// do not overwrite it with StoreLost on every reconcile (no status churn).
-	if !r.storeRecoverExhausted(dm.UID) {
+	if !storeRecoverExhausted(dm) {
 		r.degradeStoreLost(ctx, dm, claim)
 	}
 
@@ -315,7 +308,7 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 			res, ferr := r.finish(ctx, dm, ctrl.Result{}, cerr)
 			return res, ferr
 		}
-		r.clearStoreRecover(dm.UID)
+		clearStoreRecover(dm)
 		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
 		return res, ferr
 	}
@@ -331,7 +324,7 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 			res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 			return res, ferr
 		}
-		if r.countFailedRecovery(dm.UID, st.job.UID) {
+		if r.countFailedRecovery(dm, st.job.UID) {
 			r.degradeStorePrefetchFailed(ctx, dm, claim)
 			// Stop churning: slow requeue, no further counting or writes.
 			res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
@@ -377,32 +370,29 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	return res, ferr
 }
 
-// countFailedRecovery records a failed recovery prefetch Job identified by jobUID.
-// It counts a given Job UID at most once (so a stale cache read of the same failed
-// Job is not double-counted) and returns whether the bounded retries are now
-// exhausted.
-func (r *DecisionModelReconciler) countFailedRecovery(dmUID, jobUID types.UID) (exhausted bool) {
-	r.storeRecoverMu.Lock()
-	defer r.storeRecoverMu.Unlock()
-	if r.storeRecover == nil {
-		r.storeRecover = map[types.UID]*storeRecoverState{}
-	}
-	s := r.storeRecover[dmUID]
+// countFailedRecovery records a failed recovery prefetch Job identified by jobUID
+// into dm.Status.StoreRecovery (persisted by the surrounding finish, so the bound
+// survives an operator restart). It counts a given Job UID at most once (so a
+// stale cache read of the same failed Job is not double-counted) and returns
+// whether the bounded retries are now exhausted. The caller must persist dm's
+// status (every caller returns through finish).
+func (r *DecisionModelReconciler) countFailedRecovery(dm *decisionmodelv1alpha1.DecisionModel, jobUID types.UID) (exhausted bool) {
+	s := dm.Status.StoreRecovery
 	if s == nil {
-		s = &storeRecoverState{}
-		r.storeRecover[dmUID] = s
+		s = &decisionmodelv1alpha1.StoreRecoveryStatus{}
+		dm.Status.StoreRecovery = s
 	}
-	if s.exhausted {
+	if s.Exhausted {
 		return true
 	}
-	if s.lastFailedJob != jobUID {
-		s.lastFailedJob = jobUID
-		s.attempts++
+	if s.LastFailedJob != string(jobUID) {
+		s.LastFailedJob = string(jobUID)
+		s.Attempts++
 	}
-	if s.attempts >= maxStoreRecoverAttempts {
-		s.exhausted = true
+	if s.Attempts >= maxStoreRecoverAttempts {
+		s.Exhausted = true
 	}
-	return s.exhausted
+	return s.Exhausted
 }
 
 // clearStoreRecoveringAnnotation removes the storeRecoveringAnnotation from a now
@@ -422,19 +412,16 @@ func (r *DecisionModelReconciler) clearStoreRecoveringAnnotation(
 
 // storeRecoverExhausted reports whether the bounded recovery retries for a
 // DecisionModel are exhausted (StorePrefetchFailed owns the Degraded condition).
-func (r *DecisionModelReconciler) storeRecoverExhausted(uid types.UID) bool {
-	r.storeRecoverMu.Lock()
-	defer r.storeRecoverMu.Unlock()
-	s := r.storeRecover[uid]
-	return s != nil && s.exhausted
+func storeRecoverExhausted(dm *decisionmodelv1alpha1.DecisionModel) bool {
+	return dm.Status.StoreRecovery != nil && dm.Status.StoreRecovery.Exhausted
 }
 
-// clearStoreRecover resets the (in-memory, bound-only) failure counter for a
-// DecisionModel. The restart-safe "recovering" signal lives on the PVC annotation.
-func (r *DecisionModelReconciler) clearStoreRecover(uid types.UID) {
-	r.storeRecoverMu.Lock()
-	defer r.storeRecoverMu.Unlock()
-	delete(r.storeRecover, uid)
+// clearStoreRecover resets the persisted recovery bookkeeping for a
+// DecisionModel (on completion, a new revision, or a retry token). The
+// restart-safe "recovering" signal lives on the PVC annotation; the attempt
+// bound lives in status.storeRecovery, cleared here. The caller persists it.
+func clearStoreRecover(dm *decisionmodelv1alpha1.DecisionModel) {
+	dm.Status.StoreRecovery = nil
 }
 
 // degradeStorePrefetchFailed marks a lost-store recovery as exhausted after
@@ -987,13 +974,23 @@ func (r *DecisionModelReconciler) prefetchFailureReason(
 // exit code of the most recently started failed Pod of a revision's prefetch
 // Job. Prefetch Pods carry LabelName + LabelPrefetchRevision (never
 // LabelRevision, which is a serving selector), so they are in the operator's
-// name-scoped Pod cache. found is false when no such Pod/termination is
-// available.
+// name-scoped Pod cache. Those labels can be set by anyone with Pod create
+// rights in the namespace, so a Pod is trusted only when its controller
+// OwnerReference is the current prefetch Job's UID, and that Job is itself owned
+// by this DecisionModel. found is false when the Job is missing or not ours, or
+// when no owned Pod has a usable termination.
 func (r *DecisionModelReconciler) newestFailedPrefetchTermination(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	rev string,
 ) (message string, exitCode int32, found bool) {
+	var job batchv1.Job
+	if err := r.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: prefetchName(dm, rev)}, &job); err != nil {
+		return "", 0, false
+	}
+	if !ownedBy(&job, dm) {
+		return "", 0, false
+	}
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(dm.Namespace),
 		client.MatchingLabels{
@@ -1006,8 +1003,10 @@ func (r *DecisionModelReconciler) newestFailedPrefetchTermination(
 	var newestStart time.Time
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		// Second guard: only the Job's own Pods (it sets job-name).
-		if p.Labels["job-name"] != prefetchName(dm, rev) {
+		// Trust ownership, not labels: only Pods controlled by the current Job's
+		// UID. A foreign Pod with matching labels/job-name, or a previous Job's
+		// Pod reusing the name with a different UID, is ignored.
+		if c := metav1.GetControllerOf(p); c == nil || c.Kind != "Job" || c.UID != job.UID {
 			continue
 		}
 		term := terminatedContainer(p)

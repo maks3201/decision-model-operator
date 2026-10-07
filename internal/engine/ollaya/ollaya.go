@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -839,8 +840,9 @@ func (e *Engine) Resolve(ctx context.Context, name string) (engine.ModelRef, err
 
 	sum := sha256.Sum256(body)
 	return engine.ModelRef{
-		Name:   p.canonical(),
-		Digest: hex.EncodeToString(sum[:]),
+		Name:     p.canonical(),
+		Digest:   hex.EncodeToString(sum[:]),
+		Manifest: body,
 	}, nil
 }
 
@@ -1393,6 +1395,28 @@ fail() {
   printf 'reason: %s\n' "$1"
   exit "$2"
 }
+# Seed: if the controller passed the recorded manifest bytes (base64 in
+# MANIFEST_SEED_B64), verify them against EXPECT_DIGEST and write them to the
+# on-disk tag path BEFORE pulling. ollaya pull then trusts the on-disk manifest
+# (spike 009) and fetches exactly the referenced blobs, so the store is rebuilt
+# to the recorded digest even if the tag moved upstream. A seed whose sha256 does
+# not match EXPECT_DIGEST is a permanent DigestMismatch BEFORE anything is written.
+if [ -n "${MANIFEST_SEED_B64:-}" ]; then
+  if [ -z "${EXPECT_DIGEST:-}" ] || [ -z "${MANIFEST_PATH:-}" ]; then
+    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+  fi
+  seed_tmp="$(mktemp)"
+  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+  seed_digest="$(sha256sum "$seed_tmp" | cut -d' ' -f1)"
+  if [ "$seed_digest" != "$EXPECT_DIGEST" ]; then
+    echo "seed manifest digest $seed_digest != expected $EXPECT_DIGEST; refusing to write" >&2
+    rm -f "$seed_tmp"
+    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+  fi
+  mkdir -p "$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
+  mv "$seed_tmp" "$OLLAYA_MODELS/$MANIFEST_PATH"
+  echo "seeded manifest for $seed_digest at $MANIFEST_PATH"
+fi
 pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
   echo "$pull_err" >&2
   case "$pull_err" in
@@ -1522,6 +1546,25 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 	}
 }
 
+// maxSeedManifestBytes caps the raw manifest the Job will seed. Real manifests
+// are a few KB (laya:en is ~3 KB); the cap is generous for a multi-layer manifest
+// but keeps a hostile/oversized value out of the Pod spec env (the kernel bounds
+// the whole arg/env block). A larger manifest simply skips seeding and falls back
+// to pull-by-tag.
+const maxSeedManifestBytes = 256 << 10 // 256 KiB
+
+// seedManifestUsable reports whether a ModelRef carries manifest bytes we can
+// seed: present, within the size cap, with a digest to verify against, and
+// sha256(Manifest) actually equals Digest (defence in depth — the Job re-checks,
+// but a mismatched pair here is a controller bug we must not ship into the store).
+func seedManifestUsable(m engine.ModelRef) bool {
+	if len(m.Manifest) == 0 || len(m.Manifest) > maxSeedManifestBytes || m.Digest == "" {
+		return false
+	}
+	sum := sha256.Sum256(m.Manifest)
+	return hex.EncodeToString(sum[:]) == m.Digest
+}
+
 // revHashRE validates a store sub-path / keep-list entry: the controller's
 // revision hash is exactly 10 lowercase hex chars. Only entries matching this
 // may ever be pruned; legacy store dirs (manifests/, blobs/, lost+found) never
@@ -1562,6 +1605,22 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		{Name: "EXPECT_DIGEST", Value: p.Model.Digest},
 		{Name: "OLLAYA_MODELS", Value: modelsMount},
 		{Name: "MANIFEST_PATH", Value: manifestPath},
+	}
+
+	// Seed the recorded manifest bytes so the Job can rebuild exactly this digest
+	// even after the tag moved upstream (spike 009: ollaya pull trusts an on-disk
+	// manifest). Only when: the controller supplied the bytes, this is the normal
+	// pull script (not a refuse script), the on-disk path is known, and the digest
+	// matches the bytes. The bytes go in a base64 env var — manifests are a few KB;
+	// a cap keeps a hostile/oversized value out of the Pod spec (the whole env
+	// block is bounded by the kernel's arg/env limit). The script re-verifies the
+	// seed against EXPECT_DIGEST before writing, so a wrong value fails permanently
+	// without touching the store.
+	if script == prefetchScript && manifestPath != "" && seedManifestUsable(p.Model) {
+		env = append(env, corev1.EnvVar{
+			Name:  "MANIFEST_SEED_B64",
+			Value: base64.StdEncoding.EncodeToString(p.Model.Manifest),
+		})
 	}
 
 	// Point `ollaya pull` at the same registry the resolver used. The Ollaya

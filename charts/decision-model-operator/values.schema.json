@@ -85,6 +85,21 @@
         "secure": {
           "type": "boolean",
           "description": "Serve metrics over HTTPS."
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Prometheus Operator ServiceMonitor for the metrics Service.",
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Create a ServiceMonitor (requires metrics.enabled and the Prometheus Operator CRDs)." },
+            "namespace": { "type": "string", "description": "Namespace for the ServiceMonitor (empty = release namespace)." },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra labels on the ServiceMonitor." },
+            "interval": { "type": "string", "description": "Scrape interval (empty = Prometheus default)." },
+            "scrapeTimeout": { "type": "string", "description": "Per-scrape timeout (empty = Prometheus default)." },
+            "tlsVerify": { "type": "boolean", "description": "Verify the metrics server certificate (needs a cert-manager cert + tlsServerName/caSecret)." },
+            "tlsServerName": { "type": "string", "description": "tlsConfig.serverName when tlsVerify is true." },
+            "caSecret": { "type": "string", "description": "Secret holding ca.crt for tlsConfig.ca when tlsVerify is true." }
+          }
         }
       }
     },

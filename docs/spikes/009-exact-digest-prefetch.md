@@ -116,3 +116,45 @@ case C: the real laya:en manifest           -> OK (digest matches)
 Persist the resolved manifest bytes alongside the digest so store recovery of a stable
 revision can pre-seed the manifest and re-pull by tag to materialise exactly D even after
 the tag moved. See the task report's Requests for the proposed capability.
+
+## Implementation results — rebuild from a seeded manifest
+
+The engine now implements the pre-seed recovery the spike identified. `Resolve` fills
+`engine.ModelRef.Manifest` with the exact bytes it hashed (`sha256(Manifest) == Digest`).
+When the controller passes those bytes back in `Params.Model.Manifest`, `PrefetchJobSpec`
+delivers them to the Job as a base64 env var (`MANIFEST_SEED_B64`, capped at 256 KiB — real
+manifests are a few KB; a larger one falls back to pull-by-tag). The script verifies
+`sha256(seed) == EXPECT_DIGEST` **before** writing, writes the seed to the on-disk tag path
+(`manifests/<host>/<ns>/<model>/<tag>`, same layout helpers, mirror hosts included), then
+`ollaya pull` (which trusts the on-disk manifest) and the existing post-pull digest check.
+
+Proven on the real image (identical on `:0.10.0` and `:0.12.0`): a FRESH store (no blobs)
+seeded with laya:en's recorded manifest, running the rendered prefetch script, then
+`ollaya serve` from that store:
+
+```
+seeded manifest for c305a9276531…e9d at manifests/ollaya.dev/library/laya/en
+pulled digest: c305a9276531…e9d
+digest ok: c305a9276531…e9d        # script exit=0, 9 blobs fetched from the seed
+# serve from the rebuilt store:
+host liveness -> 200
+load http=200
+/api/ps: {"models":[{"name":"laya:en","digest":"c305a9276531…e9d","device":"cpu"}]}
+```
+
+So the store is rebuilt to the recorded digest from the manifest bytes alone — no
+pull-by-digest, and no dependency on what the tag points to now. A seed whose sha256 does
+not match the expected digest fails permanently BEFORE any write (verified: `reason:
+DigestMismatch`, exit 4, manifest not written).
+
+### Failure class: weights/commit gone upstream
+
+The seed rebuilds the manifest, but `ollaya pull` still fetches the referenced blobs — the
+registry `sha256` blobs and the HF commit-pinned weights (`.../resolve/<commit>/...`). If
+that upstream content is deleted (the HF commit/file removed, or the registry blob gone),
+the pull fails to fetch a layer. That surfaces as a pull error, not a digest mismatch, and
+the script classifies it as `Transient` (exit 1, retried) — the Job keeps retrying until the
+deadline, then the revision fails. This is correct: the content genuinely no longer exists,
+and no local action can recover it; the operator cannot invent the weights. (A dedicated
+"blobs gone" permanent reason would need the CLI to distinguish a 404-on-blob from a
+transient network error, which it does not expose today — noted for a future upstream ask.)

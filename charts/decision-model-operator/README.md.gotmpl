@@ -190,8 +190,11 @@ GPU-enabled kind setup and the Pascal/Volta `:cuda12` note.
 ### Metrics, alerts and dashboard
 
 `metrics.enabled` (default `true`) exposes controller-runtime metrics on
-`:8443`/HTTPS and creates a metrics Service. The chart does not ship a Prometheus
-`ServiceMonitor`; scrape the Service with your monitoring stack.
+`:8443`/HTTPS and creates a metrics Service. `metrics.serviceMonitor.enabled`
+(default off) adds a Prometheus Operator `ServiceMonitor` for it (HTTPS, bearer-token
+auth; keep `tlsVerify: false` with the self-signed metrics cert, or set `tlsVerify: true`
+with `tlsServerName`+`caSecret` when you front it with a cert-manager cert). Without the
+Prometheus Operator, scrape the Service directly.
 
 Optional (both default **off**): `prometheusRule.enabled` ships a `PrometheusRule`
 with symptom-based alerts (each links a runbook under `docs/runbooks/`), and

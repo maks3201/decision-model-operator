@@ -228,7 +228,8 @@ type RolloutSpec struct {
 	//   - EvaluationGated: like Automatic but requires rollout.evaluation to be
 	//     set (rejected by CEL otherwise); the gate decides promotion.
 	//   - Manual: hold the candidate in AwaitingPromotion until a human sets the
-	//     annotation decisionmodel.io/promote to the candidate's revision hash
+	//     annotation decisionmodel.io/promote to status.evaluation.approvalId (or,
+	//     without evaluation, the candidate's revision hash for one release)
 	//     (evaluation still runs when configured).
 	// When unset the effective policy is EvaluationGated if rollout.evaluation is
 	// set, else Automatic. The deprecated manualPromotion:true is an alias for
@@ -240,8 +241,9 @@ type RolloutSpec struct {
 
 	// ManualPromotion holds a candidate that passed its gate (model-ready, plus
 	// evaluation when configured) in phase AwaitingPromotion until a human
-	// approves it by setting the annotation decisionmodel.io/promote to the
-	// candidate's revision hash. The stable revision keeps serving meanwhile.
+	// approves it by setting the annotation decisionmodel.io/promote to
+	// status.evaluation.approvalId (or, without evaluation, the candidate's
+	// revision hash for one release). The stable revision keeps serving meanwhile.
 	// There is no progress timeout while waiting. The very first revision of a
 	// DecisionModel (no stable revision yet) is promoted without approval, since
 	// there is no traffic to protect. The approval annotation is removed once the
@@ -468,6 +470,28 @@ type ReplicaStatus struct {
 	ModelReady int32 `json:"modelReady,omitempty"`
 }
 
+// StoreRecoveryStatus is the bounded-retry bookkeeping for lost-store recovery of
+// the stable revision. It survives an operator restart so the attempt bound is
+// honoured across restarts.
+type StoreRecoveryStatus struct {
+	// Attempts is the number of failed recovery prefetch Jobs counted so far
+	// toward the retry bound.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// LastFailedJob is the UID of the last failed prefetch Job already counted, so
+	// a repeated observation of the same Job (e.g. a stale cache read) is not
+	// double-counted.
+	// +optional
+	LastFailedJob string `json:"lastFailedJob,omitempty"`
+
+	// Exhausted is true once Attempts reached the bound: recovery stopped with
+	// Degraded=StorePrefetchFailed and will not recreate the prefetch Job again
+	// until a new revision or a decisionmodel.io/retry token resets it.
+	// +optional
+	Exhausted bool `json:"exhausted,omitempty"`
+}
+
 // EvaluationResult is the outcome of applying the evaluation gate.
 type EvaluationResult string
 
@@ -490,6 +514,12 @@ type EvaluationStatus struct {
 	Cases int32 `json:"cases,omitempty"`
 	// FailedCases is the number of questions that were wrong or unanswerable.
 	FailedCases int32 `json:"failedCases,omitempty"`
+	// CalibratedCases is the number of scored questions that yielded a usable
+	// probability distribution and therefore contributed to ECE/Brier. A
+	// calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:
+	// ECE over an empty set is 0, which would otherwise look perfectly calibrated.
+	// +optional
+	CalibratedCases int32 `json:"calibratedCases,omitempty"`
 	// ECE is the candidate's expected calibration error (decimal string).
 	ECE string `json:"ece,omitempty"`
 	// Brier is the candidate's Brier score (decimal string).
@@ -521,6 +551,11 @@ type EvaluationStatus struct {
 	// than promoted on the stale result.
 	// +optional
 	PolicyHash string `json:"policyHash,omitempty"`
+	// ScorerVersion is the scoring/calibration implementation version this result
+	// was produced by. It is part of policyHash (and so approvalId), so an
+	// operator upgrade that changes scoring re-evaluates a parked candidate.
+	// +optional
+	ScorerVersion int32 `json:"scorerVersion,omitempty"`
 	// DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was
 	// produced from. Together with policyHash it is the result's identity: if the
 	// dataset content changes (same ConfigMap/Secret, edited in place) a parked
@@ -592,6 +627,13 @@ type DecisionModelStatus struct {
 	// controller last consumed to clear a failed revision.
 	// +optional
 	LastRetryToken string `json:"lastRetryToken,omitempty"`
+
+	// StoreRecovery tracks the bounded retries of lost-store recovery for the
+	// stable revision. It is persisted so the attempt bound survives an operator
+	// restart (an in-memory counter would reset and allow more recreations than
+	// the documented limit).
+	// +optional
+	StoreRecovery *StoreRecoveryStatus `json:"storeRecovery,omitempty"`
 
 	// Replicas reports desired and model-ready replica counts.
 	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Replicas",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}

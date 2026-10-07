@@ -77,6 +77,10 @@ jobs:
           helm template dmo charts/decision-model-operator --namespace dmo-system \
             --set prometheusRule.enabled=true \
             --set grafanaDashboard.enabled=true \
+            --set metrics.serviceMonitor.enabled=true \
+            --set metrics.serviceMonitor.tlsVerify=true \
+            --set metrics.serviceMonitor.caSecret=metrics-server-cert \
+            --set metrics.serviceMonitor.interval=30s \
             --set prometheusRule.labels.release=kps \
             --set prometheusRule.windows.rolloutStuck=30m >/dev/null
 
@@ -101,6 +105,8 @@ jobs:
           assert_fail --set prometheusRule.runbookUrl=ftp://x  # not an http(s) URL
           assert_fail --set prometheusRule.widows.degraded=5m  # typo'd key under prometheusRule
           assert_fail --set grafanaDashboard.enabed=true       # typo'd key under grafanaDashboard
+          assert_fail --set metrics.serviceMonitor.enabled=yes # wrong type (bool)
+          assert_fail --set metrics.serviceMonitor.tlsVerfy=true # typo'd key under serviceMonitor
           echo "schema correctly rejected all negative cases"
 
       - name: artifacthub.io/changes generator produces a packageable chart

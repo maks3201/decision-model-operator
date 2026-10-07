@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -60,7 +61,8 @@ var _ = Describe("prefetch failure classification", func() {
 		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
 	}
 	// failPrefetch marks the revision's prefetch Job failed and creates a failed
-	// prefetch Pod whose first container terminated with the given message.
+	// prefetch Pod, controlled by that Job, whose first container terminated with
+	// the given message.
 	failPrefetch := func(name, rev, termMsg string, exit int32) {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
@@ -72,6 +74,7 @@ var _ = Describe("prefetch failure classification", func() {
 		}
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 
+		yes := true
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: name + "-prefetch-" + rev + "-abc",
@@ -80,6 +83,10 @@ var _ = Describe("prefetch failure classification", func() {
 					decisionmodelv1alpha1.LabelPrefetchRevision: rev,
 					"job-name": name + "-prefetch-" + rev,
 				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
+					Controller: &yes, BlockOwnerDeletion: &yes,
+				}},
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
 		}
@@ -147,4 +154,131 @@ var _ = Describe("prefetch failure classification", func() {
 		Entry("digest mismatch", "DigestMismatch: manifest sha256 differs", "DigestMismatch"),
 		Entry("transient", "connection reset by peer", "Transient"),
 	)
+
+	// newestFailedPrefetchTermination trusts the current prefetch Job's UID, not
+	// the labels (which anyone with Pod create rights can set). A Pod is read only
+	// when its controller OwnerReference is that Job.
+	Describe("prefetch termination lookup trusts the Job UID", func() {
+		// mkPod creates a terminated prefetch Pod with the given controller
+		// OwnerReference UID (empty = no owner); labels always match the filter.
+		mkPod := func(name, rev, suffix, msg string, exit int32, ownerUID types.UID) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: name + "-prefetch-" + rev + "-" + suffix,
+					Labels: map[string]string{
+						decisionmodelv1alpha1.LabelName:             name,
+						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
+						"job-name": name + "-prefetch-" + rev,
+					},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
+			}
+			if ownerUID != "" {
+				yes := true
+				pod.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: name + "-prefetch-" + rev,
+					UID: ownerUID, Controller: &yes, BlockOwnerDeletion: &yes,
+				}}
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			now := metav1.Now()
+			pod.Status.StartTime = &now
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "prefetch",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: exit, Message: msg,
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+
+		var (
+			r    *DecisionModelReconciler
+			name string
+			rev  string
+			job  *batchv1.Job
+		)
+		BeforeEach(func() {
+			r = newR()
+			name = "own"
+			Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+				ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+				Spec: decisionmodelv1alpha1.DecisionModelSpec{
+					Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+				},
+			})).To(Succeed())
+			rec(r, name) // resolve + create prefetch Job
+			rev = RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+			job = &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+			Expect(job.UID).NotTo(BeEmpty())
+		})
+
+		It("ignores a foreign Pod with matching labels and job-name", func() {
+			mkPod(name, rev, "foreign", "evil ModelNotFound", 1, "")
+			_, _, found := r.newestFailedPrefetchTermination(ctx, getDM(name), rev)
+			Expect(found).To(BeFalse())
+		})
+
+		It("ignores a Pod of a previous Job that reused the name (different UID)", func() {
+			mkPod(name, rev, "stale", "stale ModelNotFound", 1, types.UID("00000000-0000-0000-0000-000000000000"))
+			_, _, found := r.newestFailedPrefetchTermination(ctx, getDM(name), rev)
+			Expect(found).To(BeFalse())
+		})
+
+		It("uses a Pod controlled by the current Job", func() {
+			mkPod(name, rev, "owned", "DigestMismatch here", 7, job.UID)
+			msg, exit, found := r.newestFailedPrefetchTermination(ctx, getDM(name), rev)
+			Expect(found).To(BeTrue())
+			Expect(msg).To(Equal("DigestMismatch here"))
+			Expect(exit).To(Equal(int32(7)))
+		})
+
+		It("returns found=false when the prefetch Job is missing", func() {
+			// A revision whose prefetch Job was never created: an owned-looking Pod
+			// (any UID) must not be trusted because its Job cannot be verified.
+			missingRev := rev + "x"
+			mkPod(name, missingRev, "orphan", "DigestMismatch", 1, types.UID("11111111-1111-1111-1111-111111111111"))
+			_, _, found := r.newestFailedPrefetchTermination(ctx, getDM(name), missingRev)
+			Expect(found).To(BeFalse())
+		})
+
+		It("picks the newest owned Pod when several exist", func() {
+			mkPod(name, rev, "old", "old reason", 1, job.UID)
+			// Create the second owned Pod with a strictly later start time.
+			old := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev + "-old"}, old)).To(Succeed())
+			yes := true
+			newPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: name + "-prefetch-" + rev + "-new",
+					Labels: map[string]string{
+						decisionmodelv1alpha1.LabelName:             name,
+						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
+						"job-name": name + "-prefetch-" + rev,
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
+						Controller: &yes, BlockOwnerDeletion: &yes,
+					}},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
+			}
+			Expect(k8sClient.Create(ctx, newPod)).To(Succeed())
+			later := metav1.NewTime(old.Status.StartTime.Add(time.Hour))
+			newPod.Status.StartTime = &later
+			newPod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "prefetch",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 2, Message: "new reason",
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, newPod)).To(Succeed())
+
+			msg, exit, found := r.newestFailedPrefetchTermination(ctx, getDM(name), rev)
+			Expect(found).To(BeTrue())
+			Expect(msg).To(Equal("new reason"))
+			Expect(exit).To(Equal(int32(2)))
+		})
+	})
 })

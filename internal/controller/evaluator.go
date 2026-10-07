@@ -99,6 +99,14 @@ func parseDataset(raw []byte, maxCases int) ([]evalCase, error) {
 	return cases, nil
 }
 
+// scorerVersion identifies the scoring/calibration implementation. It is part of
+// the evaluation identity (evalPolicyHash -> approvalId), so an operator upgrade
+// that changes HOW a result is computed re-evaluates a parked candidate instead
+// of promoting it on a stale result. Bump it on any change to: scorePrediction /
+// MatchScore semantics, the calibration (ECE/Brier) computation, dataset case
+// parsing, or result aggregation.
+const scorerVersion = 1
+
 // scoreOutcome is the result of scoring one answer against its golden value.
 type scoreOutcome struct {
 	scored         bool                   // false: unknown type / malformed expectation -> wrong
@@ -160,15 +168,16 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 
 // evalResult is the outcome of an evaluation run.
 type evalResult struct {
-	accuracy    float64
-	ece         float64
-	brier       float64
-	total       int
-	failedCases int
-	transport   int // number of per-case transport errors (not scored as answers)
-	done        bool
-	err         error // non-nil on dataset/timeout/transport failure
-	timedOut    bool
+	accuracy        float64
+	ece             float64
+	brier           float64
+	total           int
+	failedCases     int
+	calibratedCases int // scored questions that fed ECE/Brier (len(preds))
+	transport       int // number of per-case transport errors (not scored as answers)
+	done            bool
+	err             error // non-nil on dataset/timeout/transport failure
+	timedOut        bool
 }
 
 // runEvaluation scores every case sequentially against a single Pod baseURL.
@@ -244,13 +253,14 @@ func runEvaluation(
 		acc = float64(correct) / float64(total)
 	}
 	res := evalResult{
-		accuracy:    acc,
-		ece:         calibration.ECE(preds, 0),
-		brier:       calibration.Brier(preds),
-		total:       total,
-		failedCases: failed,
-		transport:   transport,
-		done:        true,
+		accuracy:        acc,
+		ece:             calibration.ECE(preds, 0),
+		brier:           calibration.Brier(preds),
+		total:           total,
+		failedCases:     failed,
+		calibratedCases: len(preds),
+		transport:       transport,
+		done:            true,
 	}
 	// Any transport error invalidates the whole run: a partial/blip score must
 	// never promote a candidate or stand in as a baseline.
@@ -327,6 +337,30 @@ func (s *evalStore) finish(k evalKey, r evalResult) {
 	if e, ok := s.results[k]; ok {
 		e.result = r
 		e.cancel = nil
+	}
+}
+
+// forgetMismatched cancels and drops any entry for the same
+// (namespace,name,revision) as cur whose other identity fields
+// (dataset/maxCases/tolerance) differ from cur — i.e. a run started for a
+// now-superseded eval identity of the SAME revision (e.g. an in-place dataset
+// edit or a tolerance change while Evaluating). forgetExcept only keys on
+// revision, so without this the old-dataset goroutine for the current revision
+// keeps sending requests until the revision changes.
+func (s *evalStore) forgetMismatched(cur evalKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, e := range s.results {
+		if k.namespace != cur.namespace || k.name != cur.name || k.revision != cur.revision {
+			continue
+		}
+		if k == cur {
+			continue // the current identity: keep it
+		}
+		if e.cancel != nil {
+			e.cancel()
+		}
+		delete(s.results, k)
 	}
 }
 

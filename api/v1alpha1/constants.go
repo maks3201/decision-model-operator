@@ -105,7 +105,11 @@ const MaxNameLength = 43
 // change.
 const AnnotationRetry = "decisionmodel.io/retry"
 
-// AnnotationPromote approves a candidate held by spec.rollout.manualPromotion.
-// Its value must equal status.candidateRevision.hash; an approval for any other
-// revision is ignored. The controller removes it after the promotion is persisted.
+// AnnotationPromote approves a candidate held for manual promotion. When
+// spec.rollout.evaluation is set its value must equal status.evaluation.approvalId
+// (which binds the approval to the evaluated revision, policy and dataset); a bare
+// revision hash is then ignored. Without evaluation the value may be the candidate
+// revision hash, accepted for one release with a Warning Event. An approval for any
+// other value is ignored. The controller removes the annotation after the promotion
+// is persisted.
 const AnnotationPromote = "decisionmodel.io/promote"

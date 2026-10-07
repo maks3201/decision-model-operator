@@ -217,8 +217,10 @@ func main() {
 	var maxConcurrentRollouts int
 	flag.IntVar(&maxConcurrentRollouts, "max-concurrent-rollouts", 0,
 		"Maximum DecisionModels rolling out at once across the watched scope (0 = unlimited). "+
-			"Others wait in phase Pending. Set a small value (e.g. 2-3) to avoid a fleet-wide "+
-			"stampede when the operator's default runtime image changes under FollowOperator.")
+			"A DecisionModel counts as rolling out while it has a candidate revision OR is still "+
+			"inside its post-promotion stabilization window (its previous revision's Deployment is "+
+			"kept running). Others wait in phase Pending. Set a small value (e.g. 2-3) to avoid a "+
+			"fleet-wide stampede when the operator's default runtime image changes under FollowOperator.")
 	var watchNamespacesRaw string
 	flag.StringVar(&watchNamespacesRaw, "watch-namespaces", "",
 		"Comma-separated namespaces to watch. Empty (default) watches all namespaces. "+

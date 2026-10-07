@@ -42,6 +42,25 @@ type stabilizationResult struct {
 	err        error
 }
 
+// inStabilizationWindow reports whether a DecisionModel is currently keeping a
+// previous revision alive inside its post-promotion stabilization window. While
+// true the previous revision's Deployment is still running (the second GPU/disk
+// the rollout budget exists to bound) and the DM can still roll back to it, so
+// the fleet budget must count it as an active rollout. It mirrors the window
+// guard in reconcileStabilization: a previous revision with a promotedAt and a
+// positive window whose elapsed time has not passed the window.
+func (r *DecisionModelReconciler) inStabilizationWindow(dm *decisionmodelv1alpha1.DecisionModel) bool {
+	p := dm.Status.PreviousRevision
+	if p == nil || p.Hash == "" || p.PromotedAt == nil {
+		return false
+	}
+	window := stabilizationFor(dm)
+	if window <= 0 {
+		return false
+	}
+	return r.now().Sub(p.PromotedAt.Time) < window
+}
+
 // reconcileStabilization runs the post-promotion stabilization window on the
 // stable path. While the previous revision is still kept (status.previousRevision
 // within the window) it watches the new stable's health; if the new stable turns

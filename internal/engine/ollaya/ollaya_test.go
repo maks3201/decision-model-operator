@@ -313,6 +313,14 @@ func TestResolveKnownDigest(t *testing.T) {
 	if ref.Digest != digest {
 		t.Errorf("digest = %q, want %q (sha256 of raw body)", ref.Digest, digest)
 	}
+	// Resolve must return the exact bytes it hashed so the controller can persist
+	// them and seed a rebuild later (sha256(Manifest) == Digest).
+	if string(ref.Manifest) != manifest {
+		t.Errorf("manifest = %q, want the raw body %q", string(ref.Manifest), manifest)
+	}
+	if sum2 := sha256.Sum256(ref.Manifest); hex.EncodeToString(sum2[:]) != ref.Digest {
+		t.Errorf("sha256(Manifest) != Digest")
+	}
 }
 
 func TestResolveAuthHeader(t *testing.T) {

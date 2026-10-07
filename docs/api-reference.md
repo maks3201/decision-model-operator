@@ -182,6 +182,7 @@ _Appears in:_
 | `failedRevision` _[RevisionStatus](#revisionstatus)_ | FailedRevision is a revision that failed to roll out. The controller does<br />not automatically retry it; a spec change (new revision) is required, or<br />setting the decisionmodel.io/retry annotation to a new token re-attempts<br />the same revision. |  | Optional: \{\} <br /> |
 | `previousRevision` _[PreviousRevisionStatus](#previousrevisionstatus)_ | PreviousRevision is the revision that was stable immediately before the<br />most recent promotion. It may linger for a short grace period after<br />promotedAt so the new revision's endpoints populate before it is removed. |  | Optional: \{\} <br /> |
 | `lastRetryToken` _string_ | LastRetryToken is the value of the decisionmodel.io/retry annotation the<br />controller last consumed to clear a failed revision. |  | Optional: \{\} <br /> |
+| `storeRecovery` _[StoreRecoveryStatus](#storerecoverystatus)_ | StoreRecovery tracks the bounded retries of lost-store recovery for the<br />stable revision. It is persisted so the attempt bound survives an operator<br />restart (an in-memory counter would reset and allow more recreations than<br />the documented limit). |  | Optional: \{\} <br /> |
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
 | `evaluation` _[EvaluationStatus](#evaluationstatus)_ | Evaluation records the most recent eval-gated rollout result. |  | Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#condition-v1-meta) array_ | Conditions represent the latest available observations of the object's state. |  | Optional: \{\} <br /> |
@@ -244,6 +245,7 @@ _Appears in:_
 | `baselineAccuracy` _string_ | BaselineAccuracy is the stable revision's accuracy for this dataset, if known. |  |  |
 | `cases` _integer_ | Cases is the number of questions scored. |  |  |
 | `failedCases` _integer_ | FailedCases is the number of questions that were wrong or unanswerable. |  |  |
+| `calibratedCases` _integer_ | CalibratedCases is the number of scored questions that yielded a usable<br />probability distribution and therefore contributed to ECE/Brier. A<br />calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:<br />ECE over an empty set is 0, which would otherwise look perfectly calibrated. |  | Optional: \{\} <br /> |
 | `ece` _string_ | ECE is the candidate's expected calibration error (decimal string). |  |  |
 | `brier` _string_ | Brier is the candidate's Brier score (decimal string). |  |  |
 | `baselineEce` _string_ | BaselineECE is the stable revision's ECE for this dataset, if known. |  |  |
@@ -254,6 +256,7 @@ _Appears in:_
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
+| `scorerVersion` _integer_ | ScorerVersion is the scoring/calibration implementation version this result<br />was produced by. It is part of policyHash (and so approvalId), so an<br />operator upgrade that changes scoring re-evaluates a parked candidate. |  | Optional: \{\} <br /> |
 | `datasetDigest` _string_ | DatasetDigest is the sha256 (bare hex) of the dataset bytes this result was<br />produced from. Together with policyHash it is the result's identity: if the<br />dataset content changes (same ConfigMap/Secret, edited in place) a parked<br />candidate is re-evaluated rather than promoted on the stale result. |  | Optional: \{\} <br /> |
 | `approvalId` _string_ | ApprovalID is the identity a manual approval must name: the first 12 hex of<br />sha256(revisionHash + policyHash + datasetDigest). Set the annotation<br />decisionmodel.io/promote to this value to promote. It changes whenever the<br />revision, policy or dataset changes, so an approval cannot carry over a<br />re-evaluation. |  | Optional: \{\} <br /> |
 | `completedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | CompletedAt is when the evaluation finished. |  | Optional: \{\} <br /> |
@@ -363,8 +366,8 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `evaluation` _[EvaluationSpec](#evaluationspec)_ | Evaluation gates promotion on a golden-dataset accuracy check. When unset,<br />a candidate is promoted as soon as all its Pods are model-ready. |  | Optional: \{\} <br /> |
 | `stabilization` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#duration-v1-meta)_ | Stabilization keeps the previous revision's Deployment running (scaled to<br />its replicas, out of the Service) for this long after a promotion, so the<br />operator can switch traffic back instantly if the new stable turns out<br />unhealthy during the window. Default 5m when unset; "0" disables it (the<br />previous revision is removed after a short endpoint-gap grace, as before).<br />Must be between 1m and 24h when set to a non-zero value. |  | MaxLength: 32 <br />Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|ms\|s\|m\|h))+$` <br />Type: string <br />Optional: \{\} <br /> |
-| `promotion` _[PromotionPolicy](#promotionpolicy)_ | Promotion selects how a candidate that passed ModelReady is promoted:<br />  - Automatic: promote as soon as the candidate is model-ready (and, when<br />    evaluation is configured, has passed the gate).<br />  - EvaluationGated: like Automatic but requires rollout.evaluation to be<br />    set (rejected by CEL otherwise); the gate decides promotion.<br />  - Manual: hold the candidate in AwaitingPromotion until a human sets the<br />    annotation decisionmodel.io/promote to the candidate's revision hash<br />    (evaluation still runs when configured).<br />When unset the effective policy is EvaluationGated if rollout.evaluation is<br />set, else Automatic. The deprecated manualPromotion:true is an alias for<br />Manual; setting both promotion and manualPromotion:true to disagreeing<br />values is rejected by CEL. |  | Enum: [Automatic EvaluationGated Manual] <br />Optional: \{\} <br /> |
-| `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to the<br />candidate's revision hash. The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted.<br />Deprecated: use promotion: Manual. manualPromotion:true keeps working as an<br />alias for promotion: Manual. | false | Optional: \{\} <br /> |
+| `promotion` _[PromotionPolicy](#promotionpolicy)_ | Promotion selects how a candidate that passed ModelReady is promoted:<br />  - Automatic: promote as soon as the candidate is model-ready (and, when<br />    evaluation is configured, has passed the gate).<br />  - EvaluationGated: like Automatic but requires rollout.evaluation to be<br />    set (rejected by CEL otherwise); the gate decides promotion.<br />  - Manual: hold the candidate in AwaitingPromotion until a human sets the<br />    annotation decisionmodel.io/promote to status.evaluation.approvalId (or,<br />    without evaluation, the candidate's revision hash for one release)<br />    (evaluation still runs when configured).<br />When unset the effective policy is EvaluationGated if rollout.evaluation is<br />set, else Automatic. The deprecated manualPromotion:true is an alias for<br />Manual; setting both promotion and manualPromotion:true to disagreeing<br />values is rejected by CEL. |  | Enum: [Automatic EvaluationGated Manual] <br />Optional: \{\} <br /> |
+| `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to<br />status.evaluation.approvalId (or, without evaluation, the candidate's<br />revision hash for one release). The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted.<br />Deprecated: use promotion: Manual. manualPromotion:true keeps working as an<br />alias for promotion: Manual. | false | Optional: \{\} <br /> |
 | `timeouts` _[RolloutTimeouts](#rollouttimeouts)_ | Timeouts overrides the progress timeouts of a rollout. Unset fields keep<br />the built-in defaults. Large models (tens of GB) need more than the<br />defaults on a cold node. Not part of the revision hash; a change applies to<br />the phase timeouts immediately, but a prefetch Job that already exists keeps<br />the deadline it was created with. |  | Optional: \{\} <br /> |
 
 
@@ -404,5 +407,25 @@ _Appears in:_
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#toleration-v1-core) array_ | Tolerations allow the Pod to schedule onto nodes with matching taints. |  | Optional: \{\} <br /> |
 | `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#affinity-v1-core)_ | Affinity constrains Pod scheduling. |  | Optional: \{\} <br /> |
 | `runtimeClassName` _string_ | RuntimeClassName selects the RuntimeClass for serving Pods, e.g. "nvidia"<br />when the NVIDIA GPU Operator does not make it the default runtime. It is<br />applied to serving Pods only (the prefetch Job needs no GPU runtime).<br />Because it is part of spec.scheduling, changing it changes the revision's<br />placement hash and therefore starts a new revision (blue-green), like any<br />other scheduling change. |  | MaxLength: 253 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$` <br />Optional: \{\} <br /> |
+
+
+#### StoreRecoveryStatus
+
+
+
+StoreRecoveryStatus is the bounded-retry bookkeeping for lost-store recovery of
+the stable revision. It survives an operator restart so the attempt bound is
+honoured across restarts.
+
+
+
+_Appears in:_
+- [DecisionModelStatus](#decisionmodelstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `attempts` _integer_ | Attempts is the number of failed recovery prefetch Jobs counted so far<br />toward the retry bound. |  | Optional: \{\} <br /> |
+| `lastFailedJob` _string_ | LastFailedJob is the UID of the last failed prefetch Job already counted, so<br />a repeated observation of the same Job (e.g. a stale cache read) is not<br />double-counted. |  | Optional: \{\} <br /> |
+| `exhausted` _boolean_ | Exhausted is true once Attempts reached the bound: recovery stopped with<br />Degraded=StorePrefetchFailed and will not recreate the prefetch Job again<br />until a new revision or a decisionmodel.io/retry token resets it. |  | Optional: \{\} <br /> |
 
 

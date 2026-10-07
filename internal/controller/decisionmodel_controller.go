@@ -116,14 +116,15 @@ const (
 	reasonCacheNotShareable  = "CacheNotShareable"
 	reasonCacheSpecImmutable = "CacheSpecImmutable"
 
-	reasonEvaluationUnsupported = "EvaluationUnsupported"
-	reasonDatasetInvalid        = "DatasetInvalid"
-	reasonDatasetNotFound       = "DatasetNotFound"
-	reasonDatasetKeyNotFound    = "DatasetKeyNotFound"
-	reasonEvaluationTimeout     = "EvaluationTimeout"
-	reasonEvaluationFailed      = "EvaluationFailed"
-	reasonBaselineUnavailable   = "BaselineUnavailable"
-	reasonDatasetChanged        = "DatasetChanged"
+	reasonEvaluationUnsupported  = "EvaluationUnsupported"
+	reasonDatasetInvalid         = "DatasetInvalid"
+	reasonDatasetNotFound        = "DatasetNotFound"
+	reasonDatasetKeyNotFound     = "DatasetKeyNotFound"
+	reasonEvaluationTimeout      = "EvaluationTimeout"
+	reasonEvaluationFailed       = "EvaluationFailed"
+	reasonBaselineUnavailable    = "BaselineUnavailable"
+	reasonCalibrationUnavailable = "CalibrationUnavailable"
+	reasonDatasetChanged         = "DatasetChanged"
 
 	// Evaluated-condition reasons that tell the rollout story.
 	reasonEvaluationRunning = "EvaluationRunning"
@@ -255,14 +256,15 @@ type DecisionModelReconciler struct {
 	// In memory only; guarded by regateMu.
 	regateMu sync.Mutex
 	regate   regateTracker
-	// storeRecover tracks, per DecisionModel UID, the bounded failed-prefetch retry
-	// count for lost-store recovery: the UID of the last failed prefetch Job
-	// already counted (idempotent counting) and whether the bound is exhausted.
-	// This is a bound, not a safety signal — the restart-safe
-	// "recovering" state lives on the store PVC annotation. In memory only;
-	// guarded by storeRecoverMu.
-	storeRecoverMu sync.Mutex
-	storeRecover   map[types.UID]*storeRecoverState
+	// budgetMu serializes the fleet rollout-budget "count + decide + reserve" so
+	// two DecisionModels reconciled concurrently (MaxConcurrentReconciles > 1)
+	// cannot both see a free slot and both admit. budgetReservations holds
+	// admitted-but-not-yet-visible candidates (ns/name -> rev) until the cached DM
+	// shows status.candidateRevision.hash == rev; they count as active. In memory
+	// only (a restart re-derives admissions from candidateRevision in the API);
+	// cleaned when the candidate becomes visible, ends, or the DM is deleted.
+	budgetMu           sync.Mutex
+	budgetReservations map[string]string
 }
 
 // watchedNamespace reports whether the reconciler should act on objects in ns.
@@ -324,8 +326,10 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.Get(ctx, req.NamespacedName, &dm); err != nil {
 		if apierrors.IsNotFound(err) {
 			// DM gone: cancel and drop any evaluations we were running for it,
-			// and delete its exported metric series so they stop being scraped.
+			// release any rollout-budget reservation it held, and delete its
+			// exported metric series so they stop being scraped.
 			r.evalStoreOrInit().forgetExcept(req.Namespace, req.Name, "")
+			r.releaseReservation(req.Namespace, req.Name)
 			deleteMetrics(req.Namespace, req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -407,40 +411,35 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	r.evalStoreOrInit().forgetExcept(dm.Namespace, dm.Name, keepRevs...)
 
-	// 4. Ensure the model store PVC for the revision we are about to act on and
-	// evaluate the cache-sharing guard against it (one PVC per revision).
-	// On the stable path reuse the stable revision's existing claim (per-revision
-	// PVC, or the legacy shared <dm>-store until the next promotion); on the
-	// candidate path create the candidate's own per-revision PVC.
-	var pvc *corev1.PersistentVolumeClaim
+	// 4. Store/cache handling.
+	//   - Stable path: ensure (or recover) the stable revision's existing claim
+	//     and run the cache-sharing guard against it, here, before serving.
+	//   - Candidate path: the per-revision PVC must NOT be created until the
+	//     rollout budget admits the candidate (a queued rollout must not provision
+	//     a volume while it waits). So the candidate's ensurePVC + cache guard are
+	//     deferred into reconcileCandidatePath, after the gate.
+	var (
+		pvc              *corev1.PersistentVolumeClaim
+		storeTerminating bool
+		storeLost        bool
+		cacheDegraded    bool
+	)
 	if isStable {
 		pvc, err = r.ensureStoreForStable(ctx, &dm, stable)
-	} else {
-		pvc, err = r.ensurePVC(ctx, &dm, rev)
-	}
-	// A terminating claim is a wait, not a failure, and it only matters to the flow
-	// that would build on it (the candidate flow below). The retry bookkeeping and
-	// the failed-revision guard do not need the claim, so they still run; without
-	// this a `decisionmodel.io/retry` would appear to do nothing until the old
-	// claim finished terminating.
-	storeTerminating := errors.Is(err, errStoreTerminating)
-	// A lost stable store (missing or terminating PVC) is not a failure either: the
-	// stable path routes it to recoverStableStore, which recreates the PVC with the
-	// recovering annotation and reprefetches before serving. There is
-	// no PVC to run the cache-sharing guard against, so skip it in that case.
-	storeLost := errors.Is(err, errStoreLostRecovering)
-	if err != nil && !storeTerminating && !storeLost {
-		return r.finish(ctx, &dm, ctrl.Result{}, err)
-	}
-	cacheDegraded := false
-	if !storeTerminating && !storeLost {
-		var cacheErr error
-		cacheDegraded, cacheErr = r.guardCacheSharing(ctx, &dm, pvc)
-		if cacheErr != nil {
-			// A transient cache-reconcile error (e.g. a PVC expansion Patch that
-			// failed for a non-policy reason): back off via the workqueue rather
-			// than parking it as an immutable-spec condition.
-			return r.finish(ctx, &dm, ctrl.Result{}, cacheErr)
+		storeTerminating = errors.Is(err, errStoreTerminating)
+		storeLost = errors.Is(err, errStoreLostRecovering)
+		if err != nil && !storeTerminating && !storeLost {
+			return r.finish(ctx, &dm, ctrl.Result{}, err)
+		}
+		if !storeTerminating && !storeLost {
+			var cacheErr error
+			cacheDegraded, cacheErr = r.guardCacheSharing(ctx, &dm, pvc)
+			if cacheErr != nil {
+				// A transient cache-reconcile error (e.g. a PVC expansion Patch that
+				// failed for a non-policy reason): back off via the workqueue rather
+				// than parking it as an immutable-spec condition.
+				return r.finish(ctx, &dm, ctrl.Result{}, cacheErr)
+			}
 		}
 	}
 
@@ -494,7 +493,7 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Candidate revision (new spec or first creation).
-	return r.reconcileCandidatePath(ctx, &dm, eng, params, candidate, digest, cacheDegraded, apiKey, rev, storeTerminating)
+	return r.reconcileCandidatePath(ctx, &dm, eng, params, candidate, digest, apiKey, rev)
 }
 
 // reconcileCandidatePath handles a non-stable (candidate) revision: it waits
@@ -507,32 +506,50 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	params engine.Params,
 	candidate *decisionmodelv1alpha1.RevisionStatus,
 	digest string,
-	cacheDegraded bool,
 	apiKey, rev string,
-	storeTerminating bool,
 ) (ctrl.Result, error) {
-	// It builds on this revision's store claim, so it waits while the previous
-	// claim of the same revision is still being deleted; once that is NotFound the
-	// next reconcile creates a fresh one.
-	// A new candidate supersedes an in-flight post-promotion stabilization window:
-	// end it so a fresh rollout is not entangled with the last one's rollback
-	// target. Only when the window is actually enabled (>0) — with stabilization
-	// disabled the previous revision keeps its short endpoint-gap grace, collected
-	// by GC as before.
-	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
-		dm.Status.PreviousRevision = nil
-		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
-	}
-	if storeTerminating {
-		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
-	}
-	// Fleet rollout budget: a brand-new candidate waits in Pending/RolloutQueued
-	// when the watched scope is already at --max-concurrent-rollouts. A candidate
-	// already admitted bypasses the gate so an in-flight rollout cannot deadlock.
+	// Fleet rollout budget FIRST — before any allocation AND before ending the
+	// current stabilization window. A brand-new candidate waits in
+	// Pending/RolloutQueued when the watched scope is already at
+	// --max-concurrent-rollouts; a queued candidate must not create its
+	// per-revision PVC (provision a volume) while it waits, and must keep its
+	// previous revision + Stabilizing condition so the current window still
+	// protects it (an unhealthy stable can still roll back while queued — the
+	// stable path owns that, reached on the next reconcile for a DM with a stable
+	// revision). An already-admitted candidate, or one reusing its own window's
+	// slot, bypasses the gate so an in-flight rollout cannot deadlock.
 	if queued, qres, qerr := r.gateRolloutBudget(ctx, dm, rev); qerr != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, qerr)
 	} else if queued {
 		return qres, nil
+	}
+
+	// Admitted: only now end any in-flight post-promotion stabilization window, so
+	// a fresh rollout is not entangled with the last one's rollback target. Only
+	// when the window is actually enabled (>0) — with stabilization disabled the
+	// previous revision keeps its short endpoint-gap grace, collected by GC as
+	// before. Clearing it before admission would drop the rollback protection of a
+	// DM that then sits queued for minutes.
+	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
+		dm.Status.PreviousRevision = nil
+		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
+	}
+
+	// Create the candidate's per-revision store PVC and run the cache-sharing
+	// guard against it. It builds on this revision's store claim, so it waits
+	// while a previous claim of the same revision is still terminating; once that
+	// is NotFound the next reconcile creates a fresh one.
+	pvc, err := r.ensurePVC(ctx, dm, rev)
+	storeTerminating := errors.Is(err, errStoreTerminating)
+	if err != nil && !storeTerminating {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	if storeTerminating {
+		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
+	}
+	cacheDegraded, cacheErr := r.guardCacheSharing(ctx, dm, pvc)
+	if cacheErr != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, cacheErr)
 	}
 	return r.reconcileCandidate(ctx, dm, eng, params, candidate, digest, cacheDegraded, apiKey)
 }
@@ -583,8 +600,8 @@ func (r *DecisionModelReconciler) applyRetryToken(dm *decisionmodelv1alpha1.Deci
 	// (Degraded=StorePrefetchFailed) clears the latch so the stable path starts a
 	// fresh bounded set of prefetch attempts (the failed Job is deleted and
 	// recreated as usual).
-	if newRetry && r.storeRecoverExhausted(dm.UID) {
-		r.clearStoreRecover(dm.UID)
+	if newRetry && storeRecoverExhausted(dm) {
+		clearStoreRecover(dm)
 		dm.Status.LastRetryToken = tok
 	}
 }

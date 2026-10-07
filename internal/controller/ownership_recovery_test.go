@@ -362,7 +362,6 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 	It("resets an exhausted stable-store recovery on a new retry token", func() {
 		r := newRec(k8sClient, newProber())
 		rev := driveToStable(r, "retry")
-		dm := getDM("retry")
 		pvcKey := types.NamespacedName{Namespace: namespace, Name: "retry-store-" + rev}
 
 		// Lose the store so the stable path is in recovery.
@@ -376,37 +375,45 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		}, "5s", "50ms").Should(BeTrue())
 
 		// --- Deterministic token semantics (no reconcile/recovery interplay). ---
-		exhaust := func(prefix string) {
+		// countFailedRecovery now records into dm.Status.StoreRecovery, so the
+		// bound is persisted and survives a restart. Exhaust a local object.
+		exhaust := func(d *decisionmodelv1alpha1.DecisionModel, prefix string) {
 			for i := 0; i < maxStoreRecoverAttempts; i++ {
-				r.countFailedRecovery(dm.UID, types.UID(prefix+itoa(i)))
+				r.countFailedRecovery(d, types.UID(prefix+itoa(i)))
 			}
-			Expect(r.storeRecoverExhausted(dm.UID)).To(BeTrue())
+			Expect(storeRecoverExhausted(d)).To(BeTrue())
 		}
 
-		exhaust("f1-")
 		// First observation of token "t1": clears the latch, records the token.
 		d1 := getDM("retry")
+		exhaust(d1, "f1-")
 		d1.Annotations = map[string]string{decisionmodelv1alpha1.AnnotationRetry: "t1"}
 		r.applyRetryToken(d1, true)
-		Expect(r.storeRecoverExhausted(dm.UID)).To(BeFalse(), "new token clears the exhausted latch")
+		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "new token clears the exhausted latch")
 		Expect(d1.Status.LastRetryToken).To(Equal("t1"), "token recorded (consumed once)")
 
 		// Same token again: re-exhaust, apply "t1" with lastRetryToken already "t1"
 		// -> no reset.
-		exhaust("f2-")
+		exhaust(d1, "f2-")
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t1"
 		r.applyRetryToken(d1, true) // d1.Status.LastRetryToken == "t1"
-		Expect(r.storeRecoverExhausted(dm.UID)).To(BeTrue(), "the same token does not restart recovery")
+		Expect(storeRecoverExhausted(d1)).To(BeTrue(), "the same token does not restart recovery")
 
 		// A different token resets again.
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t2"
 		r.applyRetryToken(d1, true)
-		Expect(r.storeRecoverExhausted(dm.UID)).To(BeFalse(), "a new token restarts recovery again")
+		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "a new token restarts recovery again")
 		Expect(d1.Status.LastRetryToken).To(Equal("t2"))
 
-		// --- Through-Reconcile smoke: a retry annotation on an exhausted DM leads to
-		// a non-exhausted latch (the wiring in Reconcile calls applyRetryToken). ---
-		exhaust("f3-")
+		// --- Through-Reconcile smoke: an exhausted latch persisted in status plus a
+		// retry annotation leads to a non-exhausted latch (Reconcile calls
+		// applyRetryToken). The exhausted state is now stored in status, so persist
+		// it to the cluster before reconciling. ---
+		Expect(updateDMStatus(ctx, namespace, "retry", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.StoreRecovery = &decisionmodelv1alpha1.StoreRecoveryStatus{
+				Attempts: maxStoreRecoverAttempts, LastFailedJob: "f3", Exhausted: true,
+			}
+		})).To(Succeed())
 		Expect(updateDM(ctx, namespace, "retry", func(d *decisionmodelv1alpha1.DecisionModel) {
 			if d.Annotations == nil {
 				d.Annotations = map[string]string{}
@@ -415,7 +422,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		})).To(Succeed())
 		Eventually(func() bool {
 			_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "retry"}})
-			return !r.storeRecoverExhausted(dm.UID)
+			return !storeRecoverExhausted(getDM("retry"))
 		}, "5s", "20ms").Should(BeTrue(), "a retry annotation clears the exhausted latch through Reconcile")
 	})
 })

@@ -44,23 +44,43 @@ func (r *DecisionModelReconciler) gateRolloutBudget(
 ) (bool, ctrl.Result, error) {
 	admitted := dm.Status.CandidateRevision != nil && dm.Status.CandidateRevision.Hash == rev
 	if admitted {
+		// Already recorded as a candidate: the reservation (if any) is now
+		// redundant; drop it so a stale entry cannot double-count.
+		r.releaseReservation(dm.Namespace, dm.Name)
 		return false, ctrl.Result{}, nil
 	}
-	return r.rolloutBudgetBlocks(ctx, dm)
+	// A DM already in its own active stabilization window holds a slot (its
+	// previous revision's Deployment is the one the budget bounds). A new spec on
+	// that DM must reuse that slot, not wait behind itself — otherwise it would
+	// deadlock when the budget is full of its own window. Admit it directly; the
+	// window is ended after admission in reconcileCandidatePath.
+	if r.inStabilizationWindow(dm) {
+		return false, ctrl.Result{}, nil
+	}
+	return r.rolloutBudgetBlocks(ctx, dm, rev)
 }
 
 // rolloutBudgetBlocks reports whether a brand-new candidate for dm must wait
 // because the fleet is at --max-concurrent-rollouts. When it must wait it also
 // sets phase Pending (reason RolloutQueued) and returns the requeue result.
 //
-// The count is derived from cluster state, never memory: a DecisionModel is
-// "rolling out" when its status.candidateRevision is set (a candidate has been
-// admitted). FIFO is by phaseTransitionTime among the DecisionModels currently
-// queued (phase Pending) plus dm itself, so the longest-waiting candidate is
-// admitted first and the order is stable across reconciles.
+// Admission is race-free for a single manager process (leader election
+// guarantees one active reconciler): the whole "count + decide + reserve" runs
+// under budgetMu, so two DecisionModels reconciled concurrently cannot both see
+// a free slot. The durable record of an admission is status.candidateRevision;
+// until the manager cache reflects that write, an in-memory reservation
+// (ns/name -> rev) stands in and counts as active, closing the cache-lag window.
+//
+// The count derives from cluster state (status.candidateRevision) plus the
+// reservation set; FIFO is by phaseTransitionTime among queued (Pending)
+// DecisionModels plus dm itself. The cached List is sufficient (no uncached
+// APIReader): the only staleness that matters is this process's own just-written
+// candidateRevision, which the reservation covers until the cache catches up; a
+// reservation is dropped once the cached DM shows the candidate.
 func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
 ) (bool, ctrl.Result, error) {
 	if r.MaxConcurrentRollouts <= 0 {
 		return false, ctrl.Result{}, nil // unlimited
@@ -71,23 +91,56 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 		return false, ctrl.Result{}, err
 	}
 
+	r.budgetMu.Lock()
+	defer r.budgetMu.Unlock()
+
+	// Reconcile reservations against the freshly listed state: drop any whose DM
+	// now visibly carries that candidate (admission durable), or that is gone.
+	r.syncReservationsLocked(list)
+
+	self := dm.Namespace + "/" + dm.Name
 	active := 0
 	type queued struct {
 		key string
 		t   int64
 	}
 	var waiting []queued
+	seen := map[string]struct{}{}
 	for i := range list.Items {
 		d := &list.Items[i]
-		if d.Namespace == dm.Namespace && d.Name == dm.Name {
+		key := d.Namespace + "/" + d.Name
+		seen[key] = struct{}{}
+		if key == self {
 			continue // dm handled separately below
 		}
 		if d.Status.CandidateRevision != nil {
 			active++
 			continue
 		}
+		// A DM still inside its post-promotion stabilization window keeps its
+		// previous revision's Deployment running — the second GPU/disk the budget
+		// bounds — so it counts as an active rollout until the window ends.
+		if r.inStabilizationWindow(d) {
+			active++
+			continue
+		}
+		// An admitted-but-not-yet-visible candidate (its status write has not
+		// reached the cache) still occupies a slot via its reservation.
+		if _, reserved := r.budgetReservations[key]; reserved {
+			active++
+			continue
+		}
 		if d.Status.Phase == decisionmodelv1alpha1.PhasePending {
-			waiting = append(waiting, queued{key: d.Namespace + "/" + d.Name, t: transitionNanos(d)})
+			waiting = append(waiting, queued{key: key, t: transitionNanos(d)})
+		}
+	}
+	// A reservation for a DM not in this (possibly lagged) List still counts.
+	for key := range r.budgetReservations {
+		if key == self {
+			continue
+		}
+		if _, ok := seen[key]; !ok {
+			active++
 		}
 	}
 
@@ -99,11 +152,11 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 	// Rank dm against the other waiting DecisionModels by phaseTransitionTime
 	// (FIFO). dm's own timestamp is its current Pending transition, or now when it
 	// is entering the queue this reconcile.
-	self := queued{key: dm.Namespace + "/" + dm.Name, t: r.now().UnixNano()}
+	selfQ := queued{key: self, t: r.now().UnixNano()}
 	if dm.Status.Phase == decisionmodelv1alpha1.PhasePending && dm.Status.PhaseTransitionTime != nil {
-		self.t = dm.Status.PhaseTransitionTime.UnixNano()
+		selfQ.t = dm.Status.PhaseTransitionTime.UnixNano()
 	}
-	all := append(waiting, self)
+	all := append(waiting, selfQ)
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].t != all[j].t {
 			return all[i].t < all[j].t
@@ -112,15 +165,52 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 	})
 	rank := 0
 	for i := range all {
-		if all[i].key == self.key {
+		if all[i].key == selfQ.key {
 			rank = i
 			break
 		}
 	}
 	if rank < slots {
-		return false, ctrl.Result{}, nil // admitted
+		// Admitted: reserve the slot until status.candidateRevision is visible.
+		if r.budgetReservations == nil {
+			r.budgetReservations = map[string]string{}
+		}
+		r.budgetReservations[self] = rev
+		return false, ctrl.Result{}, nil
 	}
 	return true, r.queueRollout(ctx, dm), nil
+}
+
+// syncReservationsLocked drops reservations whose admission is now durable and
+// visible in the cache: the DM carries that candidate (candidateRevision.hash ==
+// rev). It deliberately does NOT drop a reservation just because the DM is absent
+// from this List — the List can lag, and dropping on absence would reopen the
+// over-admission race the reservation exists to close. Reservations for deleted
+// DMs or ended candidates are freed explicitly (releaseReservation / the
+// admitted-bypass in gateRolloutBudget). Caller holds budgetMu.
+func (r *DecisionModelReconciler) syncReservationsLocked(list *decisionmodelv1alpha1.DecisionModelList) {
+	if len(r.budgetReservations) == 0 {
+		return
+	}
+	for i := range list.Items {
+		d := &list.Items[i]
+		key := d.Namespace + "/" + d.Name
+		rev, ok := r.budgetReservations[key]
+		if !ok {
+			continue
+		}
+		if d.Status.CandidateRevision != nil && d.Status.CandidateRevision.Hash == rev {
+			delete(r.budgetReservations, key) // admission now durable/visible
+		}
+	}
+}
+
+// releaseReservation drops dm's rollout-budget reservation (candidate ended or DM
+// deleted), freeing the slot for a queued DecisionModel.
+func (r *DecisionModelReconciler) releaseReservation(namespace, name string) {
+	r.budgetMu.Lock()
+	defer r.budgetMu.Unlock()
+	delete(r.budgetReservations, namespace+"/"+name)
 }
 
 // queueRollout parks dm in Pending/RolloutQueued and returns the requeue result.
