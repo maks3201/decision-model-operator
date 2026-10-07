@@ -348,31 +348,20 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.finish(ctx, &dm, ctrl.Result{}, nil)
 	}
 
-	// Security guards: validate the model name, registry allow-list,
-	// and image-override policy before touching the registry or any workload.
-	if res, err, done := r.guardSecurity(ctx, &dm, eng); done {
-		return res, err
-	}
-
-	// 2. Resolve the model to a digest.
-	digest, done, res, err := r.reconcileResolve(ctx, &dm, eng)
+	// Candidate preflight (security guards, resolve, runtime version) validates
+	// the LIVE spec, which describes the next candidate. When a stable revision is
+	// already serving, a preflight failure must never stop maintaining it: the
+	// stable is rendered from status.stableRevision (independent of the broken
+	// spec), so the failure is surfaced as a condition/Event and the stable is
+	// kept alive. With no stable, preflight failures behave as before (Failed /
+	// Resolving / Terminal).
+	digest, done, res, err := r.reconcilePreflight(ctx, &dm, eng)
 	if done {
 		return res, err
 	}
 
 	// 3. Compute the revision and candidate identity.
 	stable := dm.Status.StableRevision
-	// Validate an explicit spec.runtimeVersion against the engine (CEL rejects
-	// malformed strings; this catches a too-old version or an engine that cannot
-	// pin versions). An invalid/unsupported version is Degraded and changes no
-	// workloads.
-	if err := validateRuntimeVersion(eng, dm.Spec.RuntimeVersion); err != nil {
-		reason := reasonInvalidRuntimeVersion
-		if errors.Is(err, errRuntimeVersionUnsupported) {
-			reason = reasonRuntimeVersionUnsupported
-		}
-		return r.degradeSecretReason(ctx, &dm, reason, err)
-	}
 	effVer := r.effectiveRuntimeVersion(eng, &dm, stable)
 	image := servingImage(eng, r.paramsForVersion(&dm, digest, "", "", effVer))
 	rev := RevisionHash(dm.Spec, digest, image)
@@ -690,6 +679,174 @@ func (r *DecisionModelReconciler) reconcileResolve(
 		Message: fmt.Sprintf("resolved %q to digest %s", dm.Spec.Model, digest),
 	})
 	return digest, false, ctrl.Result{}, nil
+}
+
+// reconcilePreflight runs the candidate preflight checks (security guards,
+// resolve, runtime version) against the live spec. It returns the resolved
+// digest and done=false to continue the normal flow. On a preflight failure it
+// returns done=true with the result: when a stable revision is serving the
+// failure is surfaced and the stable is maintained (never failing the object);
+// with no stable the checks behave as before (Failed / Resolving / Terminal).
+func (r *DecisionModelReconciler) reconcilePreflight(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+) (digest string, done bool, res ctrl.Result, err error) {
+	hasStable := dm.Status.StableRevision != nil
+	stable := dm.Status.StableRevision
+
+	// Security guards: model name, registry allow-list, image-override policy.
+	if reason, msg, bad, sdone, sres, serr := r.preflightSecurity(ctx, dm, eng, hasStable); sdone {
+		return "", true, sres, serr
+	} else if bad {
+		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
+			decisionmodelv1alpha1.ConditionReady, reason, msg)
+		return "", true, res, err
+	}
+
+	// Resolve the model to a digest.
+	digest, rdone, bad, reason, msg, rres, rerr := r.preflightResolve(ctx, dm, eng, hasStable)
+	if rdone {
+		return "", true, rres, rerr
+	}
+	if bad {
+		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
+			decisionmodelv1alpha1.ConditionResolved, reason, msg)
+		return "", true, res, err
+	}
+
+	// Validate an explicit spec.runtimeVersion against the engine (CEL rejects
+	// malformed strings; this catches a too-old version or an engine that cannot
+	// pin versions). An invalid/unsupported version changes no workloads — unless
+	// a stable is serving, in which case it keeps running.
+	if verr := validateRuntimeVersion(eng, dm.Spec.RuntimeVersion); verr != nil {
+		reason := reasonInvalidRuntimeVersion
+		if errors.Is(verr, errRuntimeVersionUnsupported) {
+			reason = reasonRuntimeVersionUnsupported
+		}
+		if hasStable {
+			res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
+				decisionmodelv1alpha1.ConditionReady, reason, verr.Error())
+			return "", true, res, err
+		}
+		res, err = r.degradeSecretReason(ctx, dm, reason, verr)
+		return "", true, res, err
+	}
+	return digest, false, ctrl.Result{}, nil
+}
+
+// preflightSecurity runs the candidate security guards. When no stable revision
+// is serving it behaves like guardSecurity (sets Failed + Terminal and finishes,
+// done=true). When a stable is serving a violation is reported as bad=true with
+// the reason/message so the caller keeps maintaining the stable instead of
+// failing the whole object; the guard is not weakened — the candidate is still
+// refused.
+func (r *DecisionModelReconciler) preflightSecurity(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	hasStable bool,
+) (reason, msg string, bad, done bool, res ctrl.Result, err error) {
+	if !hasStable {
+		res, err, done = r.guardSecurity(ctx, dm, eng)
+		return "", "", false, done, res, err
+	}
+	// A stable is serving: evaluate the same checks but do not fail the object.
+	if verr := validateModelName(eng, dm.Spec.Model); verr != nil {
+		return reasonInvalidModelName, verr.Error(), true, false, ctrl.Result{}, nil
+	}
+	if rsn, m := r.checkRegistryAllowed(eng, dm.Spec.Model); rsn != "" {
+		return rsn, m, true, false, ctrl.Result{}, nil
+	}
+	if dm.Spec.Image != "" && !r.AllowImageOverride {
+		return reasonImageOverrideNotAllowed,
+			"spec.image override is not allowed (set --allow-image-override)", true, false, ctrl.Result{}, nil
+	}
+	return "", "", false, false, ctrl.Result{}, nil
+}
+
+// preflightResolve resolves the digest. With no stable it delegates to
+// reconcileResolve (done=true on failure). With a stable it never fails the
+// object: a permanent model-not-found is reported as bad=true/ModelNotFound; a
+// transient resolve error (e.g. registry 5xx) returns done=true with a plain
+// requeue+err so the workqueue backs off while the stable keeps serving (the
+// stable path runs on the next reconcile; nothing is marked failed).
+func (r *DecisionModelReconciler) preflightResolve(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	hasStable bool,
+) (digest string, done, bad bool, reason, msg string, res ctrl.Result, err error) {
+	if !hasStable {
+		digest, done, res, err = r.reconcileResolve(ctx, dm, eng)
+		return digest, done, false, "", "", res, err
+	}
+	digest, rerr := r.resolveDigest(ctx, dm, eng)
+	if rerr == nil {
+		if !meta.IsStatusConditionTrue(dm.Status.Conditions, decisionmodelv1alpha1.ConditionResolved) {
+			r.event(ctx, dm, corev1.EventTypeNormal, eventResolved,
+				"resolved %q to digest %s", dm.Spec.Model, digest)
+		}
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionResolved,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonResolved,
+			Message: fmt.Sprintf("resolved %q to digest %s", dm.Spec.Model, digest),
+		})
+		return digest, false, false, "", "", ctrl.Result{}, nil
+	}
+	if errors.Is(rerr, engine.ErrNotFound) {
+		// Permanent for the candidate: surface it and keep the stable serving.
+		return "", false, true, reasonModelNotFound,
+			fmt.Sprintf("model %q not found", dm.Spec.Model), ctrl.Result{}, nil
+	}
+	// Transient (e.g. registry 5xx): nothing is marked failed. Surface it as a
+	// candidate failure and keep the stable serving; resolve retries on the next
+	// reconcile. bad=true routes to the stable path, which requeues.
+	return "", false, true, reasonResolveFailed, rerr.Error(), ctrl.Result{}, nil
+}
+
+// maintainStableAfterPreflight records a candidate-preflight failure on the
+// given condition type (Resolved=False for a resolve failure, Ready carries the
+// reason otherwise via Degraded) and then runs the full stable maintenance path
+// so a bad candidate never stops serving/repairing the stable. Ready is set by
+// the stable path from the stable's own readiness; this adds a Degraded=True
+// with the candidate failure reason and (for a resolve miss) Resolved=False.
+func (r *DecisionModelReconciler) maintainStableAfterPreflight(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	condType, reason, msg string,
+) (ctrl.Result, error) {
+	if condType == decisionmodelv1alpha1.ConditionResolved {
+		setStatusCondition(dm, metav1.Condition{
+			Type: condType, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
+		})
+	}
+	// Always surface the candidate failure as Degraded so it is visible even when
+	// the stable is otherwise healthy; the stable path owns Ready.
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: fmt.Sprintf("candidate spec rejected (%s); the current stable keeps serving", msg),
+	})
+	r.event(ctx, dm, corev1.EventTypeWarning, reason,
+		"candidate spec rejected: %s; maintaining the current stable %s", msg, stable.Hash)
+
+	// The stable's API key may itself be unreadable (e.g. the Secret lost its
+	// label). That must not stop maintaining a running stable: surface Degraded
+	// and continue with an empty key (the prober then cannot authenticate, which
+	// shows as not-model-ready, but Deployment/Service/PDB/store repair runs).
+	apiKey, kerr := r.apiKey(ctx, dm)
+	if kerr != nil {
+		apiKey = ""
+	}
+	// Pass cacheDegraded=true so the stable path preserves the candidate-failure
+	// Degraded condition set above even when the stable is fully model-ready
+	// (otherwise setReadyConditions would clear it to "healthy").
+	return r.reconcileStablePath(ctx, dm, eng, stable, apiKey, true)
 }
 
 // reconcileStablePath keeps the stable revision in sync and re-probes its Pods.
