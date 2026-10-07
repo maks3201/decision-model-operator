@@ -340,6 +340,16 @@ func (r *DecisionModelReconciler) promote(
 	if !persisted {
 		return ctrl.Result{}, nil
 	}
+	// With the new stable durably recorded, create its PodDisruptionBudget BEFORE
+	// moving traffic to it: with replicas > 1 the Service switch otherwise opens a
+	// window where the new stable serves live traffic with no disruption
+	// protection (a node drain could take down all replicas at once). A PDB create
+	// failure blocks the switch (requeue). On a crash between the status write and
+	// here, status already says stable=candidate, so the next reconcile's stable
+	// path creates the PDB and re-asserts the Service — convergent either way.
+	if err := r.ensurePDB(ctx, dm, rev); err != nil {
+		return ctrl.Result{}, err
+	}
 	// Only now, with the new stable durably recorded, move the Service. If this
 	// fails the error requeues; every reconcile path that has a stable re-asserts
 	// the Service to it, so it converges.

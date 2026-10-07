@@ -388,7 +388,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		d1 := getDM("retry")
 		exhaust(d1, "f1-")
 		d1.Annotations = map[string]string{decisionmodelv1alpha1.AnnotationRetry: "t1"}
-		r.applyRetryToken(d1, true)
+		r.applyRetryToken(ctx, d1, true)
 		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "new token clears the exhausted latch")
 		Expect(d1.Status.LastRetryToken).To(Equal("t1"), "token recorded (consumed once)")
 
@@ -396,12 +396,12 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		// -> no reset.
 		exhaust(d1, "f2-")
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t1"
-		r.applyRetryToken(d1, true) // d1.Status.LastRetryToken == "t1"
+		r.applyRetryToken(ctx, d1, true) // d1.Status.LastRetryToken == "t1"
 		Expect(storeRecoverExhausted(d1)).To(BeTrue(), "the same token does not restart recovery")
 
 		// A different token resets again.
 		d1.Annotations[decisionmodelv1alpha1.AnnotationRetry] = "t2"
-		r.applyRetryToken(d1, true)
+		r.applyRetryToken(ctx, d1, true)
 		Expect(storeRecoverExhausted(d1)).To(BeFalse(), "a new token restarts recovery again")
 		Expect(d1.Status.LastRetryToken).To(Equal("t2"))
 

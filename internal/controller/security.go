@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -156,6 +157,12 @@ func (r *DecisionModelReconciler) apiKeyWithUID(ctx context.Context, dm *decisio
 	}
 	var secret corev1.Secret
 	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			// A missing Secret is a user-fixable configuration error, not a
+			// transient API failure: surface it as APIKeyInvalid (holds/Degraded
+			// with a requeue), naming the Secret but never its content.
+			return "", "", fmt.Errorf("%w: Secret %s/%s not found", errAPIKeyInvalid, dm.Namespace, ref.Name)
+		}
 		return "", "", err
 	}
 	if err := requireAPIKeyLabel(secret.Labels); err != nil {
@@ -211,8 +218,13 @@ func (r *DecisionModelReconciler) validateDownloadToken(
 	}
 	var secret corev1.Secret
 	if err := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: ref.Name}, &secret); err != nil {
-		// optional is not supported; treat a missing Secret the same as a missing
-		// label so the operator never creates a Job that cannot start.
+		if apierrors.IsNotFound(err) {
+			// A missing download-token Secret is a user-fixable config error, not a
+			// transient API failure: surface it as DownloadTokenInvalid (naming the
+			// Secret, never its content) instead of a raw NotFound with backoff.
+			return fmt.Errorf("%w: Secret %s/%s not found", errDownloadTokenInvalid, dm.Namespace, ref.Name)
+		}
+		// Other API errors stay transient (workqueue backoff).
 		return err
 	}
 	if err := requireDownloadTokenLabel(secret.Labels); err != nil {

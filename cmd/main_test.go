@@ -85,13 +85,16 @@ func TestWatchNamespacesCacheDefaults(t *testing.T) {
 	}
 }
 
-func TestValidateHFEndpoint(t *testing.T) {
+// validateEndpointURL guards both --ollaya-registry and --ollaya-hf-endpoint.
+func TestValidateEndpointURL(t *testing.T) {
 	tests := []struct {
 		name          string
 		raw           string
 		allowInsecure bool
 		wantErr       bool
 	}{
+		{name: "valid registry https", raw: "https://registry.internal.example.com"},
+		{name: "registry userinfo rejected", raw: "https://user:pass@registry.example.com", wantErr: true},
 		{name: "valid https", raw: "https://hf-mirror.example.com"},
 		{name: "valid https with path", raw: "https://mirror.example.com/models"},
 		{name: "valid https with port", raw: "https://mirror.example.com:8443"},
@@ -113,12 +116,12 @@ func TestValidateHFEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateHFEndpoint(tt.raw, tt.allowInsecure)
+			err := validateEndpointURL(tt.raw, tt.allowInsecure)
 			if tt.wantErr && err == nil {
-				t.Fatalf("validateHFEndpoint(%q, %v) = nil, want error", tt.raw, tt.allowInsecure)
+				t.Fatalf("validateEndpointURL(%q, %v) = nil, want error", tt.raw, tt.allowInsecure)
 			}
 			if !tt.wantErr && err != nil {
-				t.Fatalf("validateHFEndpoint(%q, %v) unexpected error: %v", tt.raw, tt.allowInsecure, err)
+				t.Fatalf("validateEndpointURL(%q, %v) unexpected error: %v", tt.raw, tt.allowInsecure, err)
 			}
 		})
 	}
