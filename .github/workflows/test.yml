@@ -95,9 +95,9 @@ jobs:
       - name: Race detector
         run: |
           v=$(go list -m -f '{{ .Version }}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')
-          read -ra pkgs < <(go list ./... | grep -v /e2e | tr '\n' ' ')
+          # shellcheck disable=SC2046 # word splitting is intended: pass each package as a separate arg
           KUBEBUILDER_ASSETS="$PWD/$(bin/setup-envtest use "$v" --bin-dir bin -p path)" \
-            go test -race "${pkgs[@]}"
+            go test -race $(go list ./... | grep -v /e2e)
 
   # Always-reporting gate. This is the stable name for branch protection: it
   # passes when the heavy job succeeded or was skipped (docs-only), and fails
