@@ -464,3 +464,97 @@ func TestResolveFollowsSameOriginRedirect(t *testing.T) {
 		t.Fatalf("same-origin redirect should be followed: %v", err)
 	}
 }
+
+// TestRuntimeClientRefusesAllRedirects pins that the runtime client
+// (Inspect/Warmup/Decide — in-cluster calls to Pod IPs that carry the API key)
+// follows NO redirect: a compromised or buggy runtime answering a 3xx must not
+// steer the operator (or the API key) at another address (SSRF), nor let a
+// forged /api/ps from elsewhere flip the readiness gate.
+func TestRuntimeClientRefusesAllRedirects(t *testing.T) {
+	var evilHits int32
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&evilHits, 1)
+		// A plausible but forged answer for each endpoint.
+		_, _ = io.WriteString(w, `{"models":[{"name":"laya:en","digest":"deadbeef","device":"cpu"}],"done_reason":"load","answers":{}}`)
+	}))
+	defer evil.Close()
+
+	// The runtime 302-redirects every call to the evil host.
+	runtime := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer runtime.Close()
+
+	e := New(withTimeouts(2*time.Second, 2*time.Second, 2*time.Second, 2*time.Second))
+
+	t.Run("Inspect", func(t *testing.T) {
+		if _, err := e.Inspect(context.Background(), runtime.URL, "tok"); err == nil {
+			t.Fatalf("Inspect must fail on a redirect")
+		} else if !strings.Contains(err.Error(), "redirect") {
+			t.Errorf("error should mention the refused redirect, got %v", err)
+		}
+	})
+	t.Run("Warmup", func(t *testing.T) {
+		if err := e.Warmup(context.Background(), runtime.URL, "tok", modelLayaEn); err == nil {
+			t.Fatalf("Warmup must fail on a redirect")
+		} else if !strings.Contains(err.Error(), "redirect") {
+			t.Errorf("error should mention the refused redirect, got %v", err)
+		}
+	})
+	t.Run("Decide", func(t *testing.T) {
+		if _, err := e.Decide(context.Background(), runtime.URL, "tok", decideReq()); err == nil {
+			t.Fatalf("Decide must fail on a redirect")
+		} else if !strings.Contains(err.Error(), "redirect") {
+			t.Errorf("error should mention the refused redirect, got %v", err)
+		}
+	})
+
+	if got := atomic.LoadInt32(&evilHits); got != 0 {
+		t.Errorf("the redirect target was reached %d times; all redirects must be refused", got)
+	}
+}
+
+// TestRuntimeRedirectErrorHidesAPIKey confirms the refused-redirect error names
+// the status and target host but never leaks the API key.
+func TestRuntimeRedirectErrorHidesAPIKey(t *testing.T) {
+	runtime := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	defer runtime.Close()
+
+	e := New(withTimeouts(2*time.Second, 2*time.Second, 2*time.Second, 2*time.Second))
+	const secret = "super-secret-key"
+	_, err := e.Inspect(context.Background(), runtime.URL, secret)
+	if err == nil {
+		t.Fatalf("expected a refused-redirect error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("error must not contain the API key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "169.254.169.254") {
+		t.Errorf("error should name the target host, got %v", err)
+	}
+}
+
+// TestResolveNotFoundWithLargeBody pins that a 404 carrying a body larger than
+// the read cap (a CDN/proxy HTML error page) is still classified as ErrNotFound,
+// not a "body too large" transient error — the status is checked before the body
+// is read.
+func TestResolveNotFoundWithLargeBody(t *testing.T) {
+	withFastBackoffs(t)
+	huge := strings.Repeat("<html>not found</html>", (2<<20)/22) // ~2 MiB, well over maxBodyBytes
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, huge)
+	}))
+	defer srv.Close()
+
+	e := fastEngine(srv.URL)
+	_, err := e.Resolve(context.Background(), modelLayaEn)
+	if !errors.Is(err, engine.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound (a large 404 body must not become a size error)", err)
+	}
+	if strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("a 404 must not be reported as a body-too-large error: %v", err)
+	}
+}

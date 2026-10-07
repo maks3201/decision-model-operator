@@ -207,9 +207,26 @@ func effectivePort(u *neturl.URL) string {
 // Pods (Inspect/Warmup/Decide). It is identical to the registry client except
 // that it has NO proxy (Proxy: nil): those calls carry the API key and target
 // Pod IPs, so they must go direct and never traverse a proxy, even when the Pod
-// CIDR is absent from NO_PROXY.
+// CIDR is absent from NO_PROXY. It also refuses ALL redirects: a serving Pod has
+// no legitimate reason to 3xx an in-cluster API call, and following one would let
+// a compromised or buggy runtime point the operator (and the API key) at an
+// arbitrary address (SSRF), or answer a forged /api/ps from elsewhere and flip
+// the readiness gate.
 func defaultRuntimeClient() *http.Client {
-	return &http.Client{Transport: newTransport(false)}
+	return &http.Client{Transport: newTransport(false), CheckRedirect: refuseAllRedirects}
+}
+
+// refuseAllRedirects is an http.Client.CheckRedirect that refuses every redirect
+// (used by the runtime client). The error names the status and the target host
+// so an operator can see where the runtime tried to send us; it never includes
+// the request headers (the API key must not leak into a log line).
+func refuseAllRedirects(req *http.Request, via []*http.Request) error {
+	status := 0
+	// The stdlib sets req.Response to the response that triggered this redirect.
+	if req.Response != nil {
+		status = req.Response.StatusCode
+	}
+	return fmt.Errorf("ollaya: refusing runtime redirect (status %d) to host %s", status, req.URL.Host)
 }
 
 // newTransport builds the shared transport. When useProxy is true the proxy env
@@ -795,16 +812,21 @@ func (e *Engine) Resolve(ctx context.Context, name string) (engine.ModelRef, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := readCappedBody(resp)
-	if err != nil {
-		return engine.ModelRef{}, fmt.Errorf("ollaya: read manifest for %q: %w", name, err)
-	}
-
+	// Classify the status BEFORE reading the body: a 404 with a huge CDN/proxy
+	// HTML error page must be ErrNotFound (permanent), not a "body too large"
+	// transient error. Drain a bounded amount so the connection can be reused.
 	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
 		return engine.ModelRef{}, fmt.Errorf("ollaya: resolve %q: %w", name, engine.ErrNotFound)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
 		return engine.ModelRef{}, fmt.Errorf("ollaya: resolve %q: unexpected status %d", name, resp.StatusCode)
+	}
+
+	body, err := readCappedBody(resp)
+	if err != nil {
+		return engine.ModelRef{}, fmt.Errorf("ollaya: read manifest for %q: %w", name, err)
 	}
 
 	var m ollayaManifest
