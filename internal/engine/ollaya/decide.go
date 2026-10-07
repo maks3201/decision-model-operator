@@ -96,19 +96,24 @@ func (e *Engine) Decide(ctx context.Context, baseURL, apiKey string, req engine.
 
 	var sr systemOneResponse
 	if uerr := json.Unmarshal(body, &sr); uerr != nil {
-		// On a non-2xx with an unparseable body, still surface the status.
+		// On a non-2xx with an unparseable body, still surface the status and
+		// classify it: a 4xx the runtime rejects cannot be fixed by retrying.
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return engine.DecideResponse{}, fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
+			err := fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
+			return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode)
 		}
 		return engine.DecideResponse{}, fmt.Errorf("ollaya: decide %q: invalid JSON: %w", req.Model, uerr)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var err error
 		if sr.Code != "" {
-			return engine.DecideResponse{}, fmt.Errorf("ollaya: decide %q failed (status %d, code %s): %s",
+			err = fmt.Errorf("ollaya: decide %q failed (status %d, code %s): %s",
 				req.Model, resp.StatusCode, sr.Code, sr.Error)
+		} else {
+			err = fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
 		}
-		return engine.DecideResponse{}, fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
+		return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode)
 	}
 
 	return engine.DecideResponse{Answers: mapAnswers(sr.Answers)}, nil
@@ -153,6 +158,35 @@ func (e *Engine) doDecideWithQueueRetry(ctx context.Context, newReq func() (*htt
 	return nil, fmt.Errorf("ollaya: decide: exhausted queue retry")
 }
 
+// wrapIfRejected wraps err with engine.ErrRequestRejected when the status is one
+// the runtime will reject identically on a retry, so the evaluator must treat the
+// case as a dataset/case error rather than a transient transport failure.
+//
+// Rejected (permanent): any 4xx EXCEPT the ones below. Verified against the
+// runtime (0.10.0): 400 INVALID_JSON (malformed body), 404 MODEL_NOT_FOUND
+// (unknown/unloaded model), 422 INVALID_REQUEST (missing field, wrong field type,
+// unknown question type) are all deterministic for a given request.
+//
+// Not rejected (left transient): 401, 403 (auth — a key/permission problem the
+// operator can fix, not the request), 408 (request timeout), 409 (conflict) and
+// 429 (rate limited) can all succeed on a retry. 5xx and network errors never
+// reach here as a status (they surface earlier or as non-4xx) and stay transient.
+func wrapIfRejected(err error, status int) error {
+	if status < 400 || status >= 500 {
+		return err
+	}
+	switch status {
+	case http.StatusUnauthorized, // 401
+		http.StatusForbidden,       // 403
+		http.StatusRequestTimeout,  // 408
+		http.StatusConflict,        // 409
+		http.StatusTooManyRequests: // 429
+		return err
+	default:
+		return fmt.Errorf("%w: %w", engine.ErrRequestRejected, err)
+	}
+}
+
 // isQueueFull reports whether a decide response body carries the error code
 // QUEUE_FULL (docs/api.md §4 error shape {"error":...,"code":"QUEUE_FULL"}). A
 // body that does not parse, or carries any other code, returns false.
@@ -182,6 +216,10 @@ func mapAnswers(raw map[string]rawAnswer) map[string]engine.Answer {
 			ans.Confidence = a.Confidence
 		case "score":
 			ans.Score = a.Score
+			// Per-level probabilities (keys "0".."n-1") drive score ECE/Brier in
+			// the evaluator; copy them like choice does. Verified against the
+			// runtime: a score answer carries probabilities summing to ~1.
+			ans.Probabilities = a.Probabilities
 			ans.Confidence = a.Confidence
 		case "noul":
 			ans.Noul = a.Noul
