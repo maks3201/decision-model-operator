@@ -63,7 +63,11 @@ Manual (the maintainer ticks them in the release PR description):
 - Pre-1.0: only the **latest minor** gets fixes (as patch releases). Users upgrade to get fixes.
 - Kubernetes: *tested* = versions E2E runs on every release; *supported* = we fix reported bugs.
   Target: tested = the three most recent Kubernetes minors kind supports; supported = the same.
-  The current list lives in the README compatibility table and is updated each minor.
+  The current list lives in the README [Compatibility](README.md#compatibility) table and is updated each minor.
+- Upgrades: from the previous minor (N-1 → N) is tested in CI. Skipping minors is not tested; upgrade one minor
+  at a time. Downgrades are not supported.
+- Deprecation: a field, flag, default or reason string that users may rely on is deprecated for at least one
+  minor (Warning Event or log, release-notes entry) before it is removed or changed.
 - Runtime: each release states the Ollaya image version it pins (`ghcr.io/ollaya-dev/ollaya:<ver>`) and was
   tested with. Bumping it is a minor change (new runtime behaviour), unless it is a pure security patch.
 

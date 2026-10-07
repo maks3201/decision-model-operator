@@ -5,7 +5,7 @@ laptop-scale cluster.
 
 ## Prerequisites
 
-- A Kubernetes cluster (v1.29+). [kind](https://kind.sigs.k8s.io/) works:
+- A Kubernetes cluster (v1.29+; CI tests 1.35 and 1.37). [kind](https://kind.sigs.k8s.io/) works:
   `kind create cluster`.
 - `kubectl` pointed at that cluster.
 - A default StorageClass that supports `ReadWriteOnce` (kind ships one). For
