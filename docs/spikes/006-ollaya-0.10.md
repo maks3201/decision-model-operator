@@ -64,3 +64,5 @@ or e2e adjustment is needed. Existing per-revision PVCs (pulled by 0.7.3) serve 
 - `ghcr.io/ollaya-dev/ollaya:0.7.3` (arm64, for upgrade-path test).
 - kind v0.33.0, k8s v1.37.0 (for the e2e run).
 - All containers, volumes, images, and the kind cluster removed after testing.
+
+<!-- gate skip check: docs-only change, remove -->
