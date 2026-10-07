@@ -161,7 +161,7 @@ spec:
 			"{.metadata.annotations.decisionmodel\\.io/apikey-checksum}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(checksumBefore).NotTo(BeEmpty(), "apikey-checksum annotation not set on the serving Deployment")
-		podsBefore, _ := utils.Kubectl("get", "pods", "-l", "decisionmodel.io/name="+dm,
+		podsBefore, _ := utils.Kubectl("get", "pods", "-l", servingPodSelector(dm),
 			"-n", authNS, "-o", "jsonpath={.items[*].metadata.name}")
 
 		By("rotating the key in place (same Secret, new value — no spec change)")
@@ -185,7 +185,7 @@ stringData:
 				"{.metadata.annotations.decisionmodel\\.io/apikey-checksum}")
 			g.Expect(checksumAfter).NotTo(Equal(checksumBefore),
 				"apikey-checksum should change after the Secret value rotates")
-			podsNow, _ := utils.Kubectl("get", "pods", "-l", "decisionmodel.io/name="+dm,
+			podsNow, _ := utils.Kubectl("get", "pods", "-l", servingPodSelector(dm),
 				"-n", authNS, "-o", "jsonpath={.items[*].metadata.name}")
 			for _, old := range strings.Fields(podsBefore) {
 				g.Expect(podsNow).NotTo(ContainSubstring(old),
