@@ -242,6 +242,53 @@ var _ = Describe("post-promotion stabilization window", func() {
 		_ = rev1
 	})
 
+	// A shortfall that begins just before the window end must not be declared
+	// Stabilized (which would GC the rollback target); the window has no more time
+	// to prove the new stable, so it rolls back to the previous revision instead.
+	It("rolls back at window end when the new stable is below quorum, never announcing Stabilized", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-endquorum", nil) // default 5m window
+
+		// Advance to within the last debounce of the window, then drop the new
+		// stable below quorum (delete its only Pod).
+		clock = clock.Add(5*time.Minute - 10*time.Second)
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-endquorum-pod-" + rev2}})).To(Succeed())
+		// This reconcile marks it unhealthy (debounce starts); still inside the
+		// window and before the debounce, so no rollback yet.
+		rec(r, "s-endquorum")
+		Expect(getDM("s-endquorum").Status.Phase).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+
+		// Now cross the window end while still below quorum (debounce has NOT
+		// elapsed). The window-end branch must roll back, not announce Stabilized.
+		clock = clock.Add(30 * time.Second) // past the window, within the debounce
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-endquorum") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-endquorum")).To(Equal(rev1), "traffic back on the previous revision")
+		Expect(getDM("s-endquorum").Status.FailedRevision.Hash).To(Equal(rev2))
+		Expect(getDM("s-endquorum").Status.PreviousRevision).To(BeNil(), "previous not GC'd as a healthy stabilize")
+		// Drain once and assert on the collected events (drainHas consumes the
+		// channel, so a single pass must check both).
+		fr := r.Recorder.(*events.FakeRecorder)
+		sawStabilized, sawRolledBack := false, false
+		for drained := false; !drained; {
+			select {
+			case e := <-fr.Events:
+				if strings.Contains(e, "Stabilized") {
+					sawStabilized = true
+				}
+				if strings.Contains(e, "RolledBackAfterPromotion") {
+					sawRolledBack = true
+				}
+			default:
+				drained = true
+			}
+		}
+		Expect(sawStabilized).To(BeFalse(), "never announced Stabilized while below quorum")
+		Expect(sawRolledBack).To(BeTrue())
+	})
+
 	It("with stabilization 0 collects the previous revision after the short grace", func() {
 		prober := &revProber{}
 		r := newRec(prober)

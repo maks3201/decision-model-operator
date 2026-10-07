@@ -71,6 +71,16 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 	}
 
 	if elapsed >= window {
+		// Window elapsed. If the new stable is unhealthy right at the boundary
+		// (e.g. a quorum shortfall that began within the last debounce), do NOT
+		// announce Stabilized and do NOT let GC collect the previous revision: the
+		// window's whole purpose is to keep the rollback target until the new
+		// stable is proven healthy, and it is not. Roll back now — the window has
+		// no more time to give the new stable, so waiting out the debounce would
+		// only delay recovery while serving below quorum.
+		if unhealthy {
+			return r.rollbackToPrevious(ctx, dm, eng, stable, p, detail)
+		}
 		// Window passed healthy: announce stabilization once, drop the condition,
 		// and let gcRevisions (called next on the stable path) collect the
 		// previous revision.
