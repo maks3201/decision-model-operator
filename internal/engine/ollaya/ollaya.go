@@ -1349,20 +1349,23 @@ const (
 	prefetchExitTransient      = 1 // network / 5xx / timeout: retry
 	prefetchExitModelNotFound  = 3 // manifest 404 / tag not found: permanent
 	prefetchExitDigestMismatch = 4 // pulled digest != expected: permanent
+	prefetchExitTagMoved       = 5 // pulled a valid but different manifest: tag moved upstream, permanent
 
 	// String forms for embedding in the shell script (const concatenation).
 	prefetchExitTransientStr      = "1"
 	prefetchExitModelNotFoundStr  = "3"
 	prefetchExitDigestMismatchStr = "4"
+	prefetchExitTagMovedStr       = "5"
 )
 
 // Prefetch failure reasons written to the termination message (and the last log
 // line as a fallback) so the controller can surface them. Exported so the
 // controller maps a failed Job to the same strings without duplicating them.
 const (
-	PrefetchReasonModelNotFound  = "ModelNotFound"
-	PrefetchReasonDigestMismatch = "DigestMismatch"
-	PrefetchReasonTransient      = "Transient"
+	PrefetchReasonModelNotFound    = "ModelNotFound"
+	PrefetchReasonDigestMismatch   = "DigestMismatch"
+	PrefetchReasonUpstreamTagMoved = "UpstreamTagMoved"
+	PrefetchReasonTransient        = "Transient"
 )
 
 // prefetchScript pulls the model and verifies its digest, then optionally prunes
@@ -1378,7 +1381,10 @@ const (
 // ollaya pull returns exit 1 for BOTH a missing tag and a network error (verified
 // in the image), so a missing tag is told apart by the message
 // ("not found in registry"); anything else that fails the pull is treated as
-// transient and retried.
+// transient and retried. A successful pull whose manifest digest differs from the
+// recorded one is split further: a well-formed manifest means the tag moved
+// upstream (UpstreamTagMoved, exit 5), an ill-formed one means corruption
+// (DigestMismatch, exit 4); both are permanent.
 var prefetchScript = `set -eu
 fail() {
   # $1 = reason, $2 = exit code. Record the reason for the controller.
@@ -1403,6 +1409,19 @@ else
   echo "pulled digest: $got"
   if [ "$got" != "$EXPECT_DIGEST" ]; then
     echo "digest mismatch: got $got want $EXPECT_DIGEST" >&2
+    # Distinguish a moved tag from a corrupt download: if the pulled manifest is
+    # a well-formed Ollaya manifest (schemaVersion 2) it is a real but different
+    # revision (the tag moved upstream), which recovery of a pinned revision
+    # cannot fix by re-pulling the tag; a manifest that is not well-formed is
+    # treated as corruption. Both are permanent. The message names both short
+    # digests (first 12 hex) so the user sees what moved.
+    want_short="$(printf '%s' "$EXPECT_DIGEST" | cut -c1-12)"
+    got_short="$(printf '%s' "$got" | cut -c1-12)"
+    if grep -q '"schemaVersion"[[:space:]]*:[[:space:]]*2' "$OLLAYA_MODELS/$MANIFEST_PATH" 2>/dev/null; then
+      echo "tag moved upstream: recorded $want_short, registry now serves $got_short" >&2
+      fail ` + PrefetchReasonUpstreamTagMoved + ` ` + prefetchExitTagMovedStr + `
+    fi
+    echo "corrupt or unexpected manifest: recorded $want_short, got $got_short" >&2
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
   fi
   echo "digest ok: $got"
@@ -1465,7 +1484,7 @@ func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
 				Action: batchv1.PodFailurePolicyActionFailJob,
 				OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
 					Operator: batchv1.PodFailurePolicyOnExitCodesOpIn,
-					Values:   []int32{prefetchExitModelNotFound, prefetchExitDigestMismatch},
+					Values:   []int32{prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved},
 				},
 			},
 		},
@@ -1482,6 +1501,8 @@ func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
 // revision on an unknown error.
 func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason string, permanent bool) {
 	switch {
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonUpstreamTagMoved):
+		return PrefetchReasonUpstreamTagMoved, true
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonDigestMismatch):
 		return PrefetchReasonDigestMismatch, true
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonModelNotFound):
@@ -1490,6 +1511,8 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 		return PrefetchReasonTransient, false
 	}
 	switch exitCode {
+	case prefetchExitTagMoved:
+		return PrefetchReasonUpstreamTagMoved, true
 	case prefetchExitDigestMismatch:
 		return PrefetchReasonDigestMismatch, true
 	case prefetchExitModelNotFound:

@@ -135,3 +135,35 @@ sum by (namespace, name) (
 ```promql
 decisionmodel_evaluation_ece > 0.1
 ```
+
+## Shipped alerts and runbooks
+
+The chart can ship these as a `PrometheusRule` (requires the Prometheus Operator) and a
+Grafana dashboard ConfigMap, both **disabled by default**:
+
+```yaml
+prometheusRule:
+  enabled: true
+  labels: { release: kube-prometheus-stack }   # match your Prometheus ruleSelector
+grafanaDashboard:
+  enabled: true
+```
+
+The rules fire only on the metrics listed above plus controller-runtime built-ins
+(`controller_runtime_reconcile_errors_total`, `controller_runtime_reconcile_total`).
+Each alert links a runbook in [`docs/runbooks/`](runbooks/):
+
+| Alert | Signal | Runbook |
+| --- | --- | --- |
+| `DecisionModelRolloutStuck` | `decisionmodel_phase` in a non-terminal phase | [RolloutStuck](runbooks/DecisionModelRolloutStuck.md) |
+| `DecisionModelCandidateTimeout` | `decisionmodel_phase` `Starting`/`Evaluating` | [CandidateTimeout](runbooks/DecisionModelCandidateTimeout.md) |
+| `DecisionModelRolloutFailures` | `decisionmodel_rollouts_total` rolled_back/failed | [RolloutFailures](runbooks/DecisionModelRolloutFailures.md) |
+| `DecisionModelEvaluationPoor` | `decisionmodel_evaluation_accuracy` / `_ece` | [EvaluationPoor](runbooks/DecisionModelEvaluationPoor.md) |
+| `DecisionModelDegraded` | `decisionmodel_phase{phase="Degraded"}` | [Degraded](runbooks/DecisionModelDegraded.md) |
+| `DecisionModelModelMismatch` | `decisionmodel_probe_results_total` digest/device mismatch | [ModelMismatch](runbooks/DecisionModelModelMismatch.md) |
+| `DecisionModelOperatorReconcileErrors` | `controller_runtime_reconcile_errors_total` | [OperatorReconcileErrors](runbooks/DecisionModelOperatorReconcileErrors.md) |
+| `DecisionModelOperatorDown` | `absent(controller_runtime_reconcile_total)` | [OperatorDown](runbooks/DecisionModelOperatorDown.md) |
+
+Thresholds and `for` windows are illustrative — tune them (chart `prometheusRule.windows`
+and the expressions) to your environment. There is no dedicated metric for a store-recovery
+failure today; it surfaces via `Degraded`/`Failed` phase and the `PrefetchFailed` condition.

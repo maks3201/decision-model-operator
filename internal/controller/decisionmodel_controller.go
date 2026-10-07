@@ -189,6 +189,8 @@ const (
 	eventRuntimeUpdate         = "RuntimeUpdateAvailable"
 	eventStabilized            = "Stabilized"
 	eventRolledBackPromo       = "RolledBackAfterPromotion"
+	eventCandidateRejected     = "CandidateRejected"
+	eventCandidateSuperseded   = "CandidateSuperseded"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -699,19 +701,17 @@ func (r *DecisionModelReconciler) reconcilePreflight(
 	if reason, msg, bad, sdone, sres, serr := r.preflightSecurity(ctx, dm, eng, hasStable); sdone {
 		return "", true, sres, serr
 	} else if bad {
-		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
-			decisionmodelv1alpha1.ConditionReady, reason, msg)
+		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable, reason, msg, false)
 		return "", true, res, err
 	}
 
 	// Resolve the model to a digest.
-	digest, rdone, bad, reason, msg, rres, rerr := r.preflightResolve(ctx, dm, eng, hasStable)
+	digest, rdone, bad, transient, reason, msg, rres, rerr := r.preflightResolve(ctx, dm, eng, hasStable)
 	if rdone {
 		return "", true, rres, rerr
 	}
 	if bad {
-		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
-			decisionmodelv1alpha1.ConditionResolved, reason, msg)
+		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable, reason, msg, transient)
 		return "", true, res, err
 	}
 
@@ -725,8 +725,7 @@ func (r *DecisionModelReconciler) reconcilePreflight(
 			reason = reasonRuntimeVersionUnsupported
 		}
 		if hasStable {
-			res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable,
-				decisionmodelv1alpha1.ConditionReady, reason, verr.Error())
+			res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable, reason, verr.Error(), false)
 			return "", true, res, err
 		}
 		res, err = r.degradeSecretReason(ctx, dm, reason, verr)
@@ -767,19 +766,20 @@ func (r *DecisionModelReconciler) preflightSecurity(
 
 // preflightResolve resolves the digest. With no stable it delegates to
 // reconcileResolve (done=true on failure). With a stable it never fails the
-// object: a permanent model-not-found is reported as bad=true/ModelNotFound; a
-// transient resolve error (e.g. registry 5xx) returns done=true with a plain
-// requeue+err so the workqueue backs off while the stable keeps serving (the
-// stable path runs on the next reconcile; nothing is marked failed).
+// object: it reports bad=true and the caller routes to the stable path. A
+// permanent model-not-found is bad=true/ModelNotFound (transient=false); a
+// transient resolve error (e.g. registry 5xx) is bad=true/ResolveFailed with
+// transient=true, so the caller surfaces only Resolved=False (not Degraded) and
+// keeps the stable serving. Nothing is marked failed in either case.
 func (r *DecisionModelReconciler) preflightResolve(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	eng engine.Engine,
 	hasStable bool,
-) (digest string, done, bad bool, reason, msg string, res ctrl.Result, err error) {
+) (digest string, done, bad, transient bool, reason, msg string, res ctrl.Result, err error) {
 	if !hasStable {
 		digest, done, res, err = r.reconcileResolve(ctx, dm, eng)
-		return digest, done, false, "", "", res, err
+		return digest, done, false, false, "", "", res, err
 	}
 	digest, rerr := r.resolveDigest(ctx, dm, eng)
 	if rerr == nil {
@@ -793,60 +793,79 @@ func (r *DecisionModelReconciler) preflightResolve(
 			Reason:  reasonResolved,
 			Message: fmt.Sprintf("resolved %q to digest %s", dm.Spec.Model, digest),
 		})
-		return digest, false, false, "", "", ctrl.Result{}, nil
+		return digest, false, false, false, "", "", ctrl.Result{}, nil
 	}
 	if errors.Is(rerr, engine.ErrNotFound) {
 		// Permanent for the candidate: surface it and keep the stable serving.
-		return "", false, true, reasonModelNotFound,
+		return "", false, true, false, reasonModelNotFound,
 			fmt.Sprintf("model %q not found", dm.Spec.Model), ctrl.Result{}, nil
 	}
 	// Transient (e.g. registry 5xx): nothing is marked failed. Surface it as a
-	// candidate failure and keep the stable serving; resolve retries on the next
-	// reconcile. bad=true routes to the stable path, which requeues.
-	return "", false, true, reasonResolveFailed, rerr.Error(), ctrl.Result{}, nil
+	// candidate failure (transient) and keep the stable serving; resolve retries
+	// on the next reconcile via the stable path's requeue.
+	return "", false, true, true, reasonResolveFailed, rerr.Error(), ctrl.Result{}, nil
 }
 
-// maintainStableAfterPreflight records a candidate-preflight failure on the
-// given condition type (Resolved=False for a resolve failure, Ready carries the
-// reason otherwise via Degraded) and then runs the full stable maintenance path
-// so a bad candidate never stops serving/repairing the stable. Ready is set by
-// the stable path from the stable's own readiness; this adds a Degraded=True
-// with the candidate failure reason and (for a resolve miss) Resolved=False.
+// maintainStableAfterPreflight records a candidate-preflight failure and runs
+// the full stable maintenance path so a bad candidate never stops serving the
+// stable. The candidate failure is surfaced on the Resolved condition
+// (Resolved=False with the specific reason); the Degraded condition is left to
+// the stable path so a real stable-side problem (CacheNotShareable,
+// PostPromotionUnhealthy, replica shortfall) is never hidden by the candidate
+// reason. A Warning Event is emitted only when the Resolved reason/message
+// changes, so a persistently bad spec does not spam one per reconcile; a
+// transient failure (registry 5xx) stays quiet (no Degraded, Event only on
+// change). A candidate that was in flight for the previous spec is abandoned so
+// it stops holding a rollout slot / GPU / disk.
 func (r *DecisionModelReconciler) maintainStableAfterPreflight(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	eng engine.Engine,
 	stable *decisionmodelv1alpha1.RevisionStatus,
-	condType, reason, msg string,
+	reason, msg string,
+	transient bool,
 ) (ctrl.Result, error) {
-	if condType == decisionmodelv1alpha1.ConditionResolved {
-		setStatusCondition(dm, metav1.Condition{
-			Type: condType, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
-		})
-	}
-	// Always surface the candidate failure as Degraded so it is visible even when
-	// the stable is otherwise healthy; the stable path owns Ready.
+	// Dedupe the Event: emit only when the candidate-failure signal changes.
+	prev := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionResolved)
+	changed := prev == nil || prev.Status != metav1.ConditionFalse ||
+		prev.Reason != reason || prev.Message != msg
+
 	setStatusCondition(dm, metav1.Condition{
-		Type:    decisionmodelv1alpha1.ConditionDegraded,
-		Status:  metav1.ConditionTrue,
-		Reason:  reason,
-		Message: fmt.Sprintf("candidate spec rejected (%s); the current stable keeps serving", msg),
+		Type: decisionmodelv1alpha1.ConditionResolved, Status: metav1.ConditionFalse,
+		Reason: reason, Message: msg,
 	})
-	r.event(ctx, dm, corev1.EventTypeWarning, reason,
-		"candidate spec rejected: %s; maintaining the current stable %s", msg, stable.Hash)
+	// Emit a Warning only for a permanent rejection (bad model name, missing tag,
+	// disallowed registry, invalid runtimeVersion) and only when the signal
+	// changed. A transient resolve blip (registry 5xx) is a retriable outage, not
+	// a user error: it stays quiet (Resolved=False carries it) so a flapping
+	// registry does not spam Events.
+	if changed && !transient {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventCandidateRejected,
+			"candidate spec rejected (%s): %s; the current stable %s keeps serving", reason, msg, stable.Hash)
+	}
+
+	// Abandon a candidate started for a now-superseded spec: the spec no longer
+	// asks for it, and leaving it holds its Deployment/Job/PVC (GPU, disk) and a
+	// rollout slot until the spec is fixed. Clearing candidateRevision lets
+	// gcRevisions (run by the stable path) collect it. Emit once.
+	if c := dm.Status.CandidateRevision; c != nil {
+		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
+			"abandoning candidate %s: the spec changed to a revision that cannot start", c.Hash)
+		dm.Status.CandidateRevision = nil
+	}
 
 	// The stable's API key may itself be unreadable (e.g. the Secret lost its
-	// label). That must not stop maintaining a running stable: surface Degraded
-	// and continue with an empty key (the prober then cannot authenticate, which
-	// shows as not-model-ready, but Deployment/Service/PDB/store repair runs).
+	// label). That must not stop maintaining a running stable: continue with an
+	// empty key. ensureDeployment preserves the existing key checksum on an empty
+	// key, so this never rolls the running stable; the prober may get a transient
+	// 401 (handled by Reinspect) rather than a template change.
 	apiKey, kerr := r.apiKey(ctx, dm)
 	if kerr != nil {
 		apiKey = ""
 	}
-	// Pass cacheDegraded=true so the stable path preserves the candidate-failure
-	// Degraded condition set above even when the stable is fully model-ready
-	// (otherwise setReadyConditions would clear it to "healthy").
-	return r.reconcileStablePath(ctx, dm, eng, stable, apiKey, true)
+	// cacheDegraded=false: the stable path owns Degraded and sets it from the
+	// stable's own health; the candidate failure lives on Resolved above.
+	return r.reconcileStablePath(ctx, dm, eng, stable, apiKey, false)
 }
 
 // reconcileStablePath keeps the stable revision in sync and re-probes its Pods.

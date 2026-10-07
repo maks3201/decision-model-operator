@@ -46,9 +46,9 @@ func TestPrefetchFailFastPolicy(t *testing.T) {
 	for _, v := range rule.OnExitCodes.Values {
 		got[v] = true
 	}
-	if !got[prefetchExitModelNotFound] || !got[prefetchExitDigestMismatch] {
-		t.Errorf("fail-fast exit codes = %v, want %d and %d",
-			rule.OnExitCodes.Values, prefetchExitModelNotFound, prefetchExitDigestMismatch)
+	if !got[prefetchExitModelNotFound] || !got[prefetchExitDigestMismatch] || !got[prefetchExitTagMoved] {
+		t.Errorf("fail-fast exit codes = %v, want %d, %d and %d",
+			rule.OnExitCodes.Values, prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved)
 	}
 	if got[prefetchExitTransient] {
 		t.Errorf("transient exit %d must NOT be in the fail-fast set", prefetchExitTransient)
@@ -72,12 +72,14 @@ func TestPrefetchFailFastPolicy(t *testing.T) {
 func TestPrefetchScriptClassifies(t *testing.T) {
 	script := New().PrefetchJobSpec(baseParams()).Template.Spec.Containers[0].Args[0]
 	wants := []string{
-		`not found in registry`,                            // 404 message match
-		"fail " + PrefetchReasonModelNotFound + " " + "3",  // -> exit 3
-		"fail " + PrefetchReasonTransient + " " + "1",      // network -> exit 1
-		"fail " + PrefetchReasonDigestMismatch + " " + "4", // digest -> exit 4
-		`got $got want $EXPECT_DIGEST`,                     // digest check kept
-		"/dev/termination-log",                             // reason recorded
+		`not found in registry`,                              // 404 message match
+		"fail " + PrefetchReasonModelNotFound + " " + "3",    // -> exit 3
+		"fail " + PrefetchReasonTransient + " " + "1",        // network -> exit 1
+		"fail " + PrefetchReasonDigestMismatch + " " + "4",   // corrupt manifest -> exit 4
+		"fail " + PrefetchReasonUpstreamTagMoved + " " + "5", // well-formed, moved -> exit 5
+		`got $got want $EXPECT_DIGEST`,                       // digest check kept
+		`"schemaVersion"`,                                    // well-formedness probe
+		"/dev/termination-log",                               // reason recorded
 	}
 	for _, w := range wants {
 		if !strings.Contains(script, w) {
@@ -95,9 +97,11 @@ func TestClassifyPrefetchFailure(t *testing.T) {
 		wantPermanent bool
 	}{
 		{"digest mismatch from message", "reason: DigestMismatch\n", 4, PrefetchReasonDigestMismatch, true},
+		{"upstream tag moved from message", "reason: UpstreamTagMoved\n", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from message", "reason: ModelNotFound\n", 3, PrefetchReasonModelNotFound, true},
 		{"transient from message", "reason: Transient\n", 1, PrefetchReasonTransient, false},
 		{"digest mismatch from exit code only", "", 4, PrefetchReasonDigestMismatch, true},
+		{"upstream tag moved from exit code only", "", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from exit code only", "", 3, PrefetchReasonModelNotFound, true},
 		{"transient from exit code only", "", 1, PrefetchReasonTransient, false},
 		{"unknown exit code is transient", "", 2, PrefetchReasonTransient, false},
