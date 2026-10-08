@@ -45,15 +45,21 @@ const chaosDM = "chaos-router"
 //
 // Scenarios (one DecisionModel reused where possible to bound node memory — every
 // laya:en Pod holds the model, so the suite runs them sequentially):
-//  1. Registry 500 during Resolving  -> stable keeps serving, Resolved=False/ResolveFailed
-//     (transient, no Degraded, no Event); fault cleared -> the candidate proceeds.
-//  2. Registry 404 for the tag       -> Resolved=False/ModelNotFound, stable keeps serving.
-//  3. Runtime fault during Evaluating (model unloaded from the candidate Pod) ->
-//     evaluation holds and retries, no false reject; model back -> promotes.
-//  4. Stable store PVC deleted while Ready -> Degraded=StoreLost, bounded recovery.
-//     (PENDING — see the PIt comment; timing-sensitive on kind.)
-//  5. Stable serving Pod deleted during Stabilizing -> no false rollback when it
-//     returns within the debounce. (PENDING — see the PIt comment.)
+//
+//	1a. Registry 500 during Resolving  -> stable keeps serving, Resolved=False/ResolveFailed
+//	    (transient, no Degraded, no Event); fault cleared -> the candidate proceeds.
+//	1b. Registry fault (503) during prefetch (Caching) -> waits in Caching, not Failed;
+//	    cleared -> completes.
+//	2.  Registry 404 for the tag       -> Resolved=False/ModelNotFound, stable keeps serving.
+//	3.  Runtime fault during Evaluating (candidate Pod disrupted = transport error) ->
+//	    evaluation holds and retries, no false reject; recovered -> promotes.
+//	4.  Operator Pod killed mid-rollout and after promotion -> converges, exactly one
+//	    Deployment/Job/PVC per revision, Service on the stable.
+//	5a. Candidate store PVC deleted during Starting -> fresh re-prefetch, then completes.
+//	5b. Stable store PVC deleted while Ready -> Degraded store reason, bounded recovery.
+//	    (PENDING — see the PIt comment; timing-sensitive on kind.)
+//	6.  Stable serving Pod deleted during Stabilizing -> no false rollback within the
+//	    debounce. (PENDING — see the PIt comment.)
 var _ = Describe("Chaos: faults between critical steps", Label("nightly", "chaos"), Ordered, func() {
 	const dm = chaosDM
 
@@ -305,6 +311,120 @@ spec:
 		}, 2*time.Minute, 5*time.Second).Should(Equal("Bound"), "the stable store PVC should be recreated and Bound")
 	})
 
+	It("waits in Caching (not Failed) when the registry faults during prefetch, then completes", func() {
+		// A transient registry fault DURING prefetch (the Caching phase) must keep the
+		// DecisionModel waiting in Caching while the Job retries, NOT fail it; once the
+		// registry recovers the prefetch completes and it promotes. Held via MIRROR_FAULT
+		// (503) for longer than the Job's internal retries and a reconcile.
+		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("resolving a new revision while the registry is healthy, then faulting it as prefetch starts")
+		// Bump cpu to force a new revision; resolve succeeds (registry healthy), then we
+		// fault the registry so the prefetch Job's pull fails and retries.
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"resources":{"requests":{"cpu":"600m","memory":"1Gi"},"limits":{"memory":"4Gi"}}}}`)
+		Expect(err).NotTo(HaveOccurred())
+		// Wait until a candidate is recorded (resolve done), then fault the registry.
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.candidateRevision.hash}")
+		}, 3*time.Minute, 2*time.Second).ShouldNot(BeEmpty())
+		setMirrorFault("503")
+
+		By("the DecisionModel waits in Caching (Cached=False), not Failed/RolledBack, while the Job retries")
+		Consistently(func(g Gomega) {
+			phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(phase).NotTo(BeElementOf("Failed", "RolledBack"),
+				"a transient registry fault during prefetch must not fail the rollout")
+		}, 40*time.Second, 5*time.Second).Should(Succeed())
+
+		By("clearing the fault lets the prefetch complete and the candidate promote")
+		clearMirrorFault()
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"),
+			"once the registry recovers the prefetch should complete and promote")
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).NotTo(Equal(stableBefore), "the new revision should have promoted after recovery")
+	})
+
+	It("converges with no duplicate objects when the operator Pod is killed mid-rollout", func() {
+		// Kill the operator Pod while a candidate is rolling out (right after it is
+		// created) and again after it promotes. Owner refs + deterministic per-revision
+		// names + level-triggered reconcile + persist-before-switch make this safe: the
+		// restarted operator re-asserts the same objects (idempotent) and ends with
+		// exactly one Deployment/Job/PVC per revision and the Service on the stable.
+		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("rolling out a new revision and killing the operator as soon as the candidate exists")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"resources":{"requests":{"cpu":"650m","memory":"1Gi"},"limits":{"memory":"4Gi"}}}}`)
+		Expect(err).NotTo(HaveOccurred())
+		var candHash string
+		Eventually(func() (string, error) {
+			candHash, _ = utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.candidateRevision.hash}")
+			return candHash, nil
+		}, 3*time.Minute, 2*time.Second).ShouldNot(BeEmpty())
+		killOperatorPod()
+
+		By("the rollout still completes to Ready on the new revision after the restart")
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"))
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).To(Equal(candHash), "the candidate should promote across the operator restart")
+
+		By("killing the operator again right after promotion; the Service stays on the stable")
+		killOperatorPod()
+		Consistently(func(g Gomega) {
+			g.Expect(serviceRevision(chaosNS, dm)).To(Equal(candHash),
+				"the Service must stay on the promoted stable across a restart")
+		}, 30*time.Second, 5*time.Second).Should(Succeed())
+
+		By("exactly one Deployment/Job/PVC for the promoted revision (no duplicates from the restart)")
+		Expect(deploymentCountForRevision(chaosNS, dm, candHash)).To(Equal(1))
+		Expect(jobCountForRevision(chaosNS, dm, candHash)).To(Equal(1))
+		Expect(pvcCountForRevision(chaosNS, dm, candHash)).To(Equal(1))
+		_ = stableBefore
+	})
+
+	It("re-prefetches a fresh candidate store when its PVC is deleted during Starting", func() {
+		// Fault 5 (candidate side): the candidate's per-revision store PVC is deleted
+		// while it is Starting. The candidate flow does not run the bounded stable
+		// recovery; it waits out the Terminating PVC and re-prefetches a fresh one, then
+		// completes — a normal rollout, no Failed.
+		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("rolling out a new revision and deleting its store PVC once a candidate exists")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"resources":{"requests":{"cpu":"700m","memory":"1Gi"},"limits":{"memory":"4Gi"}}}}`)
+		Expect(err).NotTo(HaveOccurred())
+		var candHash string
+		Eventually(func() (string, error) {
+			candHash, _ = utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.candidateRevision.hash}")
+			return candHash, nil
+		}, 3*time.Minute, 2*time.Second).ShouldNot(BeEmpty())
+		// Delete the candidate store PVC and its prefetch Job's/serving Pod so it finalizes.
+		_, _ = utils.Kubectl("delete", "pvc", dm+"-store-"+candHash, "-n", chaosNS, "--wait=false")
+		_, _ = utils.Kubectl("delete", "pods", "-l",
+			"decisionmodel.io/name="+dm+",decisionmodel.io/revision="+candHash, "-n", chaosNS,
+			"--grace-period=0", "--force")
+
+		By("the candidate must not fail; it re-prefetches a fresh store and completes to Ready")
+		Consistently(func(g Gomega) {
+			phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(phase).NotTo(Equal("Failed"), "a deleted candidate store must not fail the rollout")
+		}, 20*time.Second, 5*time.Second).Should(Succeed())
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"))
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).To(Equal(candHash), "the candidate should still promote after a fresh re-prefetch")
+		_ = stableBefore
+	})
+
 	// PENDING: depends on hitting the Stabilizing window and the 30s post-promotion
 	// debounce precisely; enable alongside the store-loss scenario once the chaos CI is
 	// dispatchable for iteration.
@@ -431,5 +551,25 @@ func eventReasonCountIn(reason string) int {
 	out, _ := utils.Kubectl("get", "events", "-n", chaosNS,
 		"--field-selector", "involvedObject.name="+chaosDM+",reason="+reason,
 		"-o", "jsonpath={.items[*].reason}")
+	return len(strings.Fields(out))
+}
+
+// killOperatorPod force-deletes the controller-manager Pod(s); the Deployment
+// recreates them. Used to prove restart convergence (level-triggered reconcile +
+// persist-before-switch make a mid-step kill safe).
+func killOperatorPod() {
+	for _, p := range managerPods() {
+		_, _ = utils.Kubectl("delete", "pod", p, "-n", operatorNamespace, "--grace-period=0", "--force")
+	}
+	_, _ = utils.Kubectl("rollout", "status", "deployment/"+managerDeployment(),
+		"-n", operatorNamespace, "--timeout=2m")
+}
+
+// pvcCountForRevision counts the per-revision store PVCs carrying a revision label
+// (a duplicate would mean the restart created a second store for one revision).
+func pvcCountForRevision(ns, name, rev string) int {
+	out, _ := utils.Kubectl("get", "pvc",
+		"-l", "decisionmodel.io/name="+name+",decisionmodel.io/revision="+rev,
+		"-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
 	return len(strings.Fields(out))
 }
