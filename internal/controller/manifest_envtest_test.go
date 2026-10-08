@@ -27,11 +27,13 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -361,5 +363,109 @@ var _ = Describe("per-revision manifest persistence", func() {
 		Expect(apierrors.IsNotFound(
 			k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("queued", rev)}, job),
 		)).To(BeTrue(), "no prefetch Job while queued")
+	})
+
+	It("deletes the manifest ConfigMap of a superseded candidate that never got a PVC", func() {
+		// A candidate queued by the rollout budget persists its manifest ConfigMap
+		// but never creates a store PVC. When it is later abandoned, GC cannot find
+		// it through a stale PVC (there is none) and cannot List ConfigMaps
+		// (get-only RBAC), so the abandon path records the hash on the reconcile
+		// state and GC deletes <dm>-manifest-<rev> by name.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		createDM("abandon")
+		dmObj := getDM("abandon")
+		// A candidate ConfigMap for a revision that has NO store PVC (queued by the
+		// budget, never prefetched).
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "abandon-manifest-deadbeef01",
+				Labels: revisionLabels(dmObj, "deadbeef01"),
+			},
+			BinaryData: map[string][]byte{manifestKey: manifestBody},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, cm, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		_, err := manifestCM("abandon", "deadbeef01")
+		Expect(err).NotTo(HaveOccurred(), "precondition: the orphan ConfigMap exists")
+
+		// Record the hash as abandoned on the reconcile state (as the abandon paths
+		// do before clearing status.candidateRevision), then run GC. No PVC named
+		// abandon-store-deadbeef01 exists.
+		st := &reconcileState{base: getDM("abandon").DeepCopy()}
+		gctx := context.WithValue(ctx, reconcileStateKey{}, st)
+		markManifestAbandoned(gctx, "deadbeef01")
+		Expect(r.gcRevisions(gctx, getDM("abandon"))).To(Succeed())
+
+		Eventually(func() bool {
+			c, gerr := manifestCM("abandon", "deadbeef01")
+			return apierrors.IsNotFound(gerr) || (gerr == nil && c.DeletionTimestamp != nil)
+		}, "3s", "50ms").Should(BeTrue(),
+			"the abandoned candidate's manifest ConfigMap is deleted by name even without a PVC")
+	})
+
+	It("deletes the manifest ConfigMap of a stale revision whose PVC is still terminating", func() {
+		// A crash between the PVC delete and the ConfigMap delete leaves the PVC
+		// terminating (deletionTimestamp set, finalizer lingering) with the
+		// ConfigMap still present. The next GC pass still sees the terminating PVC
+		// in the List, so it re-derives the revision and deletes the ConfigMap.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		createDM("term")
+		dmObj := getDM("term")
+
+		// A stale revision (neither stable nor candidate): a store PVC with a
+		// finalizer so a Delete leaves it terminating, and its manifest ConfigMap.
+		staleRev := "cafef00d01"
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "term-store-" + staleRev,
+				Labels:     revisionLabels(dmObj, staleRev),
+				Finalizers: []string{"decisionmodel.io/test-hold"},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, pvc, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		// Put it into terminating state (deletionTimestamp set, finalizer holds it).
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		Eventually(func() bool {
+			live := &corev1.PersistentVolumeClaim{}
+			if gerr := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "term-store-" + staleRev}, live); gerr != nil {
+				return false
+			}
+			return live.DeletionTimestamp != nil
+		}, "3s", "50ms").Should(BeTrue(), "precondition: the PVC is terminating")
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "term-manifest-" + staleRev,
+				Labels: revisionLabels(dmObj, staleRev),
+			},
+			BinaryData: map[string][]byte{manifestKey: manifestBody},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, cm, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+		// GC: the terminating PVC is still listed, so its revision is collected and
+		// the ConfigMap is deleted.
+		Expect(r.gcRevisions(ctx, getDM("term"))).To(Succeed())
+		Eventually(func() bool {
+			c, gerr := manifestCM("term", staleRev)
+			return apierrors.IsNotFound(gerr) || (gerr == nil && c.DeletionTimestamp != nil)
+		}, "3s", "50ms").Should(BeTrue(),
+			"a terminating PVC still drives deletion of its manifest ConfigMap")
+
+		// Release the finalizer so the PVC can finish deleting (test cleanup).
+		live := &corev1.PersistentVolumeClaim{}
+		if gerr := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "term-store-" + staleRev}, live); gerr == nil {
+			live.Finalizers = nil
+			_ = k8sClient.Update(ctx, live)
+		}
 	})
 })

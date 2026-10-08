@@ -614,6 +614,7 @@ func (r *DecisionModelReconciler) abandonCandidateThenFinish(
 	if abandoned := dm.Status.CandidateRevision; abandoned != nil {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
 			"abandoning candidate revision %s: the spec no longer describes a startable revision", abandoned.Hash)
+		markManifestAbandoned(ctx, abandoned.Hash)
 		dm.Status.CandidateRevision = nil
 	}
 	persisted, conflict, perr := r.persistStatus(ctx, dm)
@@ -1136,6 +1137,7 @@ func (r *DecisionModelReconciler) maintainStableAfterPreflight(
 	if c := dm.Status.CandidateRevision; c != nil {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
 			"abandoning candidate revision %s: the spec changed to a revision that cannot start", c.Hash)
+		markManifestAbandoned(ctx, c.Hash)
 		dm.Status.CandidateRevision = nil
 	}
 

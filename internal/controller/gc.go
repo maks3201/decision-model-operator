@@ -96,15 +96,34 @@ func (r *DecisionModelReconciler) gcRevisions(
 	}
 	// Per-revision manifest ConfigMaps are collected with their revision. They are
 	// read with get-only RBAC (no list/watch), so GC cannot List them; instead it
-	// deletes <dm>-manifest-<rev> BY NAME for each stale store PVC it collects (a
-	// revision that ever prefetched has a store PVC, created alongside its
-	// manifest ConfigMap). Capture the revisions whose PVC was deleted and remove
-	// their manifest ConfigMaps by name (owner-UID checked, NotFound ignored).
+	// deletes <dm>-manifest-<rev> BY NAME. Two sources of names:
+	//   1. Every stale store PVC collected this pass. A terminating PVC
+	//      (deletionTimestamp set) is still listed and still yields its revision
+	//      here, so a crash between the PVC delete and the ConfigMap delete is
+	//      recovered on the next pass as long as the PVC lingers.
+	//   2. Candidate revisions abandoned this reconcile that never got a PVC (a
+	//      candidate queued by the rollout budget), recorded on the reconcile
+	//      state before status.candidateRevision was cleared. GC runs after that
+	//      status write on both abandon paths, so this is persist-then-act.
+	// Owner-UID is checked and NotFound is ignored, so a foreign ConfigMap with
+	// our name survives and a double-delete is harmless.
 	stalePVCRevs, err := r.gcStaleByRevisionCollect(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete)
 	if err != nil {
 		return err
 	}
-	for _, rev := range stalePVCRevs {
+	manifestRevs := append([]string{}, stalePVCRevs...)
+	if st := reconcileStateFrom(ctx); st != nil {
+		manifestRevs = append(manifestRevs, st.abandonedManifestRevs...)
+	}
+	seen := map[string]struct{}{}
+	for _, rev := range manifestRevs {
+		if rev == "" {
+			continue
+		}
+		if _, dup := seen[rev]; dup {
+			continue
+		}
+		seen[rev] = struct{}{}
 		if err := r.deleteManifestConfigMapIfOwned(ctx, dm, rev); err != nil {
 			return err
 		}
