@@ -146,10 +146,10 @@ kind-down: ## Delete the kind cluster '$(KIND_CLUSTER)' (idempotent).
 	KIND_CLUSTER=$(KIND_CLUSTER) ./hack/kind-down.sh
 
 .PHONY: test-e2e
-test-e2e: kind-up manifests generate fmt vet ## Run the e2e tests on kind. Leaves the cluster DOWN.
+test-e2e: kind-up manifests generate fmt vet ## Run the e2e tests on kind. Leaves the cluster DOWN unless E2E_KEEP_CLUSTER=1.
 	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v $(GINKGO_LABEL_FILTER) -timeout 40m; \
 		status=$$?; \
-		$(MAKE) kind-down; \
+		if [ -z "$(E2E_KEEP_CLUSTER)" ]; then $(MAKE) kind-down; fi; \
 		exit $$status
 
 ##@ Demo
