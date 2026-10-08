@@ -279,7 +279,59 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 			"the permanent give-up did not consume the bounded attempts")
 	})
 
-	// The same failed Job UID counts once (idempotent across stale cache reads).
+	// A moved upstream tag during store recovery is permanent (the pinned digest
+	// can no longer be rebuilt from the registry tag) and surfaces both short
+	// digests in the Degraded message, so a user sees recorded vs. served.
+	It("gives up at once on UpstreamTagMoved with both short digests", func() {
+		dm := mkDM("moved")
+		stable := stableRev()
+		claim := storeNameRev(dm, stable.Hash)
+		rr := newRec(k8sClient)
+
+		driveToJob(rr, dm, stable, claim)
+		job := getJob(dm)
+		markFailed(job)
+		yes := true
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: prefetchName(dm, "r1") + "-mv",
+				Labels: map[string]string{
+					decisionmodelv1alpha1.LabelName:             dm.Name,
+					decisionmodelv1alpha1.LabelPrefetchRevision: "r1",
+					"job-name": prefetchName(dm, "r1"),
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
+					Controller: &yes, BlockOwnerDeletion: &yes,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		now := metav1.Now()
+		pod.Status.StartTime = &now
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "prefetch",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 5,
+				Message:  "reason: UpstreamTagMoved\ntag moved upstream: recorded aaaaaaaaaaaa, registry now serves bbbbbbbbbbbb",
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		handled, _, res, err := rr.recoverStableStore(ctx, dm, rr.Engines["ollaya"], stable, claim, false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(handled).To(BeTrue())
+		Expect(res.RequeueAfter).To(Equal(regateInterval))
+		Expect(degradedReason(dm)).To(Equal(reasonStorePrefetchFailed))
+		deg := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg.Message).To(ContainSubstring("UpstreamTagMoved"))
+		Expect(deg.Message).To(ContainSubstring("permanently"))
+		Expect(deg.Message).To(ContainSubstring("aaaaaaaaaaaa"), "recorded short digest surfaced")
+		Expect(deg.Message).To(ContainSubstring("bbbbbbbbbbbb"), "registry short digest surfaced")
+		Expect(rr.countFailedRecovery(dm, types.UID("probe"))).To(BeFalse(),
+			"the permanent give-up did not consume the bounded attempts")
+	})
 	It("counts the same failed Job UID only once", func() {
 		dm := mkDM("once")
 		rr := newRec(k8sClient)

@@ -155,6 +155,43 @@ var _ = Describe("prefetch failure classification", func() {
 		Entry("transient", "connection reset by peer", "Transient"),
 	)
 
+	// A moved upstream tag is a permanent prefetch failure: the recorded digest
+	// no longer matches what the registry serves and re-pulling the tag cannot
+	// fix a pinned revision. The termination message carries both short digests
+	// (recorded vs. the one the registry now serves); the controller passes the
+	// classifier detail through to the PrefetchFailed condition, the Event and
+	// status.failedRevision.message, so a user sees exactly what moved.
+	It("candidate path surfaces UpstreamTagMoved with both short digests", func() {
+		name := "moved"
+		r := newR()
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+			},
+		})).To(Succeed())
+		rec(r, name)
+		rev := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		// The engine's prefetch container writes the classification plus both
+		// short digests to the termination message (reason line + detail line).
+		termMsg := "reason: UpstreamTagMoved\ntag moved upstream: recorded aaaaaaaaaaaa, registry now serves bbbbbbbbbbbb"
+		failPrefetch(name, rev, termMsg, 5)
+		rec(r, name)
+
+		dm := getDM(name)
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseFailed))
+		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg).NotTo(BeNil())
+		Expect(deg.Reason).To(Equal(reasonPrefetchFailed), "condition reason stays PrefetchFailed")
+		Expect(deg.Message).To(ContainSubstring("UpstreamTagMoved"))
+		Expect(deg.Message).To(ContainSubstring("permanent"))
+		Expect(deg.Message).To(ContainSubstring("aaaaaaaaaaaa"), "recorded short digest surfaced")
+		Expect(deg.Message).To(ContainSubstring("bbbbbbbbbbbb"), "registry short digest surfaced")
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("UpstreamTagMoved"))
+		Expect(drainHas(r, "UpstreamTagMoved")).To(BeTrue(), "the Event names the classified reason")
+	})
+
 	// newestFailedPrefetchTermination trusts the current prefetch Job's UID, not
 	// the labels (which anyone with Pod create rights can set). A Pod is read only
 	// when its controller OwnerReference is that Job.

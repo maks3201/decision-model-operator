@@ -313,7 +313,7 @@ func (r *DecisionModelReconciler) evalStoreOrInit() *evalStore {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;create;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -396,6 +396,14 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// this policy must not be reported as a refused/unpinned candidate).
 	if !isStable {
 		r.recordRuntimeImagePinned(ctx, &dm, eng, candidate, effVer)
+		// Persist this candidate's manifest NOW — same reconcile as Resolve, before
+		// the digest is recorded in status — so the bytes can never be lost (a
+		// queued candidate, a later-reconcile prefetch, or a crash after Resolve
+		// still has a durable manifest). On a write error, abort without a status
+		// write so the next reconcile resolves again and retries.
+		if err := r.persistCandidateManifest(ctx, &dm, rev, digest); err != nil {
+			return r.finish(ctx, &dm, ctrl.Result{}, err)
+		}
 	}
 
 	// Surface whether a newer engine runtime default exists than the version this
@@ -1342,6 +1350,11 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 	}
 
 	// 5. Prefetch Job.
+	// Persist this revision's manifest (owned, revision-labelled ConfigMap) BEFORE
+	// the Job and seed params.Model.Manifest from it, so the Job rebuilds exactly
+	// the recorded digest even if the upstream tag later moves. A missing/moved
+	// manifest leaves the seed empty -> pull-by-tag + verify (today's behaviour).
+	params = r.seedManifest(ctx, dm, params, rev, digest)
 	jobCreated, jobDone, jobFailed, err := r.ensurePrefetchJob(ctx, dm, eng, params, rev)
 	if err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
@@ -1453,6 +1466,11 @@ func (r *DecisionModelReconciler) resolveDigest(
 	observeRegistryResolve(time.Since(start))
 	if err != nil {
 		return "", err
+	}
+	// Stash the manifest for the per-revision manifest ConfigMap persist, so it
+	// reuses this Resolve rather than calling Resolve again.
+	if st := reconcileStateFrom(ctx); st != nil {
+		st.resolvedManifest = ref.Manifest
 	}
 	return ref.Digest, nil
 }

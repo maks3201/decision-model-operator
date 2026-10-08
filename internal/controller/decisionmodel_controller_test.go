@@ -66,6 +66,10 @@ type fakeEngine struct {
 	digest       string
 	resolveErr   error
 	resolveCalls int
+	// manifest, when set, makes Resolve return these bytes as ModelRef.Manifest
+	// and derive the digest from them (sha256). Used by the manifest-persistence
+	// tests; nil keeps the fixed-digest, no-manifest behaviour.
+	manifest []byte
 	// defaultVersion overrides the engine's default runtime version, to simulate
 	// an operator upgrade that ships a newer default (a fresh reconciler with a
 	// new build). Empty means fakeDefaultRuntimeVersion.
@@ -92,6 +96,12 @@ func (f *fakeEngine) Resolve(_ context.Context, name string) (engine.ModelRef, e
 	f.resolveCalls++
 	if f.resolveErr != nil {
 		return engine.ModelRef{}, f.resolveErr
+	}
+	// When a manifest is configured, return it and derive the digest from it so
+	// the controller's sha256(manifest)==digest check holds; otherwise report the
+	// fixed f.digest with no manifest (the pre-manifest behaviour).
+	if f.manifest != nil {
+		return engine.ModelRef{Name: name, Digest: digestOf(f.manifest), Manifest: f.manifest}, nil
 	}
 	return engine.ModelRef{Name: name, Digest: f.digest}, nil
 }
@@ -211,6 +221,8 @@ func (f *fakeEngine) RuntimeImagePinned(version, _ string) bool {
 // else (including an unrecognised message) is Transient.
 func (f *fakeEngine) ClassifyPrefetchFailure(terminationMessage string, _ int32) (string, bool) {
 	switch {
+	case strings.Contains(terminationMessage, "UpstreamTagMoved"):
+		return "UpstreamTagMoved", true
 	case strings.Contains(terminationMessage, "ModelNotFound"):
 		return "ModelNotFound", true
 	case strings.Contains(terminationMessage, "DigestMismatch"):
@@ -313,6 +325,13 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	if p.Image != "" {
 		img = p.Image
 	}
+	env := fakeJobEnv(p)
+	// Mirror the real engine's manifest seed: when the controller passes the
+	// persisted manifest bytes, expose their digest as an env var so tests can
+	// assert the recovery/candidate Job was seeded (not left to pull-by-tag).
+	if len(p.Model.Manifest) > 0 {
+		env = append(env, corev1.EnvVar{Name: "MANIFEST_SEED_DIGEST", Value: digestOf(p.Model.Manifest)})
+	}
 	return batchv1.JobSpec{
 		Template: corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
@@ -320,7 +339,7 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 				Containers: []corev1.Container{{
 					Name:  "prefetch",
 					Image: img,
-					Env:   fakeJobEnv(p),
+					Env:   env,
 				}},
 			},
 		},

@@ -54,6 +54,12 @@ type reconcileState struct {
 	// the reconcile and flushed only after a successful status write, so a
 	// conflicting/failed write never double-counts (same rule as Events).
 	metrics []bufferedMetric
+	// resolvedManifest is the raw model manifest from this reconcile's Resolve
+	// (sha256 == the resolved digest), stashed so the manifest-ConfigMap persist
+	// reuses it instead of calling Resolve a second time. Empty when Resolve was
+	// short-circuited (hard-pinned spec.digest, or a digest reused from status) or
+	// the engine returned no manifest.
+	resolvedManifest []byte
 }
 
 type bufferedEvent struct {
