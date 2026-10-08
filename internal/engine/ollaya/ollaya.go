@@ -1619,16 +1619,17 @@ else
 fi
 # Prune other revisions' stores. Runs only when the operator provided a valid,
 # non-empty keep list (KEEP_SUBPATHS) and STORE_ROOT is mounted. Only prune
-# entries that are directories whose name is a 10-hex revision hash (defence in
-# depth via the case below); anything else at the root (legacy manifests/,
-# blobs/, lost+found, files) is left untouched.
+# entries that are directories whose name is a revision hash — exactly 10 or 16
+# lowercase hex chars (defence in depth via the case below); anything else at the
+# root (legacy manifests/, blobs/, lost+found, files) is left untouched.
 if [ -n "${KEEP_SUBPATHS:-}" ] && [ -n "${STORE_ROOT:-}" ]; then
   for entry in "$STORE_ROOT"/*; do
     [ -d "$entry" ] || continue
     base="$(basename "$entry")"
     case "$base" in
       [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-      *) continue ;;  # not a revision hash: never prune
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+      *) continue ;;  # not a revision hash (10 or 16 hex): never prune
     esac
     keep=no
     for k in $KEEP_SUBPATHS; do
@@ -1733,10 +1734,11 @@ func seedManifestUsable(m engine.ModelRef) bool {
 }
 
 // revHashRE validates a store sub-path / keep-list entry: the controller's
-// revision hash is exactly 10 lowercase hex chars. Only entries matching this
-// may ever be pruned; legacy store dirs (manifests/, blobs/, lost+found) never
-// match, so they are always left untouched.
-var revHashRE = regexp.MustCompile(`^[a-f0-9]{10}$`)
+// revision hash is 10 lowercase hex chars (legacy) or 16 (the 64-bit width).
+// Only entries matching this may ever be pruned; legacy store dirs (manifests/,
+// blobs/, lost+found) never match, so they are always left untouched. Both exact
+// widths are accepted and nothing in between, so a stray path can never match.
+var revHashRE = regexp.MustCompile(`^([a-f0-9]{10}|[a-f0-9]{16})$`)
 
 // PrefetchJobSpec returns a Job that downloads p.Model into the store (RW
 // mount, at StoreSubPath). Idempotent (ollaya pull is a fast no-op when
