@@ -72,14 +72,17 @@ func TestPrefetchFailFastPolicy(t *testing.T) {
 func TestPrefetchScriptClassifies(t *testing.T) {
 	script := New().PrefetchJobSpec(baseParams()).Template.Spec.Containers[0].Args[0]
 	wants := []string{
-		`not found in registry`,                              // 404 message match
-		"fail " + PrefetchReasonModelNotFound + " " + "3",    // -> exit 3
-		"fail " + PrefetchReasonTransient + " " + "1",        // network -> exit 1
-		"fail " + PrefetchReasonDigestMismatch + " " + "4",   // corrupt manifest -> exit 4
-		"fail " + PrefetchReasonUpstreamTagMoved + " " + "5", // well-formed, moved -> exit 5
-		`got $got want $EXPECT_DIGEST`,                       // digest check kept
-		`"schemaVersion"`,                                    // well-formedness probe
-		"/dev/termination-log",                               // reason recorded
+		`not found in registry`,                           // 404 message match
+		"fail " + PrefetchReasonModelNotFound + " " + "3", // -> exit 3
+		"fail " + PrefetchReasonTransient + " " + "1",     // network -> exit 1
+		`got $got want $EXPECT_DIGEST`,                    // digest check kept
+		`"schemaVersion"`,                                 // well-formedness probe
+		"/dev/termination-log",                            // reason recorded
+		// The two permanent branches now pass a detail with both short digests;
+		// the "reason: <X>" first line (what the classifier matches) is unchanged.
+		"fail " + PrefetchReasonUpstreamTagMoved + " " + "5" + ` "recorded $want_short, registry now serves $got_short"`,
+		"fail " + PrefetchReasonDigestMismatch + " " + "4" + ` "recorded $want_short, got $got_short"`,
+		`detail: %s\n`, // fail() writes the optional detail line
 	}
 	for _, w := range wants {
 		if !strings.Contains(script, w) {

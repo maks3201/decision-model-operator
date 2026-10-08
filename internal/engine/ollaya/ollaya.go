@@ -1546,10 +1546,18 @@ const (
 // (DigestMismatch, exit 4); both are permanent.
 var prefetchScript = `set -eu
 fail() {
-  # $1 = reason, $2 = exit code. Record the reason for the controller.
-  printf 'reason: %s\n' "$1" > /dev/termination-log 2>/dev/null || true
+  # $1 = reason, $2 = exit code, $3 = optional one-line detail (short digests).
+  # The first line is always "reason: <X>" (the classifier matches that prefix);
+  # a non-empty detail is written as a second "detail: <...>" line so the user
+  # sees the two short digests in the condition/Event. Kept well under the
+  # 4096-byte termination-message limit (two 12-hex digests plus labels).
+  {
+    printf 'reason: %s\n' "$1"
+    [ -n "${3:-}" ] && printf 'detail: %s\n' "$3"
+  } > /dev/termination-log 2>/dev/null || true
   echo "prefetch failed: $1" >&2
   printf 'reason: %s\n' "$1"
+  [ -n "${3:-}" ] && printf 'detail: %s\n' "$3"
   exit "$2"
 }
 # Seed: if the controller passed the recorded manifest bytes (base64 in
@@ -1568,7 +1576,9 @@ if [ -n "${MANIFEST_SEED_B64:-}" ]; then
   if [ "$seed_digest" != "$EXPECT_DIGEST" ]; then
     echo "seed manifest digest $seed_digest != expected $EXPECT_DIGEST; refusing to write" >&2
     rm -f "$seed_tmp"
-    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+    seed_short="$(printf '%s' "$seed_digest" | cut -c1-12)"
+    want_short="$(printf '%s' "$EXPECT_DIGEST" | cut -c1-12)"
+    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + ` "recorded $want_short, seed $seed_short"
   fi
   mkdir -p "$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
   mv "$seed_tmp" "$OLLAYA_MODELS/$MANIFEST_PATH"
@@ -1600,10 +1610,10 @@ else
     got_short="$(printf '%s' "$got" | cut -c1-12)"
     if grep -q '"schemaVersion"[[:space:]]*:[[:space:]]*2' "$OLLAYA_MODELS/$MANIFEST_PATH" 2>/dev/null; then
       echo "tag moved upstream: recorded $want_short, registry now serves $got_short" >&2
-      fail ` + PrefetchReasonUpstreamTagMoved + ` ` + prefetchExitTagMovedStr + `
+      fail ` + PrefetchReasonUpstreamTagMoved + ` ` + prefetchExitTagMovedStr + ` "recorded $want_short, registry now serves $got_short"
     fi
     echo "corrupt or unexpected manifest: recorded $want_short, got $got_short" >&2
-    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+    fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + ` "recorded $want_short, got $got_short"
   fi
   echo "digest ok: $got"
 fi
