@@ -83,7 +83,7 @@ hack/demo.sh run              # just the scenario (fast to re-run)
 | `KIND_CLUSTER` | `dmo-demo`                     | kind cluster name                                  |
 | `INSTALL`      | `local`                        | `local` (build from source) or `chart` (released)  |
 | `CHART_VERSION`| latest                         | chart version when `INSTALL=chart`                 |
-| `OLLAYA_IMAGE` | `ghcr.io/ollaya-dev/ollaya:0.10.0` | runtime image preloaded into the cluster       |
+| `OLLAYA_IMAGE` | `ghcr.io/ollaya-dev/ollaya:0.12.0` | runtime image preloaded into the cluster       |
 | `NO_WAIT`      | unset                          | set to any value to skip the between-step pauses   |
 
 Install the released chart instead of building from source:

@@ -384,8 +384,9 @@ var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() 
 })
 
 // applyDecisionModel applies a minimal DecisionModel manifest. No spec.image: the
-// operator defaults the engine image from device (cpu -> :0.10.0, cuda -> :0.10.0-cuda),
-// and rejects image overrides by default. Device comes from E2E_DEVICE (default
+// operator defaults the engine image from device (cpu -> the default runtime image,
+// cuda -> its -cuda variant), and rejects image overrides by default. Device comes
+// from E2E_DEVICE (default
 // cpu) so the same suite exercises the GPU path when run by the GPU workflow. Resource
 // requests are small so >1 replica schedules on the CI runner.
 func applyDecisionModel(name, model string, replicas int) {
