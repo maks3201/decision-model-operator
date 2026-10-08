@@ -32,6 +32,9 @@ import (
 // haNS isolates the HA failover scenarios from the other suites.
 const haNS = "dmo-e2e-ha"
 
+// haDM is the DecisionModel (and Service) name used by the HA scenarios.
+const haDM = "ha-router"
+
 // leaseName is the leader-election Lease the manager creates. controller-runtime
 // derives the Lease name from LeaderElectionID ("4aba9cc6.io" in cmd/main.go), so
 // the Lease object carries exactly that name in the operator's own namespace.
@@ -72,21 +75,14 @@ const leaseTakeoverBudget = 150 * time.Second
 //     failover would (one prefetch Job per revision, one
 //     candidate Deployment, reaches Ready).
 //
-// Exactly-once is asserted on cluster STATE (stable == candidate recorded once,
-// Service moved once, one Deployment/Job per revision, the promote annotation
-// cleared once), not on Events: Kubernetes Events are at-least-once and a leader
-// kill around the status persist can legitimately emit a second terminal Event
-// from the surviving replica's retry, so Event counts are only required to be >= 1.
-// NOTE: This container is temporarily PENDING (PDescribe) — it does not run in CI.
-// A leader-election failover during promotion currently emits TWO distinct Promoted
-// Event objects from two different manager replicas (one without and one with the
-// eval summary), reproduced locally. The spec correctly asserts exactly one Promoted
-// Event; it will start passing — and should be switched back to Describe — once the
-// controller no longer re-promotes after a leader change. The failover mechanics
-// themselves work (the rollout finishes with the correct state in every scenario);
-// only the duplicate terminal Event is wrong.
-var _ = PDescribe("HA: leader-election failover", Label("nightly", "ha"), Ordered, func() {
-	const dm = "ha-router"
+// Exactly-once is asserted on cluster STATE (one stableRevision transition to the
+// candidate, previousRevision == the prior stable, one Deployment/Job per revision,
+// the promote annotation cleared once) AND on the Promoted Event as a DELTA: each
+// scenario records the Promoted count right before it rolls its candidate and asserts
+// exactly one more afterwards. (Counting the absolute number would be wrong because
+// BeforeAll's initial stable is itself a promotion; see the per-scenario comments.)
+var _ = Describe("HA: leader-election failover", Label("nightly", "ha"), Ordered, func() {
+	const dm = haDM
 	var haVerified []string
 
 	BeforeAll(func() {
@@ -145,6 +141,7 @@ spec:
 
 		By("rolling out an eval-gated candidate the model passes")
 		applyConfigMap(haNS, "ha-eval", "cases.jsonl", datasetJSONL(haVerified))
+		promotedBefore := eventReasonCount("Promoted")
 		patchRollout(dm, haNS, rolloutPatch{
 			cpu:          "350m",
 			datasetCM:    "ha-eval",
@@ -177,6 +174,12 @@ spec:
 		Expect(stableNow).To(Equal(candHash), "the evaluated candidate should become the stable revision")
 		Expect(serviceRevision(haNS, dm)).To(Equal(candHash), "Service should route to the promoted revision")
 
+		By("exactly one stableRevision transition to the candidate (previousRevision is the prior stable)")
+		prev, err := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.previousRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(prev).To(Equal(stableBefore),
+			"previousRevision should be the stable that was serving before the candidate")
+
 		By("no duplicate work: one prefetch Job and exactly one Deployment for the promoted revision")
 		Expect(jobCountForRevision(haNS, dm, candHash)).To(Equal(1),
 			"exactly one prefetch Job should exist for the candidate revision")
@@ -189,16 +192,13 @@ spec:
 		Expect(len(deploymentRevisions(haNS, dm))).To(BeNumerically("<=", 2),
 			"only the promoted and the kept-previous revision Deployments should exist")
 
-		By("exactly one terminal Promoted Event (counted by distinct Event objects)")
-		// Expected contract: a single promotion emits exactly one Promoted Event.
-		// A leader failover currently produces TWO distinct Promoted Event objects
-		// from two different manager replicas with different messages (one without
-		// and one with the eval summary) — reproduced locally. This whole container
-		// is marked Pending (PDescribe) until that controller behaviour is fixed; the
-		// assertion stays exactly-one so it starts passing only once the bug is fixed.
+		By("exactly one more Promoted Event than before this candidate was rolled out")
+		// The failover does not duplicate the promotion: the candidate adds exactly one
+		// Promoted Event over the count taken right before patchRollout (the earlier
+		// Promoted belongs to BeforeAll's initial stable, not to this candidate).
 		dumpTerminalEvents(haNS, dm, "Promoted")
-		Expect(eventReasonCount(haNS, dm, "Promoted")).To(Equal(1),
-			"a single promotion should emit exactly one Promoted Event")
+		Expect(eventReasonCount("Promoted")).To(Equal(promotedBefore+1),
+			"the candidate's promotion should add exactly one Promoted Event")
 
 		assertObservedGeneration(haNS, dm)
 	})
@@ -210,6 +210,7 @@ spec:
 
 		By("rolling out a Manual-promotion candidate that parks in AwaitingPromotion")
 		applyConfigMap(haNS, "ha-manual", "cases.jsonl", datasetJSONL(haVerified))
+		promotedBefore := eventReasonCount("Promoted")
 		patchRollout(dm, haNS, rolloutPatch{
 			cpu:          "450m", // distinct from the previous revision so a new revision is forced
 			datasetCM:    "ha-manual",
@@ -256,6 +257,10 @@ spec:
 		stableNow, err := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stableNow).To(Equal(candHash), "the approved candidate should become stable")
+		prev, err := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.previousRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(prev).To(Equal(stableBefore),
+			"previousRevision should be the stable that was serving before the candidate")
 
 		By("the approval was consumed exactly once (state): the promote annotation is cleared and not reused")
 		Eventually(func() (string, error) {
@@ -263,24 +268,27 @@ spec:
 				"{.metadata.annotations.decisionmodel\\.io/promote}")
 		}, 2*time.Minute, 5*time.Second).Should(BeEmpty(),
 			"the operator should clear the promote annotation after honoring it once")
-		// Expected contract: exactly one Promoted Event for the approved candidate.
-		// Same leader-failover double-emission bug as the Evaluating scenario; the
-		// container is Pending until it is fixed.
+		By("exactly one more Promoted Event than before this candidate was rolled out")
 		dumpTerminalEvents(haNS, dm, "Promoted")
-		Expect(eventReasonCount(haNS, dm, "Promoted")).To(Equal(1),
-			"a single approved promotion should emit exactly one Promoted Event")
+		Expect(eventReasonCount("Promoted")).To(Equal(promotedBefore+1),
+			"the approved candidate's promotion should add exactly one Promoted Event")
 
 		assertObservedGeneration(haNS, dm)
 	})
 
 	It("finishes the stabilization window after the leader is killed mid-Stabilizing", func() {
+		stableBefore, err := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableBefore).NotTo(BeEmpty())
+
 		By("promoting a new revision with a long stabilization window")
 		applyConfigMap(haNS, "ha-stab", "cases.jsonl", datasetJSONL(haVerified))
 		// A long window keeps the Stabilizing condition True long enough to kill the
 		// leader inside it; the candidate still auto-promotes (no Manual policy).
-		_, err := utils.Kubectl("patch", "decisionmodel", dm, "-n", haNS, "--type=merge",
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", haNS, "--type=merge",
 			"-p", `{"spec":{"rollout":{"stabilization":"4m"}}}`)
 		Expect(err).NotTo(HaveOccurred())
+		promotedBefore := eventReasonCount("Promoted")
 		patchRollout(dm, haNS, rolloutPatch{
 			cpu:          "550m", // force a fresh revision
 			datasetCM:    "ha-stab",
@@ -299,7 +307,8 @@ spec:
 				"{.status.conditions[?(@.type=='Stabilizing')].status}")
 			prev, _ := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.previousRevision.hash}")
 			g.Expect(stabilizing).To(Equal("True"), "the Stabilizing condition should be True in the window")
-			g.Expect(prev).NotTo(BeEmpty(), "the previous revision should be kept during stabilization")
+			g.Expect(prev).To(Equal(stableBefore),
+				"the previous revision (the prior stable) should be kept during stabilization")
 		}, 12*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("killing the Lease holder inside the stabilization window and asserting takeover")
@@ -315,12 +324,17 @@ spec:
 			g.Expect(phase).To(Equal("Ready"), "the DM should stay Ready through stabilization")
 		}, 8*time.Minute, 5*time.Second).Should(Succeed())
 
-		Expect(eventReasonCount(haNS, dm, "RolledBackAfterPromotion")).To(Equal(0),
+		Expect(eventReasonCount("RolledBackAfterPromotion")).To(Equal(0),
 			"a healthy revision must not roll back after promotion because of a leader change")
 		stableNow, err := utils.KubectlJSONPath(haNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stableNow).To(Equal(candHash), "the stabilized revision should remain the stable one")
 		Expect(serviceRevision(haNS, dm)).To(Equal(candHash), "Service should stay on the stabilized revision")
+
+		By("exactly one more Promoted Event than before this candidate was rolled out")
+		dumpTerminalEvents(haNS, dm, "Promoted")
+		Expect(eventReasonCount("Promoted")).To(Equal(promotedBefore+1),
+			"the stabilized candidate's promotion should add exactly one Promoted Event")
 
 		assertObservedGeneration(haNS, dm)
 	})
@@ -453,12 +467,12 @@ func learnLabels(dm, ns string) []string {
 	return verified
 }
 
-// eventReasonCount counts Events on the DecisionModel object with the given reason.
-// It counts distinct Event objects (Kubernetes aggregates repeats into one object
-// with a count field), which is what "exactly one terminal Event" means here.
-func eventReasonCount(ns, name, reason string) int {
-	out, _ := utils.Kubectl("get", "events", "-n", ns,
-		"--field-selector", "involvedObject.name="+name+",reason="+reason,
+// eventReasonCount counts Events in the HA namespace on the HA DecisionModel with
+// the given reason. It counts distinct Event objects (Kubernetes aggregates repeats
+// into one object with a count field).
+func eventReasonCount(reason string) int {
+	out, _ := utils.Kubectl("get", "events", "-n", haNS,
+		"--field-selector", "involvedObject.name="+haDM+",reason="+reason,
 		"-o", "jsonpath={.items[*].reason}")
 	return len(strings.Fields(out))
 }
