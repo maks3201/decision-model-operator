@@ -71,13 +71,19 @@ func TestScriptsNeverWriteOutsideMounts(t *testing.T) {
 		}
 	}
 
-	// The seed temp dir must be derived from the writable store mount, so the
-	// quoted-variable template above resolves under /models (not /tmp).
-	if !strings.Contains(prefetchScript, `seed_dir="$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"`) {
-		t.Error("prefetchScript: the seed temp dir must be derived from $OLLAYA_MODELS")
+	// The seed temp dir must be a hidden sibling of manifests/ under the writable
+	// store mount (.seed-tmp), NOT inside a tag directory — a leftover temp in a
+	// tag dir makes `ollaya list` fail (verified on 0.12.0). The mktemp template
+	// resolves under /models (not /tmp).
+	if !strings.Contains(prefetchScript, `seed_tmpdir="$OLLAYA_MODELS/.seed-tmp"`) {
+		t.Error("prefetchScript: the seed temp dir must be $OLLAYA_MODELS/.seed-tmp")
 	}
-	if !strings.Contains(prefetchScript, `mktemp "$seed_dir/.seed.XXXXXX"`) {
-		t.Error("prefetchScript: the seed mktemp must use the $seed_dir template under the store")
+	if !strings.Contains(prefetchScript, `mktemp "$seed_tmpdir/seed.XXXXXX"`) {
+		t.Error("prefetchScript: the seed mktemp must use the $seed_tmpdir template under the store")
+	}
+	// The temp must NOT be created inside the manifests tag directory.
+	if strings.Contains(prefetchScript, `mktemp "$seed_dir/`) {
+		t.Error("prefetchScript: the seed temp must not be created inside the manifests tag dir ($seed_dir)")
 	}
 }
 
@@ -147,16 +153,23 @@ func TestSeedWritesInsideStoreUnderReadOnlyTmp(t *testing.T) {
 	if _, statErr := os.Stat(dest); statErr != nil {
 		t.Errorf("seed manifest not written to the store destination %q: %v\noutput:\n%s", dest, statErr, out)
 	}
-	// No stale temp left behind in the seed dir.
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dest), ".seed.*"))
-	if len(matches) != 0 {
-		t.Errorf("stale .seed.* temp left behind: %v", matches)
+	// Nothing left in the manifests tag directory except the manifest itself — a
+	// stray file there would make `ollaya list` fail (verified on 0.12.0).
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	for _, e := range entries {
+		if e.Name() != filepath.Base(dest) {
+			t.Errorf("unexpected file %q left in the manifests tag dir (would break ollaya list)", e.Name())
+		}
+	}
+	// The hidden .seed-tmp dir is removed after a successful seed.
+	if _, statErr := os.Stat(filepath.Join(store, ".seed-tmp")); !os.IsNotExist(statErr) {
+		t.Errorf(".seed-tmp must be cleaned after a successful seed (stat err = %v)", statErr)
 	}
 }
 
-// TestSeedStaleTempCleanup pins that a stale .seed.* from a crashed run is
-// removed at the start of the next seed, so it never accumulates or gets picked
-// up. Runs the real script with a pre-existing stale temp in the seed dir.
+// TestSeedStaleTempCleanup pins that a stale temp from a crashed run (left in
+// $OLLAYA_MODELS/.seed-tmp/) is removed at the start of the next seed, so it
+// never accumulates. Runs the real script with a pre-existing stale temp dir.
 func TestSeedStaleTempCleanup(t *testing.T) {
 	manifest := []byte(`{"schemaVersion":2,"layers":[]}`)
 	p := seedParams(manifest)
@@ -164,11 +177,12 @@ func TestSeedStaleTempCleanup(t *testing.T) {
 
 	store := t.TempDir()
 	manifestPath := "manifests/ollaya.dev/library/laya/en"
-	seedDir := filepath.Join(store, filepath.Dir(manifestPath))
-	if err := os.MkdirAll(seedDir, 0o755); err != nil {
-		t.Fatalf("mkdir seed dir: %v", err)
+	// A stale temp dir with a leftover file, as a crashed run would leave.
+	staleDir := filepath.Join(store, ".seed-tmp")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatalf("mkdir stale dir: %v", err)
 	}
-	stale := filepath.Join(seedDir, ".seed.deadbe")
+	stale := filepath.Join(staleDir, "seed.deadbe")
 	if err := os.WriteFile(stale, []byte("junk"), 0o644); err != nil {
 		t.Fatalf("write stale: %v", err)
 	}
@@ -193,7 +207,15 @@ func TestSeedStaleTempCleanup(t *testing.T) {
 		t.Fatalf("script failed: %v\n%s", err, out)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("stale .seed.* was not cleaned up (stat err = %v)", err)
+		t.Errorf("stale temp was not cleaned up (stat err = %v)", err)
+	}
+	// manifests tag dir must hold only the manifest (no stray temp).
+	tagDir := filepath.Join(store, filepath.Dir(manifestPath))
+	entries, _ := os.ReadDir(tagDir)
+	for _, e := range entries {
+		if e.Name() != "en" {
+			t.Errorf("unexpected file %q in the manifests tag dir", e.Name())
+		}
 	}
 }
 

@@ -1570,26 +1570,32 @@ if [ -n "${MANIFEST_SEED_B64:-}" ]; then
   if [ -z "${EXPECT_DIGEST:-}" ] || [ -z "${MANIFEST_PATH:-}" ]; then
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
   fi
-  # Write the temp file inside the writable store mount, next to its destination,
-  # so (a) it never touches the read-only root filesystem (/tmp is RO on the
-  # serving/prefetch container) and (b) the final mv is a rename on the same
-  # filesystem, i.e. atomic. A ".seed." prefix keeps it out of the prune's
-  # revision-hash match (hex-only) and off any tag path. Clean up a stale temp a
-  # previous crashed run may have left before creating a new one.
+  # Write the temp file inside a hidden sibling of manifests/ in the writable
+  # store mount ($OLLAYA_MODELS/.seed-tmp/), NOT in the tag directory. Reasons:
+  # (a) it never touches the read-only root filesystem (/tmp is RO on the
+  # serving/prefetch container); (b) it is on the same filesystem as the
+  # destination, so the final mv is an atomic rename; (c) ollaya enumerates tags
+  # by listing files under manifests/<host>/<ns>/<model>/, so a leftover temp in a
+  # tag dir makes "ollaya list" fail with "corrupt data" (verified on 0.12.0) -- a
+  # sibling .seed-tmp/ is never read as a tag. Clean the dir first so a temp left
+  # by a crashed run cannot accumulate.
+  seed_tmpdir="$OLLAYA_MODELS/.seed-tmp"
+  rm -rf "$seed_tmpdir" 2>/dev/null || true
+  mkdir -p "$seed_tmpdir"
   seed_dir="$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
   mkdir -p "$seed_dir"
-  rm -f "$seed_dir"/.seed.* 2>/dev/null || true
-  seed_tmp="$(mktemp "$seed_dir/.seed.XXXXXX")"
-  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -f "$seed_tmp"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
+  seed_tmp="$(mktemp "$seed_tmpdir/seed.XXXXXX")"
+  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
   seed_digest="$(sha256sum "$seed_tmp" | cut -d' ' -f1)"
   if [ "$seed_digest" != "$EXPECT_DIGEST" ]; then
     echo "seed manifest digest $seed_digest != expected $EXPECT_DIGEST; refusing to write" >&2
-    rm -f "$seed_tmp"
+    rm -rf "$seed_tmpdir"
     seed_short="$(printf '%s' "$seed_digest" | cut -c1-12)"
     want_short="$(printf '%s' "$EXPECT_DIGEST" | cut -c1-12)"
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + ` "recorded $want_short, seed $seed_short"
   fi
   mv "$seed_tmp" "$OLLAYA_MODELS/$MANIFEST_PATH"
+  rm -rf "$seed_tmpdir" 2>/dev/null || true
   echo "seeded manifest for $seed_digest at $MANIFEST_PATH"
 fi
 pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
