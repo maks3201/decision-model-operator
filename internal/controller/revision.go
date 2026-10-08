@@ -188,16 +188,23 @@ func revisionHashFromStatus(rev *decisionmodelv1alpha1.RevisionStatus) string {
 // names, so a legacy stable that keeps its old hash name (adoptLegacyStable) is
 // still recognised as the current revision.
 //
-// The serving image is compared with sameServingImage, so a stable recorded by
-// an older operator as the tag-only form (repo:tag) is recognised as the same
-// revision this build computes as repo:tag@sha256:<index> for the SAME tag. That
-// is identity recognition only (not admission): without it an upgrade to a build
-// that digest-pins the default image would roll every quiet DecisionModel, which
-// RELEASING.md forbids.
-func sameIdentity(rev, want *decisionmodelv1alpha1.RevisionStatus) bool {
+// engineRendered says whether the serving image is the engine's own default
+// (spec.image unset on the DM). Only then is the serving image compared with
+// sameServingImage, so a stable an older operator recorded as the tag-only form
+// (repo:tag) is recognised as the same revision this build computes as
+// repo:tag@sha256:<index> for the SAME tag (identity recognition, not admission:
+// without it an upgrade would roll every quiet DecisionModel). When the user set
+// spec.image the image is compared EXACTLY: a user who edits spec.image from
+// repo:tag to repo:tag@sha256:X (or removes the pin) is changing the revision and
+// a new one must start so the pin takes effect.
+func sameIdentity(rev, want *decisionmodelv1alpha1.RevisionStatus, engineRendered bool) bool {
+	imageMatches := rev != nil && want != nil && rev.Image == want.Image
+	if engineRendered && rev != nil && want != nil {
+		imageMatches = sameServingImage(rev.Image, want.Image)
+	}
 	return rev != nil && want != nil &&
 		rev.Engine == want.Engine && rev.Model == want.Model && rev.Digest == want.Digest &&
-		rev.Device == want.Device && sameServingImage(rev.Image, want.Image) && rev.Placement == want.Placement &&
+		rev.Device == want.Device && imageMatches && rev.Placement == want.Placement &&
 		equality.Semantic.DeepEqual(rev.Resources, want.Resources)
 }
 

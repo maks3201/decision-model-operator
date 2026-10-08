@@ -183,29 +183,37 @@ func TestSameIdentity(t *testing.T) {
 		return r
 	}
 	tests := []struct {
-		name string
-		a, b *decisionmodelv1alpha1.RevisionStatus
-		want bool
+		name           string
+		a, b           *decisionmodelv1alpha1.RevisionStatus
+		engineRendered bool
+		want           bool
 	}{
-		{"equal", base(), base(), true},
-		{"hash name is ignored (adopted legacy keeps its name)", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Hash = "old" }), base(), true},
-		{"precision is not identity", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Precision = "F16" }), base(), true},
+		{"equal", base(), base(), true, true},
+		{"hash name is ignored (adopted legacy keeps its name)", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Hash = "old" }), base(), true, true},
+		{"precision is not identity", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Precision = "F16" }), base(), true, true},
 		{"equivalent quantities", mut(func(r *decisionmodelv1alpha1.RevisionStatus) {
 			r.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1024Mi")
-		}), base(), true},
-		{"model", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Model = "kev:en" }), base(), false},
-		{"digest", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Digest = "x" }), base(), false},
-		{"device", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Device = "cuda" }), base(), false},
-		{"image", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "x" }), base(), false},
-		{"placement", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Placement = "abc" }), base(), false},
+		}), base(), true, true},
+		{"model", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Model = "kev:en" }), base(), true, false},
+		{"digest", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Digest = "x" }), base(), true, false},
+		{"device", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Device = "cuda" }), base(), true, false},
+		{"image", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "x" }), base(), true, false},
+		{"placement", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Placement = "abc" }), base(), true, false},
 		{"resources", mut(func(r *decisionmodelv1alpha1.RevisionStatus) {
 			r.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
-		}), base(), false},
-		{"nil", nil, base(), false},
+		}), base(), true, false},
+		{"nil", nil, base(), true, false},
+		// Engine-rendered: tag-only recorded vs same tag digest-pinned collapses.
+		{"engine-rendered tag vs same-tag pin", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0" }),
+			mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0@sha256:abc" }), true, true},
+		// User override (engineRendered=false): the same pair must NOT collapse —
+		// the user pinned, a new revision must start.
+		{"user override tag vs same-tag pin does not collapse", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0" }),
+			mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0@sha256:abc" }), false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sameIdentity(tt.a, tt.b); got != tt.want {
+			if got := sameIdentity(tt.a, tt.b, tt.engineRendered); got != tt.want {
 				t.Errorf("sameIdentity = %v, want %v", got, tt.want)
 			}
 		})

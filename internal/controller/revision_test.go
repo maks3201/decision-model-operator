@@ -349,7 +349,7 @@ func TestRevisionHashWidthUpgrade(t *testing.T) {
 	if stable.Placement != want.Placement {
 		t.Errorf("adoption did not backfill placement: got %q, want %q", stable.Placement, want.Placement)
 	}
-	if !sameIdentity(stable, want) {
+	if !sameIdentity(stable, want, true) {
 		t.Error("a legacy-width stable of the same spec must be recognised as the current revision (no fleet roll)")
 	}
 

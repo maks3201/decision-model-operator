@@ -851,10 +851,17 @@ func (r *DecisionModelReconciler) candidateIdentity(
 	// (repo:tag) and hashed the revision with it; this build renders
 	// repo:tag@sha256:<index> for the same tag. Recognise such a stable by hashing
 	// the legacy formula with the TAG-ONLY image, so an upgrade that only adds the
-	// digest pin does not look like a new revision and roll the fleet.
-	legacyImage, _ := splitImagePin(image)
+	// digest pin does not look like a new revision and roll the fleet. This applies
+	// only to engine-rendered images: when the user set spec.image we hash the
+	// recorded override verbatim, so a user who adds or removes an @sha256 pin on
+	// their own image gets a new revision.
+	engineRendered := dm.Spec.Image == ""
+	legacyImage := image
+	if engineRendered {
+		legacyImage, _ = splitImagePin(image)
+	}
 	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, legacyImage))
-	isStable = stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate))
+	isStable = stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate, engineRendered))
 	return candidate, rev, effVer, image, isStable
 }
 
