@@ -568,7 +568,69 @@ func (r *DecisionModelReconciler) degradeSecretReason(
 		Message: err.Error(),
 	})
 	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseDegraded)
-	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+	return r.abandonCandidateThenFinish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+}
+
+// abandonCandidateThenFinish persists a no-stable refusal and then, on a durable
+// write, collects any leftover candidate workloads: it clears
+// status.candidateRevision (one CandidateSuperseded Event, only when a candidate
+// was still recorded), garbage-collects revisions not kept, and releases the
+// rollout-budget reservation. Without this, a first rollout (no stable) that is
+// refused mid-flight — the spec edited to something invalid, or the operator
+// restarted with --allow-unpinned-runtime-images off — would keep its candidate's
+// workloads (a GPU, disk) and its budget slot forever.
+//
+// GC runs on EVERY successful refusal write, not only the reconcile that cleared
+// the candidate: a no-stable Degraded/Failed DM has no stable path to run GC, so
+// if the process died between the clear and GC, or GC errored once, a one-shot
+// collection would leak the orphans forever. gcRevisions is idempotent and, with
+// no stable and no candidate, keeps only what the live Service selects (nothing
+// here), so re-running it each reconcile is a cheap convergence (a handful of
+// label-filtered List calls at regateInterval); a GC error requeues so it is
+// retried.
+//
+// Persist-then-act (SKILL §10): candidateRevision is cleared BEFORE the status
+// write, so the durable record never claims a candidate whose workloads are being
+// deleted; the delete and the reservation release happen only after that write
+// succeeds and are idempotent. On a conflicting/failed write nothing is deleted
+// and the next reconcile redoes the decision from fresh state. The reconcileErr
+// (e.g. a TerminalError from guardSecurity) is preserved, EXCEPT that a GC error
+// after a durable write is returned instead so the workqueue retries the
+// collection (a TerminalError would stop all retries and leak the orphans).
+func (r *DecisionModelReconciler) abandonCandidateThenFinish(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	res ctrl.Result,
+	reconcileErr error,
+) (ctrl.Result, error) {
+	if abandoned := dm.Status.CandidateRevision; abandoned != nil {
+		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
+			"abandoning candidate %s: the spec no longer describes a startable revision", abandoned.Hash)
+		dm.Status.CandidateRevision = nil
+	}
+	persisted, conflict, perr := r.persistStatus(ctx, dm)
+	if conflict {
+		// Nothing stored, no Event emitted; redo from fresh state next reconcile.
+		return ctrl.Result{RequeueAfter: time.Second}, reconcileErr
+	}
+	if perr != nil {
+		if reconcileErr == nil {
+			return res, perr
+		}
+		return res, reconcileErr
+	}
+	if persisted {
+		// Collect any leftover workloads (none kept now that neither stable nor
+		// candidate names a revision) and free the budget slot. Runs every refusal
+		// reconcile so a crash/error between the write and here is recovered. A GC
+		// error must be retried: return it (overriding a permanent reconcileErr) so
+		// the workqueue backs off rather than giving up and leaking the orphans.
+		if gcErr := r.gcRevisions(ctx, dm); gcErr != nil {
+			return ctrl.Result{}, gcErr
+		}
+		r.releaseReservation(dm.Namespace, dm.Name)
+	}
+	return res, reconcileErr
 }
 
 // maintainStableForSecret handles a Secret problem (missing/invalid API key or
@@ -934,7 +996,7 @@ func (r *DecisionModelReconciler) degradeRuntimeImage(
 		r.event(ctx, dm, corev1.EventTypeWarning, eventUnpinnedRuntimeImage,
 			"candidate refused: %s", msg)
 	}
-	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+	return r.abandonCandidateThenFinish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 }
 
 // unpinnedSignalChanged reports whether the Ready condition does not already
