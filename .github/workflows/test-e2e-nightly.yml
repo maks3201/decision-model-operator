@@ -62,3 +62,95 @@ jobs:
           # laya:en) and is excluded here so it does not add to this job's budget.
           E2E_LABEL_FILTER: "!ha"
         run: make test-e2e
+
+  # Run the default per-PR E2E suite (laya:en, kustomize) on each Kubernetes minor
+  # the project claims to support. The per-PR workflow only exercises the newest
+  # minor (test-e2e.yml) and the release upgrade E2E only the oldest+newest, so the
+  # middle minor (K8S_MIDDLE) is otherwise never exercised. Versions come from
+  # hack/k8s-versions.env (the single source of truth) at run time; nothing here
+  # hard-codes a version. One leg per minor, each on its own cluster, in parallel.
+  k8s-versions:
+    name: kind (kustomize, CPU, laya:en, ${{ matrix.slot }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Which KIND_NODE_IMAGE_* key from hack/k8s-versions.env to pin. The actual
+        # ref and version are read from the file in the job (never hard-coded here).
+        slot: [OLDEST, MIDDLE, NEWEST]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      # Resolve this leg's kind node image from hack/k8s-versions.env. The file is
+      # the single source of truth; we source it, pick the KIND_NODE_IMAGE_<slot>
+      # ref, and surface the three supported versions in the job summary so a reader
+      # sees exactly which minors ran without opening the file.
+      - name: Resolve Kubernetes version from hack/k8s-versions.env
+        id: k8s
+        env:
+          SLOT: ${{ matrix.slot }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . ./hack/k8s-versions.env
+          node_var="KIND_NODE_IMAGE_${SLOT}"
+          ver_var="K8S_${SLOT}"
+          node="${!node_var}"
+          ver="${!ver_var}"
+          if [ -z "$node" ] || [ -z "$ver" ]; then
+            echo "::error::no entry for slot ${SLOT} in hack/k8s-versions.env"; exit 1
+          fi
+          echo "node_image=$node" >>"$GITHUB_OUTPUT"
+          echo "version=$ver" >>"$GITHUB_OUTPUT"
+          # Lowercase cluster name (kind requires lowercase, DNS-safe names).
+          slot_lc="$(printf '%s' "$SLOT" | tr '[:upper:]' '[:lower:]')"
+          echo "cluster=dmo-e2e-k8s-${slot_lc}" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Kubernetes version matrix (hack/k8s-versions.env)"
+            echo ""
+            echo "- oldest: \`${K8S_OLDEST}\`"
+            echo "- middle: \`${K8S_MIDDLE}\`"
+            echo "- newest: \`${K8S_NEWEST}\`"
+            echo ""
+            echo "This leg (**${SLOT}**): \`${ver}\` → \`${node}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # The !nightly kustomize suite includes the registry-mirror spec, which builds
+      # an extra ~0.85 GiB image and loads a second copy of the model, so reclaim the
+      # large preinstalled toolchains to avoid "No space left on device" (same step
+      # as the mirror shard in test-e2e.yml). df before/after is logged.
+      - name: Free disk space
+        run: |
+          echo "disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+          echo "disk after:"; df -h /
+
+      - name: Run e2e
+        env:
+          E2E_INSTALL: kustomize
+          # Pin the kind node image to this leg's Kubernetes minor; hack/kind-up.sh
+          # honours KIND_NODE_IMAGE and the suite inherits the environment.
+          KIND_NODE_IMAGE: ${{ steps.k8s.outputs.node_image }}
+          # Run the full default kustomize suite (same label set as the per-PR
+          # kustomize shards combined): lifecycle, mirror, eval and auth on laya:en.
+          E2E_LABEL_FILTER: "!nightly"
+          # The mirror spec is in !nightly, so build+load its image on this job.
+          E2E_MIRROR: "1"
+          # Own cluster per leg so parallel legs do not collide (lowercase name
+          # from the resolve step; kind requires lowercase).
+          KIND_CLUSTER: ${{ steps.k8s.outputs.cluster }}
+        run: make test-e2e
