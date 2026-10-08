@@ -58,9 +58,10 @@ jobs:
           E2E_MODEL: ${{ matrix.model }}
           # The mirror spec is laya-specific (dmo-e2e-mirror:laya-en); leave
           # E2E_MIRROR unset so it skips for the non-laya nightly models.
-          # The HA failover container has its own nightly workflow (test-e2e-ha.yml,
-          # laya:en) and is excluded here so it does not add to this job's budget.
-          E2E_LABEL_FILTER: "!ha"
+          # The HA and chaos containers have their own nightly workflows
+          # (test-e2e-ha.yml / test-e2e-chaos.yml, laya:en) and are excluded here so
+          # they do not add to this job's budget.
+          E2E_LABEL_FILTER: "!ha && !chaos"
         run: make test-e2e
 
   # Run the default per-PR E2E suite (laya:en, kustomize) on each Kubernetes minor
