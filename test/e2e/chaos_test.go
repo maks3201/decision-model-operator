@@ -50,16 +50,19 @@ const chaosDM = "chaos-router"
 //	    (transient, no Degraded, no Event); fault cleared -> the candidate proceeds.
 //	1b. Registry fault (503) during prefetch (Caching) -> waits in Caching, not Failed;
 //	    cleared -> completes.
+//	1c. Registry DOWN (mirror scaled to 0 = connection refused) during Resolving ->
+//	    transient ResolveFailed, stable serves; mirror back -> recovers.
+//	1d. Registry 429 during Resolving -> transient ResolveFailed, stable serves.
 //	2.  Registry 404 for the tag       -> Resolved=False/ModelNotFound, stable keeps serving.
 //	3.  Runtime fault during Evaluating (candidate Pod disrupted = transport error) ->
 //	    evaluation holds and retries, no false reject; recovered -> promotes.
 //	4.  Operator Pod killed mid-rollout and after promotion -> converges, exactly one
 //	    Deployment/Job/PVC per revision, Service on the stable.
 //	5a. Candidate store PVC deleted during Starting -> fresh re-prefetch, then completes.
-//	5b. Stable store PVC deleted while Ready -> Degraded store reason, bounded recovery.
-//	    (PENDING — see the PIt comment; timing-sensitive on kind.)
-//	6.  Stable serving Pod deleted during Stabilizing -> no false rollback within the
-//	    debounce. (PENDING — see the PIt comment.)
+//	5b. Stable store PVC deleted while Ready (provisioner paused to hold it) -> Degraded
+//	    store reason; provisioner resumed -> bounded recovery, back to Ready.
+//	6.  Stable serving Pod during Stabilizing: deleted once -> recovers within the 30s
+//	    debounce, no rollback; held down past it -> RolledBackAfterPromotion.
 var _ = Describe("Chaos: faults between critical steps", Label("nightly", "chaos"), Ordered, func() {
 	const dm = chaosDM
 
@@ -113,6 +116,7 @@ spec:
 	AfterEach(func() {
 		dumpDiag(chaosNS, dm)
 		clearMirrorFault()
+		resumeProvisioner()
 	})
 
 	It("keeps the stable serving on a transient registry 500 during Resolving", func() {
@@ -199,6 +203,85 @@ spec:
 		Expect(stableNow).To(Equal(stableBefore))
 	})
 
+	It("keeps the stable serving when the registry is DOWN (mirror scaled to 0) during Resolving", func() {
+		// "Registry down" = connection refused (not a 5xx): scale the mirror Deployment
+		// to 0 so the operator's resolve of a new tag cannot connect. With a stable
+		// present this is a transient preflight failure (ResolveFailed), the stable keeps
+		// serving, and no Degraded/Event; scaling the mirror back lets it recover.
+		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableBefore).NotTo(BeEmpty())
+
+		By("scaling the mirror to 0 and pointing at a new tag")
+		_, err = utils.Kubectl("scale", "deployment/mirror", "-n", mirrorNS, "--replicas=0")
+		Expect(err).NotTo(HaveOccurred())
+		_, _ = utils.Kubectl("rollout", "status", "deployment/mirror", "-n", mirrorNS, "--timeout=1m")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"model":"laya:multilingual"}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Resolved=False/ResolveFailed, stable keeps serving, no Degraded")
+		Eventually(func(g Gomega) {
+			reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Resolved')].reason}")
+			g.Expect(reason).To(Equal("ResolveFailed"),
+				"registry-down (connection refused) should be a transient ResolveFailed, not ModelNotFound")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		Consistently(func(g Gomega) {
+			phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(phase).To(Equal("Ready"), "the stable must keep serving while the registry is down")
+			deg, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Degraded')].status}")
+			g.Expect(deg).NotTo(Equal("True"), "a transient resolve failure must not set Degraded")
+		}, 20*time.Second, 5*time.Second).Should(Succeed())
+
+		By("scaling the mirror back and restoring the model recovers Resolved=True, stable intact")
+		_, _ = utils.Kubectl("scale", "deployment/mirror", "-n", mirrorNS, "--replicas=1")
+		_, _ = utils.Kubectl("rollout", "status", "deployment/mirror", "-n", mirrorNS, "--timeout=2m")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"model":"laya:en"}}`)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Resolved')].status}")
+		}, 5*time.Minute, 5*time.Second).Should(Equal("True"))
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).To(Equal(stableBefore), "the stable must be unchanged after a registry-down blip")
+	})
+
+	It("treats a registry 429 during Resolving as transient (stable keeps serving)", func() {
+		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stableBefore).NotTo(BeEmpty())
+
+		By("faulting the registry with 429 and pointing at a new tag")
+		setMirrorFault("429")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"model":"laya:multilingual"}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Resolved=False/ResolveFailed (429 is retryable/transient), stable keeps serving")
+		Eventually(func(g Gomega) {
+			reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Resolved')].reason}")
+			g.Expect(reason).To(Equal("ResolveFailed"), "a 429 should be transient ResolveFailed, not ModelNotFound")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		Expect(phase).To(Equal("Ready"), "the stable must keep serving under a 429")
+
+		By("clearing the fault and restoring the model recovers Resolved=True")
+		clearMirrorFault()
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"model":"laya:en"}}`)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Resolved')].status}")
+		}, 5*time.Minute, 5*time.Second).Should(Equal("True"))
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).To(Equal(stableBefore))
+	})
+
 	It("holds evaluation and does not false-reject when the runtime fails mid-Evaluating", func() {
 		// Fault 3 (runtime fault during Evaluating): make the candidate Pod unable to
 		// answer by deleting it repeatedly during the eval window. The evaluator calls
@@ -267,48 +350,57 @@ spec:
 			"a single transport fault must not cause a post-promotion rollback")
 	})
 
-	// PENDING: store-loss recovery is timing-sensitive on kind (the dynamic
-	// provisioner can recreate the PVC fast enough that the Degraded window is hard to
-	// observe deterministically). Enable once it can be iterated against the dispatchable
-	// chaos CI (the workflow must be on the default branch before it can be dispatched).
-	PIt("recovers a Degraded=StoreLost when the stable store PVC is deleted while Ready", func() {
+	It("surfaces StoreLost and recovers when the stable store PVC is deleted while Ready", func() {
 		stable, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stable).NotTo(BeEmpty())
 		pvc := dm + "-store-" + stable
 
-		By("deleting the stable store PVC")
-		// The serving Pod mounts it read-only; pvc-protection keeps it Terminating
-		// until the Pod is gone, so the operator surfaces StoreTerminating first and
-		// StoreLost once it is actually gone. Delete the serving Pod too so the PVC can
-		// finalize and the bounded recovery can recreate it.
+		By("pausing the storage provisioner so the recreated PVC cannot bind (hold the fault)")
+		// Scaling kind's local-path provisioner to 0 makes the operator's recreated store
+		// PVC stay Pending, so the lost-store Degraded state is observable deterministically
+		// instead of racing a fast dynamic provisioner. Restored at the end (and by
+		// AfterEach as a safety net).
+		pauseProvisioner()
+		defer resumeProvisioner()
+
+		By("deleting the stable store PVC and its serving Pod so the PVC can finalize")
+		// The serving Pod mounts it read-only; pvc-protection keeps the PVC Terminating
+		// until the Pod is gone.
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", chaosNS, "--wait=false")
 		_, _ = utils.Kubectl("delete", "pods", "-l",
 			"decisionmodel.io/name="+dm+",decisionmodel.io/revision="+stable, "-n", chaosNS,
 			"--grace-period=0", "--force")
 
-		By("the store is recovered: Degraded surfaces a store reason (best-effort) and it returns to Ready")
-		// The Degraded window can be brief if recovery is fast; capture it best-effort
-		// over the recovery window rather than requiring a specific poll to catch it.
-		sawStoreDegraded := false
+		By("the operator detects the lost store: a StoreLost/StorePrefetchFailed Event and Degraded")
+		// Assert on the durable Event (emitted on the transition, so it is not missed by a
+		// poll) and that Degraded is a store reason. The provisioner is paused, so the
+		// recreated store PVC stays Pending and the lost-store state persists.
 		Eventually(func(g Gomega) {
-			reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
-				"{.status.conditions[?(@.type=='Degraded')].reason}")
+			storeEvents := eventReasonCountIn("StoreLost") + eventReasonCountIn("StorePrefetchFailed") +
+				eventReasonCountIn("StoreTerminating")
+			g.Expect(storeEvents).To(BeNumerically(">=", 1),
+				"a lost stable store should emit a StoreLost/StoreTerminating/StorePrefetchFailed Event")
 			deg, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
 				"{.status.conditions[?(@.type=='Degraded')].status}")
-			if deg == "True" && (reason == "StoreLost" || reason == "StoreTerminating" || reason == "StorePrefetchFailed") {
-				sawStoreDegraded = true
-			}
-			phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
-			g.Expect(phase).To(Equal("Ready"), "bounded store recovery should re-prefetch and serve again")
-		}, 12*time.Minute, 3*time.Second).Should(Succeed())
-		_, _ = fmt.Fprintf(GinkgoWriter, "store-loss recovery: observed a store Degraded reason = %v\n", sawStoreDegraded)
-		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
-		Expect(stableNow).To(Equal(stable), "recovery keeps the same revision (re-prefetch, not a new rollout)")
-		// The recovered store PVC exists again under the same name.
+			reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Degraded')].reason}")
+			g.Expect(deg).To(Equal("True"), "a lost stable store should set Degraded")
+			g.Expect(reason).To(BeElementOf("StoreLost", "StoreTerminating", "StorePrefetchFailed"),
+				"Degraded should carry a store reason (got %q)", reason)
+		}, 8*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("resuming the provisioner lets the store recover and the DecisionModel return to Ready")
+		resumeProvisioner()
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"),
+			"bounded store recovery should re-prefetch and serve again once storage is back")
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(chaosNS, "pvc", pvc, "{.status.phase}")
-		}, 2*time.Minute, 5*time.Second).Should(Equal("Bound"), "the stable store PVC should be recreated and Bound")
+		}, 3*time.Minute, 5*time.Second).Should(Equal("Bound"), "the stable store PVC should be recreated and Bound")
+		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(stableNow).To(Equal(stable), "recovery keeps the same revision (re-prefetch, not a new rollout)")
 	})
 
 	It("waits in Caching (not Failed) when the registry faults during prefetch, then completes", func() {
@@ -427,15 +519,14 @@ spec:
 
 	// PENDING: depends on hitting the Stabilizing window and the 30s post-promotion
 	// debounce precisely; enable alongside the store-loss scenario once the chaos CI is
-	// dispatchable for iteration.
-	PIt("does not falsely roll back when the stable Pod briefly dies during Stabilizing", func() {
+	It("tolerates a brief stable-Pod loss in the debounce but rolls back when held down past it", func() {
 		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 
-		By("promoting a new revision with a stabilization window")
+		By("promoting a new revision with a long (10m) stabilization window")
 		applyConfigMap(chaosNS, "chaos-stab", "cases.jsonl", datasetJSONL(chaosLabels(dm)))
 		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
-			"-p", `{"spec":{"rollout":{"stabilization":"3m"}}}`)
+			"-p", `{"spec":{"rollout":{"stabilization":"10m"}}}`)
 		Expect(err).NotTo(HaveOccurred())
 		patchRollout(dm, chaosNS, rolloutPatch{
 			cpu:          "450m",
@@ -457,22 +548,49 @@ spec:
 			g.Expect(stab).To(Equal("True"))
 		}, 12*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("deleting the new stable's Pod once; it should recover within the 30s debounce")
+		By("(a) deleting the stable Pod once; it recovers within the 30s debounce, no rollback")
 		_, _ = utils.Kubectl("delete", "pods", "-l",
 			"decisionmodel.io/name="+dm+",decisionmodel.io/revision="+candHash, "-n", chaosNS,
 			"--grace-period=0", "--force")
-
-		By("no RolledBackAfterPromotion fires and the revision stays stable")
+		// The recreated Pod reloads the model within the debounce; the condition returns
+		// to a healthy Stabilizing and no rollback fires.
 		Eventually(func(g Gomega) {
-			// The recreated Pod reloads the model and the gate flips back True; the
-			// Stabilizing condition should return to True (healthy) without a rollback.
-			phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
-			g.Expect(phase).To(Equal("Ready"))
-		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+			stab, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+				"{.status.conditions[?(@.type=='Stabilizing')].reason}")
+			g.Expect(stab).To(BeElementOf("Stabilizing", "StableRolling"),
+				"the stable should return to a healthy Stabilizing after a brief Pod loss")
+		}, 4*time.Minute, 5*time.Second).Should(Succeed())
 		Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(Equal(0),
-			"a stable Pod that returns within the debounce must not trigger a post-promotion rollback")
-		stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
-		Expect(stableNow).To(Equal(candHash), "the revision must remain stable after a brief Pod loss")
+			"a stable Pod that returns within the debounce must not trigger a rollback")
+		mid, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		Expect(mid).To(Equal(candHash), "the revision stays stable after a brief Pod loss")
+
+		By("(b) holding the stable Pods down past the debounce -> RolledBackAfterPromotion")
+		// Keep the new stable below quorum for longer than postPromotionDebounce (30s) so
+		// the window's safety net fires. holdRevisionPodsDown force-deletes that revision's
+		// Pods in a loop; the stabilization window (10m) is still open.
+		stop := make(chan struct{})
+		stopped := false
+		closeStop := func() {
+			if !stopped {
+				close(stop)
+				stopped = true
+			}
+		}
+		defer closeStop()
+		go holdRevisionPodsDown(chaosNS, dm, candHash, stop)
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.failedRevision.reason}")
+		}, 8*time.Minute, 5*time.Second).Should(Equal("PostPromotionUnhealthy"),
+			"a stable held unhealthy past the debounce should roll back with PostPromotionUnhealthy")
+		Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(BeNumerically(">=", 1),
+			"holding the stable down past the debounce should emit RolledBackAfterPromotion")
+		closeStop() // stop deleting so the rolled-back previous revision can serve
+		// Rolled back to the previous revision; it is the stable again and still serving.
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+		}, 3*time.Minute, 5*time.Second).Should(Equal(stableBefore),
+			"the Service/stable should return to the previous revision after the rollback")
 	})
 })
 
@@ -537,6 +655,27 @@ func setMirrorFault(status string) {
 func clearMirrorFault() {
 	_, _ = utils.Kubectl("set", "env", "deployment/mirror", "-n", mirrorNS, "MIRROR_FAULT-")
 	_, _ = utils.Kubectl("rollout", "status", "deployment/mirror", "-n", mirrorNS, "--timeout=2m")
+}
+
+// provisionerNS/provisionerDeploy identify kind's dynamic storage provisioner, which
+// backs the per-revision store PVCs.
+const provisionerNS = "local-path-storage"
+const provisionerDeploy = "local-path-provisioner"
+
+// pauseProvisioner scales kind's local-path provisioner to 0 so a newly requested
+// store PVC stays Pending — holding a lost-store fault long enough to observe the
+// StoreLost Degraded state deterministically.
+func pauseProvisioner() {
+	_, err := utils.Kubectl("scale", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--replicas=0")
+	Expect(err).NotTo(HaveOccurred(), "failed to pause the storage provisioner")
+	_, _ = utils.Kubectl("rollout", "status", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--timeout=1m")
+}
+
+// resumeProvisioner scales the provisioner back to 1 so Pending PVCs bind. Idempotent
+// and best-effort (used both inline and as an AfterEach safety net).
+func resumeProvisioner() {
+	_, _ = utils.Kubectl("scale", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--replicas=1")
+	_, _ = utils.Kubectl("rollout", "status", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--timeout=2m")
 }
 
 // chaosLabels learns, once per DecisionModel, the label the model answers for each
