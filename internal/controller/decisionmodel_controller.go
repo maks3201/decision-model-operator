@@ -200,6 +200,7 @@ const (
 	eventCandidateSuperseded   = "CandidateSuperseded"
 	eventRetryNoop             = "RetryNoop"
 	eventUnpinnedRuntimeImage  = "UnpinnedRuntimeImage"
+	eventServingImageApplied   = "ServingImageApplied"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -396,6 +397,7 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// this policy must not be reported as a refused/unpinned candidate).
 	if !isStable {
 		r.recordRuntimeImagePinned(ctx, &dm, eng, candidate, effVer)
+		r.announceServingImageApplied(ctx, &dm, stable, image, rev)
 		// Persist this candidate's manifest NOW — same reconcile as Resolve, before
 		// the digest is recorded in status — so the bytes can never be lost (a
 		// queued candidate, a later-reconcile prefetch, or a crash after Resolve
@@ -825,7 +827,11 @@ func (r *DecisionModelReconciler) candidateIdentity(
 	stable *decisionmodelv1alpha1.RevisionStatus,
 ) (candidate *decisionmodelv1alpha1.RevisionStatus, rev, effVer, image string, isStable bool) {
 	effVer = r.effectiveRuntimeVersion(eng, dm, stable)
-	image = servingImage(eng, r.paramsForVersion(dm, digest, "", "", effVer))
+	// A user spec.image override is the serving image verbatim: it feeds the
+	// revision hash and candidate.Image, so the serving Pods AND the prefetch Job
+	// run it (not only the prefetch, as before). With no override the engine
+	// renders the image from the effective runtime version and device.
+	image = servingImage(eng, r.paramsForVersion(dm, digest, dm.Spec.Image, "", effVer))
 	rev = RevisionHash(dm.Spec, digest, image)
 	candidate = &decisionmodelv1alpha1.RevisionStatus{
 		Hash:   rev,
@@ -863,6 +869,30 @@ func (r *DecisionModelReconciler) candidateIdentity(
 	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, legacyImage))
 	isStable = stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate, engineRendered))
 	return candidate, rev, effVer, image, isStable
+}
+
+// announceServingImageApplied emits one Normal Event when a spec.image override
+// first takes effect as the serving image for a DM whose stable was recorded
+// (by an operator build before spec.image fed the revision) with the engine
+// default image. It makes the one resulting candidate's cause visible — the
+// user's image taking effect, not a silent roll. It fires only while the new
+// candidate is not yet recorded (so it announces once, not every reconcile), and
+// only when a stable exists whose recorded image differs from the override.
+func (r *DecisionModelReconciler) announceServingImageApplied(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	image, rev string,
+) {
+	if dm.Spec.Image == "" || stable == nil || stable.Image == image {
+		return
+	}
+	if dm.Status.CandidateRevision != nil && dm.Status.CandidateRevision.Hash == rev {
+		return // already recorded: the Event already fired
+	}
+	r.event(ctx, dm, corev1.EventTypeNormal, eventServingImageApplied,
+		"applying spec.image %q as the serving image; starting revision %s (the previous revision ran %q)",
+		dm.Spec.Image, rev, stable.Image)
 }
 
 // reconcilePreflight runs the candidate preflight checks (security guards,

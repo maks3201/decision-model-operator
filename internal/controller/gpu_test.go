@@ -134,12 +134,15 @@ var _ = Describe("GPU usability", func() {
 		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
 	}
 
-	// cudaRev computes the revision hash for a cuda DM. The resolved serving
-	// image is always the engine's CUDA default (spec.image override does not
-	// flow into the serving image via paramsFor), so the revision hash uses
-	// fakeImageCUDA regardless of spec.image.
+	// cudaRev computes the revision hash for a cuda DM. The serving image is the
+	// engine's CUDA default, unless the user set spec.image, which is now the
+	// serving image verbatim and feeds the revision hash.
 	cudaRev := func(dm *decisionmodelv1alpha1.DecisionModel) string {
-		return RevisionHash(dm.Spec, defaultDigest, fakeImageCUDA)
+		img := fakeImageCUDA
+		if dm.Spec.Image != "" {
+			img = dm.Spec.Image
+		}
+		return RevisionHash(dm.Spec, defaultDigest, img)
 	}
 
 	hasToleration := func(spec corev1.PodSpec, key string) bool {

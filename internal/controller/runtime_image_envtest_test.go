@@ -393,4 +393,117 @@ var _ = Describe("unpinned runtime image policy", func() {
 		// so no candidate Deployment / Job / PVC is provisioned for the new revision.
 		Expect(getDM("adopted").Status.CandidateRevision).To(BeNil(), "no candidate for the refused revision")
 	})
+
+	// spec.image is the serving image AND a revision input: it feeds candidate.Image
+	// and the revision hash, so serving Pods and the prefetch Job both run it.
+	Describe("spec.image is the serving image and a revision input", func() {
+		const pinnedA = "registry.example.com/ollaya/custom:1.0@sha256:" +
+			"1111111111111111111111111111111111111111111111111111111111111111"
+		const pinnedB = "registry.example.com/ollaya/custom:2.0@sha256:" +
+			"2222222222222222222222222222222222222222222222222222222222222222"
+
+		getDeployment := func(name, rev string) *appsv1.Deployment {
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: revisionName(getDM(name), rev)}, dep)).To(Succeed())
+			return dep
+		}
+		jobImage := func(name, rev string) string {
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
+			return job.Spec.Template.Spec.Containers[0].Image
+		}
+
+		It("renders a digest-form spec.image into the Job and the serving Deployment and records it", func() {
+			r := newR(false, true) // allow override; the image is pinned so the gate admits it
+			createDM("srv", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Image = pinnedA })
+			rec(r, "srv")
+
+			dm := getDM("srv")
+			Expect(dm.Status.CandidateRevision).NotTo(BeNil())
+			rev := dm.Status.CandidateRevision.Hash
+			Expect(dm.Status.CandidateRevision.Image).To(Equal(pinnedA), "status records the override as the revision image")
+			Expect(jobImage("srv", rev)).To(Equal(pinnedA), "the prefetch Job runs the override")
+
+			markJob("srv", rev)
+			rec(r, "srv")
+			Expect(getDeployment("srv", rev).Spec.Template.Spec.Containers[0].Image).To(Equal(pinnedA),
+				"the serving Deployment runs the override (not the engine default)")
+		})
+
+		It("starts a new candidate when spec.image changes (tag@digest A -> B)", func() {
+			r := newR(false, true)
+			createDM("chg", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Image = pinnedA })
+			rec(r, "chg")
+			revA := getDM("chg").Status.CandidateRevision.Hash
+
+			Expect(updateDM(ctx, namespace, "chg", func(dm *decisionmodelv1alpha1.DecisionModel) {
+				dm.Spec.Image = pinnedB
+			})).To(Succeed())
+			rec(r, "chg")
+			revB := getDM("chg").Status.CandidateRevision.Hash
+			Expect(revB).NotTo(Equal(revA), "a different spec.image is a different revision")
+			Expect(getDM("chg").Status.CandidateRevision.Image).To(Equal(pinnedB))
+		})
+
+		It("starts a new candidate (back to the engine image) when spec.image is removed", func() {
+			r := newR(false, true)
+			createDM("rm", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Image = pinnedA })
+			rec(r, "rm")
+			revOverride := getDM("rm").Status.CandidateRevision.Hash
+			Expect(getDM("rm").Status.CandidateRevision.Image).To(Equal(pinnedA))
+
+			Expect(updateDM(ctx, namespace, "rm", func(dm *decisionmodelv1alpha1.DecisionModel) {
+				dm.Spec.Image = ""
+			})).To(Succeed())
+			rec(r, "rm")
+			dm := getDM("rm")
+			Expect(dm.Status.CandidateRevision.Hash).NotTo(Equal(revOverride),
+				"removing spec.image is a new revision back to the engine image")
+			Expect(dm.Status.CandidateRevision.Image).To(Equal(fakeImage), "engine default serving image")
+		})
+
+		// Upgrade case: an existing DM already had spec.image, recorded (by older
+		// code) with the ENGINE default as its stable image. After this change the
+		// override feeds the hash, so ONE candidate starts and a Normal Event names
+		// the cause. The stable keeps serving its recorded engine image until the
+		// candidate promotes.
+		It("starts one candidate with a ServingImageApplied Event for an existing spec.image DM recorded with the engine image", func() {
+			r := newR(false, true)
+			// Simulate the pre-change recording: spec.image set, but the stable's
+			// recorded image is the engine default (what old code stored).
+			createDM("upg", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Image = pinnedA })
+			// The old code recorded the stable with the ENGINE image (fakeImage) even
+			// though spec.image was set (RevisionHash ignored spec.image then and now;
+			// only the image arg matters). Reproduce that recorded hash.
+			legacyHash := RevisionHash(getDM("upg").Spec, defaultDigest, fakeImage)
+			Expect(updateDMStatus(ctx, namespace, "upg", func(dm *decisionmodelv1alpha1.DecisionModel) {
+				dm.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{
+					Hash: legacyHash, Engine: "ollaya", Model: "laya:en", Digest: defaultDigest,
+					Device: "cpu", Image: fakeImage, Placement: placementNone,
+				}
+				dm.Status.Phase = decisionmodelv1alpha1.PhaseReady
+			})).To(Succeed())
+
+			rec(r, "upg")
+			dm := getDM("upg")
+			Expect(dm.Status.CandidateRevision).NotTo(BeNil(), "the override now differs: one candidate starts")
+			Expect(dm.Status.CandidateRevision.Image).To(Equal(pinnedA))
+			Expect(dm.Status.StableRevision.Hash).To(Equal(legacyHash), "the stable keeps serving its recorded engine image")
+			Expect(dm.Status.StableRevision.Image).To(Equal(fakeImage))
+			// The Normal Event names the cause.
+			fr := r.Recorder.(*events.FakeRecorder)
+			found := false
+			for drained := false; !drained; {
+				select {
+				case e := <-fr.Events:
+					if strings.Contains(e, "ServingImageApplied") && strings.Contains(e, pinnedA) {
+						found = true
+					}
+				default:
+					drained = true
+				}
+			}
+			Expect(found).To(BeTrue(), "a ServingImageApplied Event names the applied spec.image")
+		})
+	})
 })
