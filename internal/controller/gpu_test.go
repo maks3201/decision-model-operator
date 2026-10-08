@@ -182,14 +182,16 @@ var _ = Describe("GPU usability", func() {
 		})
 
 		It("prefetches with spec.image when the user overrides it", func() {
-			const override = "registry.example.com/ollaya:pinned"
+			const override = "registry.example.com/ollaya:pinned@sha256:" +
+				"1111111111111111111111111111111111111111111111111111111111111111"
 			eng := newFakeEngine()
 			r := newReconciler(eng, &fakeProber{})
 			createDM("p2", func(dm *decisionmodelv1alpha1.DecisionModel) {
 				dm.Spec.Device = "cuda"
 				dm.Spec.Image = override
 			})
-			// spec.image requires the operator to allow overrides.
+			// spec.image requires the operator to allow overrides. The image is
+			// pinned by digest, so the runtime-image pinning gate admits it.
 			r.AllowImageOverride = true
 
 			reconcileOnce(r, "p2")

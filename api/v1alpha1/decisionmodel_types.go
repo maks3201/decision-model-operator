@@ -405,6 +405,16 @@ type RevisionStatus struct {
 	// +optional
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 
+	// ImagePinned records whether this revision's runtime image is pinned to an
+	// immutable digest. It is set to false only on a revision admitted with a
+	// mutable-tag runtime image because the operator runs with
+	// --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+	// refuses an unpinned candidate, so an admitted revision is pinned). A false
+	// value is a durable record that this revision breaks the
+	// one-revision-hash-one-bytes guarantee.
+	// +optional
+	ImagePinned *bool `json:"imagePinned,omitempty"`
+
 	// Resources are the compute resource requirements of this revision's serving
 	// container.
 	// +optional

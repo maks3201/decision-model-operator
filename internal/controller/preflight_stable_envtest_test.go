@@ -229,6 +229,19 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		assertStableMaintained(r, "rtver", revA, reasonInvalidRuntimeVersion)
 	})
 
+	It("keeps serving the stable when the candidate runtime image is an unpinned tag", func() {
+		r, _, _, revA := stable("unpinned", nil)
+		// 0.9.0 is a valid version the fake renders by a mutable tag (no digest):
+		// the candidate is refused (one hash = one set of bytes) but the stable,
+		// rendered from status with its pinned image, keeps serving.
+		Expect(updateDM(ctx, namespace, "unpinned", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Spec.RuntimeVersion = fakeUnpinnedRuntimeVersion
+		})).To(Succeed())
+		assertStableMaintained(r, "unpinned", revA, reasonUnpinnedRuntimeImage)
+		// No candidate workload was created for the refused revision.
+		Expect(getDM("unpinned").Status.CandidateRevision).To(BeNil())
+	})
+
 	It("still fails when the model tag is missing and there is NO stable", func() {
 		fake := newFakeEngine()
 		fake.resolveErr = engine.ErrNotFound

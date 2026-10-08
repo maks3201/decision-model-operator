@@ -184,6 +184,27 @@ func (f *fakeEngine) RuntimeVersionFromImage(image string) string {
 	return tag
 }
 
+// fakeUnpinnedRuntimeVersion is a valid-but-unlisted runtime version the fake
+// engine renders by a mutable tag (no digest), mirroring the real engine's
+// behaviour for a version absent from its digest table. A candidate resolving to
+// this version is unpinned. It must not collide with versions other tests use as
+// a plain "valid version" (0.7.3 / 0.8.0 / 0.9.0 / 0.10.0) or as an operator
+// default-bump target (0.11.0).
+const fakeUnpinnedRuntimeVersion = "0.42.0"
+
+// RuntimeImagePinned implements engine.RuntimeImagePinner: the fake pins every
+// version it knows (the default and anything in its validation range) EXCEPT
+// fakeUnpinnedRuntimeVersion, which it renders by a mutable tag — so controller
+// tests can drive both the pinned and the unpinned candidate paths. Empty or
+// invalid resolves to the (pinned) default.
+func (f *fakeEngine) RuntimeImagePinned(version, _ string) bool {
+	v := version
+	if v == "" || f.ValidateRuntimeVersion(v) != nil {
+		v = f.effectiveDefaultVersion()
+	}
+	return v != fakeUnpinnedRuntimeVersion
+}
+
 // ClassifyPrefetchFailure implements engine.PrefetchFailureClassifier: it maps a
 // failed prefetch Pod's termination message to a classified reason, mirroring the
 // real engine's classes. ModelNotFound and DigestMismatch are permanent; anything

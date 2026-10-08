@@ -149,6 +149,7 @@ const (
 	reasonDownloadTokenInvalid      = "DownloadTokenInvalid"
 	reasonInvalidRuntimeVersion     = "InvalidRuntimeVersion"
 	reasonRuntimeVersionUnsupported = "RuntimeVersionUnsupported"
+	reasonUnpinnedRuntimeImage      = "UnpinnedRuntimeImage"
 	reasonRolloutQueued             = "RolloutQueued"
 	reasonRuntimeUpdateAvailable    = "RuntimeUpdateAvailable"
 	reasonAPIKeyInvalid             = "APIKeyInvalid"
@@ -198,6 +199,7 @@ const (
 	eventCandidateRejected     = "CandidateRejected"
 	eventCandidateSuperseded   = "CandidateSuperseded"
 	eventRetryNoop             = "RetryNoop"
+	eventUnpinnedRuntimeImage  = "UnpinnedRuntimeImage"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -222,6 +224,12 @@ type DecisionModelReconciler struct {
 	AllowInsecureRegistries bool
 	// AllowImageOverride permits spec.image.
 	AllowImageOverride bool
+	// AllowUnpinnedRuntimeImages permits a candidate whose runtime image is a
+	// mutable tag (the engine cannot pin it to a digest, or a spec.image override
+	// carries no @sha256:). Default false: an unpinned candidate is refused so one
+	// revision hash always means one set of runtime bytes. An admitted unpinned
+	// candidate is recorded with ImagePinned=false and a Warning Event.
+	AllowUnpinnedRuntimeImages bool
 	// MaxConcurrentReconciles bounds parallel reconciles. 0 -> defaultMaxConcurrent.
 	MaxConcurrentReconciles int
 	// RuntimeVersionPolicy selects how an unset spec.runtimeVersion resolves:
@@ -374,30 +382,21 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 3. Compute the revision and candidate identity.
 	stable := dm.Status.StableRevision
-	effVer := r.effectiveRuntimeVersion(eng, &dm, stable)
-	image := servingImage(eng, r.paramsForVersion(&dm, digest, "", "", effVer))
-	rev := RevisionHash(dm.Spec, digest, image)
+	// candidateIdentity builds the candidate and decides isStable; it adopts a
+	// legacy stable's placement/image/resources in place (first reconcile after an
+	// operator upgrade), so pass the real stable here.
+	candidate, rev, effVer, image, isStable := r.candidateIdentity(&dm, eng, digest, stable)
 	params := r.paramsForVersion(&dm, digest, image, rev, effVer)
-	candidate := &decisionmodelv1alpha1.RevisionStatus{
-		Hash:   rev,
-		Engine: engineOrDefault(dm.Spec.Engine),
-		Model:  dm.Spec.Model,
-		Digest: digest,
-		Device: deviceOrDefault(dm.Spec.Device),
-		// Record the model-affecting render inputs so the stable revision is later
-		// rendered from its own state, not a (possibly newer) spec.
-		Image:          image,
-		RuntimeVersion: recordedCandidateRuntimeVersion(eng, &dm, effVer),
-		Resources:      dm.Spec.Resources,
-		Placement:      placementRecord(dm.Spec.Scheduling),
+
+	// If the runtime image is a mutable tag we only reach this point with
+	// --allow-unpinned-runtime-images set (preflightRuntimeImage refuses a new
+	// unpinned candidate otherwise). Record the durable ImagePinned=false on the
+	// candidate and warn once per revision — but only for a genuine new candidate,
+	// never for the stable's own revision (an unchanged unpinned stable from before
+	// this policy must not be reported as a refused/unpinned candidate).
+	if !isStable {
+		r.recordRuntimeImagePinned(ctx, &dm, eng, candidate, effVer)
 	}
-	// A stable created before placement was recorded keeps its old hash name and
-	// workloads; just record the placement it is running with. This runs
-	// on the first reconcile after an operator upgrade, so no candidate is started
-	// and nothing is rolled. From then on a change of scheduling differs from the
-	// recorded placement and starts a new revision.
-	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, image))
-	isStable := stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate))
 
 	// Surface whether a newer engine runtime default exists than the version this
 	// DecisionModel runs (informational; never blocks serving). An explicit
@@ -735,6 +734,52 @@ func (r *DecisionModelReconciler) reconcileResolve(
 	return digest, false, ctrl.Result{}, nil
 }
 
+// candidateIdentity builds the candidate RevisionStatus for the live spec
+// (resolved digest), decides whether it is the stable's own revision, and
+// returns the revision hash, effective runtime version and serving image used to
+// build it. It is the single source of the candidate identity: both
+// reconcileNormal and preflightRuntimeImage call it, so the "is this the stable
+// revision" decision cannot drift between them.
+//
+// adoptLegacyStable mutates the passed stable in place (backfilling placement,
+// image and resources on a stable recorded before those fields existed). That
+// adoption must happen exactly once, in reconcileNormal, which passes the real
+// dm.Status.StableRevision. preflightRuntimeImage passes a deep copy of the
+// stable, so calling this to only inspect isStable never mutates persisted
+// status.
+func (r *DecisionModelReconciler) candidateIdentity(
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	digest string,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+) (candidate *decisionmodelv1alpha1.RevisionStatus, rev, effVer, image string, isStable bool) {
+	effVer = r.effectiveRuntimeVersion(eng, dm, stable)
+	image = servingImage(eng, r.paramsForVersion(dm, digest, "", "", effVer))
+	rev = RevisionHash(dm.Spec, digest, image)
+	candidate = &decisionmodelv1alpha1.RevisionStatus{
+		Hash:   rev,
+		Engine: engineOrDefault(dm.Spec.Engine),
+		Model:  dm.Spec.Model,
+		Digest: digest,
+		Device: deviceOrDefault(dm.Spec.Device),
+		// Record the model-affecting render inputs so the stable revision is later
+		// rendered from its own state, not a (possibly newer) spec.
+		Image:          image,
+		RuntimeVersion: recordedCandidateRuntimeVersion(eng, dm, effVer),
+		Resources:      dm.Spec.Resources,
+		Placement:      placementRecord(dm.Spec.Scheduling),
+	}
+	// A stable created before placement was recorded keeps its old hash name and
+	// workloads; just record the placement it is running with. From then on a
+	// change of scheduling differs from the recorded placement and starts a new
+	// revision. The legacy hash only matters through this adoption (it ignores
+	// placement), so a scheduling change on an already-adopted legacy stable is a
+	// real new revision — isStable is then false.
+	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, image))
+	isStable = stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate))
+	return candidate, rev, effVer, image, isStable
+}
+
 // reconcilePreflight runs the candidate preflight checks (security guards,
 // resolve, runtime version) against the live spec. It returns the resolved
 // digest and done=false to continue the normal flow. On a preflight failure it
@@ -783,7 +828,125 @@ func (r *DecisionModelReconciler) reconcilePreflight(
 		res, err = r.degradeSecretReason(ctx, dm, reason, verr)
 		return "", true, res, err
 	}
+
+	// Runtime-image pinning: one revision hash must mean one set of runtime bytes,
+	// so a candidate whose runtime image is a mutable tag is refused unless the
+	// operator explicitly allows it. This gates a NEW CANDIDATE only; when the live
+	// spec resolves to the stable's own revision (an unpinned stable from before
+	// this policy, or an in-place change that keeps the hash) the gate is skipped
+	// and the stable keeps serving, rendered from status.stableRevision. done=true =
+	// refused and handled; otherwise the image is pinned, the spec is the stable
+	// revision, OR an unpinned candidate is admitted under the flag (reconcileNormal
+	// records ImagePinned=false and warns once per revision).
+	if idone, ires, ierr := r.preflightRuntimeImage(ctx, dm, eng, stable, digest); idone {
+		return "", true, ires, ierr
+	}
 	return digest, false, ctrl.Result{}, nil
+}
+
+// preflightRuntimeImage refuses a candidate whose runtime image is not pinned to
+// an immutable digest, unless --allow-unpinned-runtime-images is set. done=true
+// means the candidate was refused and the caller must stop (a stable, if any, is
+// kept serving by maintainStableAfterPreflight; with no stable the object is
+// Degraded via degradeRuntimeImage). done=false means the image is pinned, the
+// spec resolves to the stable's existing revision (no new revision asked for), or
+// an unpinned candidate is allowed under the flag — the recording of
+// ImagePinned=false and the once-per-revision Warning Event happen in
+// reconcileNormal, where the revision hash is known. The flag/field are read on
+// every reconcile, so this is purely derived from spec + engine state (no RAM
+// bookkeeping).
+func (r *DecisionModelReconciler) preflightRuntimeImage(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	digest string,
+) (done bool, res ctrl.Result, err error) {
+	device := deviceOrDefault(dm.Spec.Device)
+	// Skip the gate when the live spec resolves to the stable's own revision: no
+	// new revision is being asked for, so refusing it would wrongly report the
+	// running stable as a rejected candidate every reconcile. candidateIdentity is
+	// the same decision reconcileNormal makes; pass a deep copy of the stable so
+	// its legacy-adoption side effect never mutates persisted status here.
+	if stable != nil {
+		_, _, effVer, _, isStable := r.candidateIdentity(dm, eng, digest, stable.DeepCopy())
+		if isStable {
+			return false, ctrl.Result{}, nil
+		}
+		if candidateRuntimeImagePinned(eng, dm, effVer, device) {
+			return false, ctrl.Result{}, nil
+		}
+		return r.refuseOrAdmitUnpinned(ctx, dm, eng, stable, effVer, device)
+	}
+	effVer := r.effectiveRuntimeVersion(eng, dm, stable)
+	if candidateRuntimeImagePinned(eng, dm, effVer, device) {
+		return false, ctrl.Result{}, nil
+	}
+	return r.refuseOrAdmitUnpinned(ctx, dm, eng, stable, effVer, device)
+}
+
+// refuseOrAdmitUnpinned refuses an unpinned candidate unless the flag is set.
+// done=true means refused and handled (stable kept serving, or Degraded with no
+// stable); done=false means admitted under the flag (reconcileNormal records
+// ImagePinned=false and warns once per revision).
+func (r *DecisionModelReconciler) refuseOrAdmitUnpinned(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	effVer, device string,
+) (done bool, res ctrl.Result, err error) {
+	if r.AllowUnpinnedRuntimeImages {
+		return false, ctrl.Result{}, nil
+	}
+	msg := fmt.Sprintf(
+		"%s is a mutable tag, not pinned to a digest; refusing the candidate "+
+			"(set --allow-unpinned-runtime-images to allow it)",
+		candidateImageMessage(dm, effVer, device))
+	if stable != nil {
+		res, err = r.maintainStableAfterPreflight(ctx, dm, eng, stable, reasonUnpinnedRuntimeImage, msg, false)
+		return true, res, err
+	}
+	res, err = r.degradeRuntimeImage(ctx, dm, msg)
+	return true, res, err
+}
+
+// degradeRuntimeImage records a candidate refusal when no stable is serving:
+// there is nothing to keep running, so it sets Resolved=False and Ready=False /
+// phase Degraded with reasonUnpinnedRuntimeImage, emits one Warning Event when
+// the refusal signal first appears or its message changes, and requeues at the
+// regate interval (a flag flip is operator-side and is not covered by the
+// generation watch, so it must be polled).
+func (r *DecisionModelReconciler) degradeRuntimeImage(
+	ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel, msg string,
+) (ctrl.Result, error) {
+	changed := unpinnedSignalChanged(dm, msg)
+	setStatusCondition(dm, metav1.Condition{
+		Type: decisionmodelv1alpha1.ConditionResolved, Status: metav1.ConditionFalse,
+		Reason: reasonUnpinnedRuntimeImage, Message: msg,
+	})
+	setStatusCondition(dm, metav1.Condition{
+		Type: decisionmodelv1alpha1.ConditionReady, Status: metav1.ConditionFalse,
+		Reason: reasonUnpinnedRuntimeImage, Message: msg,
+	})
+	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseDegraded)
+	if changed {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventUnpinnedRuntimeImage,
+			"candidate refused: %s", msg)
+	}
+	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+}
+
+// unpinnedSignalChanged reports whether the Ready condition does not already
+// carry reasonUnpinnedRuntimeImage with message msg. It dedups the no-stable
+// refusal Event (degradeRuntimeImage). Ready is used, not Resolved: the earlier
+// resolve step in preflight flips Resolved to True in memory every reconcile, so
+// a Resolved-based check would re-fire the Event each time; Ready is untouched
+// until degradeRuntimeImage sets it, so it reflects the persisted refusal.
+func unpinnedSignalChanged(dm *decisionmodelv1alpha1.DecisionModel, msg string) bool {
+	c := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionReady)
+	return c == nil || c.Status != metav1.ConditionFalse ||
+		c.Reason != reasonUnpinnedRuntimeImage || c.Message != msg
 }
 
 // preflightSecurity runs the candidate security guards. When no stable revision

@@ -1524,6 +1524,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
@@ -1819,6 +1829,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
@@ -1986,6 +2006,16 @@ spec:
                         description: Image is the resolved serving container image
                           for this revision.
                         type: string
+                      imagePinned:
+                        description: |-
+                          ImagePinned records whether this revision's runtime image is pinned to an
+                          immutable digest. It is set to false only on a revision admitted with a
+                          mutable-tag runtime image because the operator runs with
+                          --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                          refuses an unpinned candidate, so an admitted revision is pinned). A false
+                          value is a durable record that this revision breaks the
+                          one-revision-hash-one-bytes guarantee.
+                        type: boolean
                       message:
                         description: |-
                           Message is a human-readable explanation of a failure. Set only on
@@ -2124,6 +2154,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
