@@ -47,6 +47,13 @@ import (
 func main() {
 	store := envOr("MIRROR_STORE", "/store/models")
 	addr := envOr("MIRROR_ADDR", ":8080")
+	// MIRROR_FAULT, when set to an HTTP status (e.g. "500" or "429"), makes every
+	// /v2/ request return that status instead of serving. It is read once at
+	// startup; the e2e chaos spec injects a fault by `kubectl set env` + a rollout,
+	// so the fault persists for the whole time the env is set (longer than the
+	// engine's in-request retries and a reconcile), which is what makes the
+	// transient-registry behaviour observable. Unset (default) serves normally.
+	fault := faultStatus(os.Getenv("MIRROR_FAULT"))
 
 	// The store keeps manifests under a single <registry-host> directory (the host
 	// the model was pulled from at bake time). Discover it so the served repo path
@@ -56,11 +63,23 @@ func main() {
 		log.Fatalf("mirror: no manifests found under %s/manifests/*", store)
 	}
 	host := filepath.Base(hostDirs[0])
-	log.Printf("mirror: store=%s manifestHost=%s addr=%s", store, host, addr)
+	log.Printf("mirror: store=%s manifestHost=%s addr=%s fault=%d", store, host, addr, fault)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		// /healthz is never faulted so the readiness probe can target it while a
+		// fault is injected on /v2/ (the chaos spec sets MIRROR_FAULT and still needs
+		// the Pod to report Ready for `kubectl rollout status`).
+		if p == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if fault != 0 && strings.HasPrefix(p, "/v2") {
+			w.WriteHeader(fault)
+			log.Printf("mirror: %d (injected fault) %s", fault, p)
+			return
+		}
 		switch {
 		case strings.Contains(p, "/manifests/"):
 			serveManifest(w, r, store, host)
@@ -77,6 +96,24 @@ func main() {
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// faultStatus parses MIRROR_FAULT into an HTTP status to force on /v2/ requests,
+// or 0 when unset/invalid (serve normally). Only 5xx and 429 are accepted — the
+// statuses the engine treats as retryable/transient.
+func faultStatus(v string) int {
+	switch v {
+	case "429":
+		return http.StatusTooManyRequests
+	case "500":
+		return http.StatusInternalServerError
+	case "502":
+		return http.StatusBadGateway
+	case "503":
+		return http.StatusServiceUnavailable
+	default:
+		return 0
+	}
 }
 
 func serveManifest(w http.ResponseWriter, r *http.Request, store, host string) {
