@@ -315,7 +315,7 @@ func (r *DecisionModelReconciler) promote(
 			Reason:  reasonPromoted,
 			Message: fmt.Sprintf("revision %s is serving", rev),
 		})
-		r.event(ctx, dm, corev1.EventTypeNormal, eventPromoted, "promoted %s%s", modelRef(candidate), promotionEvalSummary(dm, candidate.Hash))
+		r.event(ctx, dm, corev1.EventTypeNormal, eventPromoted, "promoted %s (revision %s)%s", modelRef(candidate), candidate.Hash, promotionEvalSummary(dm, candidate.Hash))
 		bufferRollout(ctx, rolloutPromoted)
 	}
 	// GC now: everything except the new stable, the just-demoted previous revision
@@ -407,8 +407,8 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 			Message: fmt.Sprintf("candidate %s rejected (%s); %s keeps serving", modelRef(failed), reason, modelRef(dm.Status.StableRevision)),
 		})
 		r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
-			"candidate %s rejected (%s): %s; %s keeps serving",
-			modelRef(failed), reason, message, modelRef(dm.Status.StableRevision))
+			"candidate %s (revision %s) rejected (%s): %s; %s keeps serving",
+			modelRef(failed), failed.Hash, reason, message, modelRef(dm.Status.StableRevision))
 		bufferRollout(ctx, rolloutRolledBack)
 	} else {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseFailed)

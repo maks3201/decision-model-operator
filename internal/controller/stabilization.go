@@ -364,8 +364,8 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	prev *decisionmodelv1alpha1.PreviousRevisionStatus,
 	detail string,
 ) stabilizationResult {
-	msg := fmt.Sprintf("new stable %s unhealthy during the stabilization window (%s); rolling back to %s",
-		modelRef(failed), detail, prev.Hash)
+	msg := fmt.Sprintf("new stable %s (revision %s) unhealthy during the stabilization window (%s); rolling back to %s",
+		modelRef(failed), failed.Hash, detail, prev.Hash)
 
 	failedAt := metav1.NewTime(r.now())
 	rolledBack := failed.DeepCopy()

@@ -270,10 +270,10 @@ Events are human-readable and name the model and short digest instead of a bare
 revision hash, so `kubectl describe dm` reads like a changelog:
 
 ```text
-Normal   EvaluationStarted   evaluating revision a1b2c3d4e5 against 500 cases
+Normal   EvaluationStarted   evaluating revision a1b2c3d4e5f60718 against 500 cases
 Warning  EvaluationFailed    candidate kev:en@sha256:1a2b3c4d failed evaluation: accuracy 0.8700 < minAccuracy 0.9200; laya:en@sha256:c305a927 keeps serving
-Warning  RolledBack          candidate kev:en@sha256:1a2b3c4d rejected (EvaluationFailed): ...; laya:en@sha256:c305a927 keeps serving
-Normal   Promoted            promoted laya:en@sha256:c305a927 (accuracy 0.9400, baseline 0.9300)
+Warning  RolledBack          candidate kev:en@sha256:1a2b3c4d (revision a1b2c3d4e5f60718) rejected (EvaluationFailed): ...; laya:en@sha256:c305a927 keeps serving
+Normal   Promoted            promoted laya:en@sha256:c305a927 (revision 7c9f0a1b2c3d4e5f) (accuracy 0.9400, baseline 0.9300)
 ```
 
 The event **reason** (the first column after the type) is stable and safe to key

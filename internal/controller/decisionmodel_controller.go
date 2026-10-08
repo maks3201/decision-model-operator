@@ -613,7 +613,7 @@ func (r *DecisionModelReconciler) abandonCandidateThenFinish(
 ) (ctrl.Result, error) {
 	if abandoned := dm.Status.CandidateRevision; abandoned != nil {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
-			"abandoning candidate %s: the spec no longer describes a startable revision", abandoned.Hash)
+			"abandoning candidate revision %s: the spec no longer describes a startable revision", abandoned.Hash)
 		dm.Status.CandidateRevision = nil
 	}
 	persisted, conflict, perr := r.persistStatus(ctx, dm)
@@ -1126,7 +1126,7 @@ func (r *DecisionModelReconciler) maintainStableAfterPreflight(
 	// registry does not spam Events.
 	if changed && !transient {
 		r.event(ctx, dm, corev1.EventTypeWarning, eventCandidateRejected,
-			"candidate spec rejected (%s): %s; the current stable %s keeps serving", reason, msg, stable.Hash)
+			"candidate spec rejected (%s): %s; the current stable (revision %s) keeps serving", reason, msg, stable.Hash)
 	}
 
 	// Abandon a candidate started for a now-superseded spec: the spec no longer
@@ -1135,7 +1135,7 @@ func (r *DecisionModelReconciler) maintainStableAfterPreflight(
 	// gcRevisions (run by the stable path) collect it. Emit once.
 	if c := dm.Status.CandidateRevision; c != nil {
 		r.event(ctx, dm, corev1.EventTypeNormal, eventCandidateSuperseded,
-			"abandoning candidate %s: the spec changed to a revision that cannot start", c.Hash)
+			"abandoning candidate revision %s: the spec changed to a revision that cannot start", c.Hash)
 		dm.Status.CandidateRevision = nil
 	}
 
