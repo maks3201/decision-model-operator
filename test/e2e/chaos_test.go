@@ -45,15 +45,21 @@ const chaosDM = "chaos-router"
 //
 // Scenarios (one DecisionModel reused where possible to bound node memory — every
 // laya:en Pod holds the model, so the suite runs them sequentially):
-//  1. Registry 500 during Resolving  -> stable keeps serving, Resolved=False/ResolveFailed
-//     (transient, no Degraded, no Event); fault cleared -> the candidate proceeds.
-//  2. Registry 404 for the tag       -> Resolved=False/ModelNotFound, stable keeps serving.
-//  3. Runtime fault during Evaluating (model unloaded from the candidate Pod) ->
-//     evaluation holds and retries, no false reject; model back -> promotes.
-//  4. Stable store PVC deleted while Ready -> Degraded=StoreLost, bounded recovery.
-//     (PENDING — see the PIt comment; timing-sensitive on kind.)
-//  5. Stable serving Pod deleted during Stabilizing -> no false rollback when it
-//     returns within the debounce. (PENDING — see the PIt comment.)
+//
+//	1a. Registry 500 during Resolving  -> stable keeps serving, Resolved=False/ResolveFailed
+//	    (transient, no Degraded, no Event); fault cleared -> the candidate proceeds.
+//	1b. Registry fault (503) during prefetch (Caching) -> waits in Caching, not Failed;
+//	    cleared -> completes.
+//	2.  Registry 404 for the tag       -> Resolved=False/ModelNotFound, stable keeps serving.
+//	3.  Runtime fault during Evaluating (candidate Pod disrupted = transport error) ->
+//	    evaluation holds and retries, no false reject; recovered -> promotes.
+//	4.  Operator Pod killed mid-rollout and after promotion -> converges, exactly one
+//	    Deployment/Job/PVC per revision, Service on the stable.
+//	5a. Candidate store PVC deleted during Starting -> fresh re-prefetch, then completes.
+//	5b. Stable store PVC deleted while Ready -> Degraded store reason, bounded recovery.
+//	    (PENDING — see the PIt comment; timing-sensitive on kind.)
+//	6.  Stable serving Pod deleted during Stabilizing -> no false rollback within the
+//	    debounce. (PENDING — see the PIt comment.)
 var _ = Describe("Chaos: faults between critical steps", Label("nightly", "chaos"), Ordered, func() {
 	const dm = chaosDM
 
