@@ -59,8 +59,8 @@ const chaosDM = "chaos-router"
 //	4.  Operator Pod killed mid-rollout and after promotion -> converges, exactly one
 //	    Deployment/Job/PVC per revision, Service on the stable.
 //	5a. Candidate store PVC deleted during Starting -> fresh re-prefetch, then completes.
-//	5b. Stable store PVC deleted while Ready (provisioner paused to hold it) -> Degraded
-//	    store reason; provisioner resumed -> bounded recovery, back to Ready.
+//	5b. Stable store PVC deleted while Ready -> StoreTerminating (does not auto-stop the
+//	    stable); then unmount (replicas 0) so it finalizes -> store recovers, back to Ready.
 //	6.  Stable serving Pod during Stabilizing: deleted once -> recovers within the 30s
 //	    debounce, no rollback; held down past it -> RolledBackAfterPromotion.
 var _ = Describe("Chaos: faults between critical steps", Label("nightly", "chaos"), Ordered, func() {
@@ -116,7 +116,6 @@ spec:
 	AfterEach(func() {
 		dumpDiag(chaosNS, dm)
 		clearMirrorFault()
-		resumeProvisioner()
 	})
 
 	It("keeps the stable serving on a transient registry 500 during Resolving", func() {
@@ -350,52 +349,51 @@ spec:
 			"a single transport fault must not cause a post-promotion rollback")
 	})
 
-	It("surfaces StoreLost and recovers when the stable store PVC is deleted while Ready", func() {
+	It("flags StoreTerminating while mounted, then recovers the lost store once unmounted", func() {
+		// A stable store PVC deleted while the stable is Ready stays Terminating
+		// (pvc-protection) because the running stable Pod still mounts it; the operator
+		// does NOT auto-stop the stable — it surfaces StoreTerminating (Event + Degraded
+		// flag, "delete them to let recovery proceed") and keeps serving. This is the
+		// documented behaviour (docs/ARCHITECTURE.md: StoreTerminating "does not stop
+		// serving"). To then exercise the lost-store recovery path, we remove the mount
+		// (scale replicas to 0) so the PVC finalizes and is actually missing; the operator
+		// recreates and re-prefetches it, and scaling back to 1 returns to Ready on the
+		// same revision.
 		stable, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(stable).NotTo(BeEmpty())
 		pvc := dm + "-store-" + stable
 
-		By("pausing the storage provisioner so the recreated PVC cannot bind (hold the fault)")
-		// Scaling kind's local-path provisioner to 0 makes the operator's recreated store
-		// PVC stay Pending, so the lost-store Degraded state is observable deterministically
-		// instead of racing a fast dynamic provisioner. Restored at the end (and by
-		// AfterEach as a safety net).
-		pauseProvisioner()
-		defer resumeProvisioner()
-
-		By("deleting the stable store PVC and its serving Pod so the PVC can finalize")
-		// The serving Pod mounts it read-only; pvc-protection keeps the PVC Terminating
-		// until the Pod is gone.
+		By("deleting the stable store PVC while the stable Pod still mounts it")
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", chaosNS, "--wait=false")
-		_, _ = utils.Kubectl("delete", "pods", "-l",
-			"decisionmodel.io/name="+dm+",decisionmodel.io/revision="+stable, "-n", chaosNS,
-			"--grace-period=0", "--force")
 
-		By("the operator detects the lost store: a StoreLost/StorePrefetchFailed Event and Degraded")
-		// Assert on the durable Event (emitted on the transition, so it is not missed by a
-		// poll) and that Degraded is a store reason. The provisioner is paused, so the
-		// recreated store PVC stays Pending and the lost-store state persists.
+		By("the operator surfaces StoreTerminating and keeps the stable serving (does not auto-stop)")
 		Eventually(func(g Gomega) {
-			storeEvents := eventReasonCountIn("StoreLost") + eventReasonCountIn("StorePrefetchFailed") +
-				eventReasonCountIn("StoreTerminating")
-			g.Expect(storeEvents).To(BeNumerically(">=", 1),
-				"a lost stable store should emit a StoreLost/StoreTerminating/StorePrefetchFailed Event")
-			deg, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
-				"{.status.conditions[?(@.type=='Degraded')].status}")
-			reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
-				"{.status.conditions[?(@.type=='Degraded')].reason}")
-			g.Expect(deg).To(Equal("True"), "a lost stable store should set Degraded")
-			g.Expect(reason).To(BeElementOf("StoreLost", "StoreTerminating", "StorePrefetchFailed"),
-				"Degraded should carry a store reason (got %q)", reason)
-		}, 8*time.Minute, 5*time.Second).Should(Succeed())
+			g.Expect(eventReasonCountIn("StoreTerminating")).To(BeNumerically(">=", 1),
+				"a PVC deleted while still mounted should emit StoreTerminating")
+		}, 4*time.Minute, 5*time.Second).Should(Succeed())
+		// The stable keeps serving: the DM must not stop its stable on a StoreTerminating.
+		phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+		Expect(phase).To(BeElementOf("Ready", "Degraded"),
+			"the stable must keep serving while the store is Terminating (got phase %q)", phase)
+		running, _ := utils.Kubectl("get", "pods",
+			"-l", "decisionmodel.io/name="+dm+",decisionmodel.io/revision="+stable,
+			"-n", chaosNS, "-o", "jsonpath={.items[*].status.phase}")
+		Expect(running).To(ContainSubstring("Running"), "the stable Pod should still be running")
 
-		By("resuming the provisioner lets the store recover and the DecisionModel return to Ready")
-		resumeProvisioner()
+		By("removing the mount (replicas 0) so the Terminating PVC can finalize and go missing")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"replicas":0}}`)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("the operator recreates+re-prefetches the store; scaling back to 1 returns to Ready")
+		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+			"-p", `{"spec":{"replicas":1}}`)
+		Expect(err).NotTo(HaveOccurred())
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
 		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"),
-			"bounded store recovery should re-prefetch and serve again once storage is back")
+			"the store should recover (re-prefetch) and serve again")
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(chaosNS, "pvc", pvc, "{.status.phase}")
 		}, 3*time.Minute, 5*time.Second).Should(Equal("Bound"), "the stable store PVC should be recreated and Bound")
@@ -655,27 +653,6 @@ func setMirrorFault(status string) {
 func clearMirrorFault() {
 	_, _ = utils.Kubectl("set", "env", "deployment/mirror", "-n", mirrorNS, "MIRROR_FAULT-")
 	_, _ = utils.Kubectl("rollout", "status", "deployment/mirror", "-n", mirrorNS, "--timeout=2m")
-}
-
-// provisionerNS/provisionerDeploy identify kind's dynamic storage provisioner, which
-// backs the per-revision store PVCs.
-const provisionerNS = "local-path-storage"
-const provisionerDeploy = "local-path-provisioner"
-
-// pauseProvisioner scales kind's local-path provisioner to 0 so a newly requested
-// store PVC stays Pending — holding a lost-store fault long enough to observe the
-// StoreLost Degraded state deterministically.
-func pauseProvisioner() {
-	_, err := utils.Kubectl("scale", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--replicas=0")
-	Expect(err).NotTo(HaveOccurred(), "failed to pause the storage provisioner")
-	_, _ = utils.Kubectl("rollout", "status", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--timeout=1m")
-}
-
-// resumeProvisioner scales the provisioner back to 1 so Pending PVCs bind. Idempotent
-// and best-effort (used both inline and as an AfterEach safety net).
-func resumeProvisioner() {
-	_, _ = utils.Kubectl("scale", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--replicas=1")
-	_, _ = utils.Kubectl("rollout", "status", "deployment/"+provisionerDeploy, "-n", provisionerNS, "--timeout=2m")
 }
 
 // chaosLabels learns, once per DecisionModel, the label the model answers for each
