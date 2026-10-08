@@ -70,7 +70,7 @@ routing set and is rejected (`minAccuracy 0.90`), `nli:latest` scores 0.925 and 
 
 ## Quickstart
 
-Needs Kubernetes 1.29+ (tested on 1.35 and 1.37, see [Compatibility](#compatibility)) with a default
+Needs Kubernetes 1.29+ (tested on 1.35, 1.36 and 1.37, see [Compatibility](#compatibility)) with a default
 StorageClass (kind works).
 
 <!-- x-release-please-start-version -->
@@ -118,7 +118,7 @@ The full walk-through (first request, scaling, proxies, mirrors) is in the
 
 | Area | Tested | Notes |
 |---|---|---|
-| Kubernetes | 1.37 on every change (kind); 1.35 and 1.37 in the upgrade E2E of each release | 1.29+ is required by the APIs the operator uses. 1.36 is expected to work but is not run in CI; versions below 1.35 are not tested ([RELEASING.md](RELEASING.md#5-support-policy)). |
+| Kubernetes | 1.35, 1.36 and 1.37 nightly (kind, default suite); 1.37 on every change; 1.35 and 1.37 in the upgrade E2E of each release | 1.29+ is required by the APIs the operator uses. Versions below 1.35 are not tested ([RELEASING.md](RELEASING.md#5-support-policy)); exact patch versions are in [`hack/k8s-versions.env`](hack/k8s-versions.env). |
 | Runtime: [Ollaya](https://github.com/ollaya-dev/ollaya) | 0.10.0 (default), CPU | 0.7.3 is the oldest accepted `runtimeVersion` (verified in spikes 001 and 006, not in CI). |
 | Device `cuda` | Manual only: one T4 GPU on EKS (Bottlerocket), runtime 0.7.3 | No GPU in CI. CUDA on 0.10.0 is not verified yet. |
 | Storage | `ReadWriteOnce` (kind `standard`, local-path) | `ReadWriteMany` for `replicas > 1` across nodes is supported by the code but not tested. |
