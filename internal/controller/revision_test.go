@@ -61,9 +61,9 @@ func TestRevisionHash(t *testing.T) {
 
 	baseline := RevisionHash(baseSpec(), digest, image)
 
-	// The hash must be a stable 10-char hex string.
-	if len(baseline) != 10 {
-		t.Fatalf("expected 10-char hash, got %q (len %d)", baseline, len(baseline))
+	// The hash must be a stable 16-char hex string (64-bit).
+	if len(baseline) != 16 {
+		t.Fatalf("expected 16-char hash, got %q (len %d)", baseline, len(baseline))
 	}
 	for _, r := range baseline {
 		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
@@ -238,7 +238,7 @@ func TestRevisionHashNoSchedulingIsBackwardCompatible(t *testing.T) {
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256(b)
-		return hex.EncodeToString(sum[:])[:10]
+		return hex.EncodeToString(sum[:])[:16]
 	}
 	withEmptyScheduling := baseSpec()
 	withEmptyScheduling.Scheduling = &decisionmodelv1alpha1.SchedulingSpec{
@@ -304,5 +304,61 @@ func TestPlacementRecordAndAdoption(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// New revisions use a 64-bit (16-hex) hash; a revision recorded by an older
+// operator at 40 bits (10-hex) keeps its name and is recognised as the current
+// revision (no fleet roll), because the wider hash is a longer prefix of the same
+// sha256 and legacyRevisionHash recomputes the old width.
+func TestRevisionHashWidthUpgrade(t *testing.T) {
+	const (
+		digest = "cc00000000000000000000000000000000000000000000000000000000000000"
+		image  = "ghcr.io/ollaya-dev/ollaya:0.10.0"
+	)
+	spec := decisionmodelv1alpha1.DecisionModelSpec{Engine: "ollaya", Model: "laya:en", Device: "cpu"}
+
+	modern := RevisionHash(spec, digest, image)
+	if len(modern) != 16 {
+		t.Fatalf("new revision hash width = %d, want 16", len(modern))
+	}
+	legacy := legacyRevisionHash(spec, digest, image)
+	if len(legacy) != 10 {
+		t.Fatalf("legacy revision hash width = %d, want 10", len(legacy))
+	}
+	// The 16-hex hash is a prefix-extension of the old 10-hex hash for the same
+	// spec, so an operator upgrade recomputing the hash recognises the old name.
+	if modern[:10] != legacy {
+		t.Errorf("16-hex hash %q does not extend the 10-hex hash %q", modern, legacy)
+	}
+
+	// A stable recorded at the legacy width + the current spec must be recognised
+	// as the current revision: adoptLegacyStable matches on the legacy hash, and
+	// sameIdentity matches on the recorded fields regardless of hash width.
+	stable := &decisionmodelv1alpha1.RevisionStatus{
+		Hash: legacy, Engine: "ollaya", Model: "laya:en", Digest: digest, Device: "cpu", Image: image,
+	}
+	want := &decisionmodelv1alpha1.RevisionStatus{
+		Hash: modern, Engine: "ollaya", Model: "laya:en", Digest: digest, Device: "cpu", Image: image,
+		Placement: placementRecord(spec.Scheduling),
+	}
+	adoptLegacyStable(stable, want, legacy)
+	if stable.Hash != legacy {
+		t.Errorf("adoption changed the stable hash name to %q; it must keep its legacy name", stable.Hash)
+	}
+	if stable.Placement != want.Placement {
+		t.Errorf("adoption did not backfill placement: got %q, want %q", stable.Placement, want.Placement)
+	}
+	if !sameIdentity(stable, want) {
+		t.Error("a legacy-width stable of the same spec must be recognised as the current revision (no fleet roll)")
+	}
+
+	// revisionHashFromStatus recomputes at the recorded width, so verification
+	// works for both a legacy and a modern recorded revision.
+	if got := revisionHashFromStatus(stable); got != legacy {
+		t.Errorf("revisionHashFromStatus(legacy) = %q, want %q", got, legacy)
+	}
+	if got := revisionHashFromStatus(want); got != modern {
+		t.Errorf("revisionHashFromStatus(modern) = %q, want %q", got, modern)
 	}
 }

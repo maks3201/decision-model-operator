@@ -56,7 +56,7 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 	}
 	markJobComplete := func(name, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime, job.Status.CompletionTime = &now, &now
 		job.Status.Conditions = []batchv1.JobCondition{

@@ -463,7 +463,7 @@ var _ = Describe("DecisionModel Controller", func() {
 	markJob := func(dmName, rev string, condType batchv1.JobConditionType) {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: dmName + "-prefetch-" + rev,
+			Namespace: namespace, Name: jobName(dmName, rev),
 		}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
@@ -562,7 +562,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1-store-" + rev}, pvc)).To(Succeed())
 
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("s1", rev)}, job)).To(Succeed())
 
 		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching))
 		Expect(meta.IsStatusConditionTrue(dm.Status.Conditions, decisionmodelv1alpha1.ConditionResolved)).To(BeTrue())
@@ -585,7 +585,7 @@ var _ = Describe("DecisionModel Controller", func() {
 
 		rev := revOf(getDM("s1b"))
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1b-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("s1b", rev)}, job)).To(Succeed())
 		Expect(job.Spec.Template.Spec.NodeSelector).To(Equal(sched.NodeSelector))
 		Expect(job.Spec.Template.Spec.Tolerations).To(Equal(sched.Tolerations))
 		// Shared SELinux level (store relabel on SELinux-enforcing nodes).
@@ -968,7 +968,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		// Reconcile again: the failed revision's Job must NOT be recreated.
 		reconcileOnce(r, "t3")
 		job := &batchv1.Job{}
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "t3-prefetch-" + rev}, job)
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("t3", rev)}, job)
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "failed revision Job must not be recreated")
 
 		// Change the model -> new revision -> proceeds (new Job created).
@@ -982,7 +982,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		rev2 := RevisionHash(getDM("t3").Spec, digest2, fakeImage)
 		Expect(rev2).NotTo(Equal(rev))
 		newJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "t3-prefetch-" + rev2}, newJob)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("t3", rev2)}, newJob)).To(Succeed())
 	})
 
 	// Caching longer than cacheTimeout with no stable -> CacheTimeout Failed.
@@ -1407,7 +1407,7 @@ var _ = Describe("DecisionModel Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "nsmode2-store-" + rev}, pvc)).To(Succeed())
 			job := &batchv1.Job{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: namespace, Name: "nsmode2-prefetch-" + rev,
+				Namespace: namespace, Name: jobName("nsmode2", rev),
 			}, job)).To(Succeed())
 			Expect(getDM("nsmode2").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching))
 		})

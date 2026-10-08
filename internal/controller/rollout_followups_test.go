@@ -118,7 +118,7 @@ var _ = Describe("rollout follow-ups", func() {
 	}
 	markJobComplete := func(dmName, rev string) error {
 		job := &batchv1.Job{}
-		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job); err != nil {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job); err != nil {
 			return err
 		}
 		now := metav1.Now()

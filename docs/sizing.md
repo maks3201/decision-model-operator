@@ -6,10 +6,13 @@ spikes [001](spikes/001-ollaya-container.md) and
 
 All figures are **CPU / F32**, measured under OrbStack on Apple Silicon. GPU
 (`device: cuda`) and F16 are **unverified** — no GPU on the test hosts. The
-Ollaya runtime image used is `ghcr.io/ollaya-dev/ollaya:0.10.0` (the figures were
+Ollaya runtime image used is `ghcr.io/ollaya-dev/ollaya:0.12.0` (the operator
+pins this default by its multi-arch index digest in the rendered Pod specs, so a
+re-pushed tag cannot change the running bytes; the figures were
 measured on 0.7.3 and re-checked on 0.10.0 in
-[spike 006](spikes/006-ollaya-0.10.md); `laya:en` was 3139 MiB on 0.10.0, within
-the same request).
+[spike 006](spikes/006-ollaya-0.10.md) and on 0.12.0 in
+[spike 008](spikes/008-ollaya-0.12.md); `laya:en` was 3139 MiB on 0.10.0 and
+~3.08 GiB on 0.12.0, within the same request — sizing unchanged across the bump).
 
 ## Measured per model
 
@@ -18,7 +21,8 @@ loaded and pinned (`keep_alive:-1`), read from `/sys/fs/cgroup/memory.stat`
 inside the container — not `docker stats`, which also counts the page cache left
 by the pull and over-reports by ~0.8–1.7 GiB. Re-measured **2026-10-02**
 (ghcr.io/ollaya-dev/ollaya:0.7.3, OrbStack arm64, F32 / cpu confirmed via
-`/api/ps`); verified on 0.10.0 in spike 006 (sizing unchanged). `jevk5:latest`
+`/api/ps`); verified on 0.10.0 in spike 006 and on 0.12.0 in spike 008 (sizing
+unchanged). `jevk5:latest`
 (the first GGUF model) was measured on 0.10.0, CPU / Q8_0, in
 [spike 007](spikes/007-gguf-models.md).
 
@@ -34,7 +38,7 @@ Reproduce (host with Docker; the image has no curl, so port-map and call from th
 host):
 
 ```sh
-docker run -d --name m -p 127.0.0.1:11435:11435 ghcr.io/ollaya-dev/ollaya:0.10.0 serve
+docker run -d --name m -p 127.0.0.1:11435:11435 ghcr.io/ollaya-dev/ollaya:0.12.0 serve
 docker exec m ollaya pull laya:en
 curl -sS -X POST localhost:11435/api/decide -d '{"model":"laya:en","keep_alive":-1}'
 curl -sS localhost:11435/api/ps                       # confirm device cpu, precision F32

@@ -671,7 +671,8 @@ type DecisionModelStatus struct {
 //
 // metadata.name must be a DNS-1035 label of at most 43 characters (see
 // MaxNameLength): the operator derives a Service named after it (no dots) and
-// Job/PVC names that must stay within 63 characters.
+// Job/PVC names that must stay within 63 characters (a new revision's 16-hex hash
+// uses the short <dm>-pf-<hash> Job name so the worst case still fits 63).
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must be a DNS-1035 label: lowercase letters, digits and '-', starting with a letter and ending with a letter or digit (no dots)"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 43",message="metadata.name must be at most 43 characters (derived Job and PVC names must fit in 63)"
 // +operator-sdk:csv:customresourcedefinitions:displayName="Decision Model",resources={{Deployment,v1,""},{Service,v1,""},{Job,v1,""},{PersistentVolumeClaim,v1,""},{PodDisruptionBudget,v1,""}}

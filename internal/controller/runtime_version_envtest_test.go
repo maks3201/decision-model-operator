@@ -74,7 +74,7 @@ var _ = Describe("runtime version and rollout budget", func() {
 
 	markJob := func(name, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.CompletionTime = &now
@@ -298,7 +298,7 @@ var _ = Describe("runtime version and rollout budget", func() {
 
 		revB := RevisionHash(getDM("q-b").Spec, defaultDigest, fakeImage)
 		pvcB := types.NamespacedName{Namespace: namespace, Name: "q-b-store-" + revB}
-		jobB := types.NamespacedName{Namespace: namespace, Name: "q-b-prefetch-" + revB}
+		jobB := types.NamespacedName{Namespace: namespace, Name: jobName("q-b", revB)}
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, pvcB, &corev1.PersistentVolumeClaim{}))).
 			To(BeTrue(), "queued rollout provisions no store PVC")
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, jobB, &batchv1.Job{}))).

@@ -292,7 +292,7 @@ var _ = Describe("security guards", func() {
 		rev := RevisionHash(getDM("dt1").Spec, defaultDigest, fakeImage)
 		job := &batchv1.Job{}
 		err = k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: "dt1-prefetch-" + rev,
+			Namespace: namespace, Name: jobName("dt1", rev),
 		}, job)
 		Expect(err).To(HaveOccurred(), "no Job should exist")
 	})
@@ -327,7 +327,7 @@ var _ = Describe("security guards", func() {
 		// Check the Job: must have OLLAYA_HF_TOKEN env var referencing the Secret.
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: "dt2-prefetch-" + rev,
+			Namespace: namespace, Name: jobName("dt2", rev),
 		}, job)).To(Succeed())
 		jobEnv := job.Spec.Template.Spec.Containers[0].Env
 		found := false
@@ -434,7 +434,7 @@ var _ = Describe("security guards", func() {
 		rev := RevisionHash(getDM("dt4").Spec, defaultDigest, fakeImage)
 		job := &batchv1.Job{}
 		err = k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: "dt4-prefetch-" + rev,
+			Namespace: namespace, Name: jobName("dt4", rev),
 		}, job)
 		Expect(err).To(HaveOccurred(), "no Job should exist")
 	})
@@ -472,7 +472,7 @@ var _ = Describe("security guards", func() {
 		rev := RevisionHash(getDM("dt5").Spec, defaultDigest, fakeImage)
 		job := &batchv1.Job{}
 		gerr := k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: "dt5-prefetch-" + rev,
+			Namespace: namespace, Name: jobName("dt5", rev),
 		}, job)
 		Expect(gerr).To(HaveOccurred(), "no Job should exist")
 	})
@@ -667,7 +667,7 @@ func createReadyPodSG(ctx context.Context, ns, dmName, rev string) {
 // markPrefetchFailed sets the prefetch Job for a revision to Failed.
 func markPrefetchFailed(ctx context.Context, ns, dmName, rev string) {
 	job := &batchv1.Job{}
-	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: jobName(dmName, rev)}, job)).To(Succeed())
 	now := metav1.Now()
 	job.Status.StartTime = &now
 	job.Status.Conditions = []batchv1.JobCondition{
@@ -680,7 +680,7 @@ func markPrefetchFailed(ctx context.Context, ns, dmName, rev string) {
 // markPrefetchComplete sets the prefetch Job for a revision to Complete.
 func markPrefetchComplete(ctx context.Context, ns, dmName, rev string) {
 	job := &batchv1.Job{}
-	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: jobName(dmName, rev)}, job)).To(Succeed())
 	now := metav1.Now()
 	job.Status.StartTime = &now
 	job.Status.CompletionTime = &now

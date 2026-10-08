@@ -91,7 +91,8 @@ DecisionModel is the Schema for the decisionmodels API.
 
 metadata.name must be a DNS-1035 label of at most 43 characters (see
 MaxNameLength): the operator derives a Service named after it (no dots) and
-Job/PVC names that must stay within 63 characters.
+Job/PVC names that must stay within 63 characters (a new revision's 16-hex hash
+uses the short <dm>-pf-<hash> Job name so the worst case still fits 63).
 
 
 

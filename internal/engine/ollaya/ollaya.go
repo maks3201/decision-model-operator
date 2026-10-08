@@ -292,6 +292,9 @@ var _ engine.RegistryHoster = (*Engine)(nil)
 // Compile-time check that Engine implements the optional RuntimeVersioner capability.
 var _ engine.RuntimeVersioner = (*Engine)(nil)
 
+// Compile-time check that Engine implements the optional RuntimeImagePinner capability.
+var _ engine.RuntimeImagePinner = (*Engine)(nil)
+
 // Name returns the engine name.
 func (e *Engine) Name() string { return engineName }
 
@@ -971,12 +974,15 @@ func setAuth(req *http.Request, apiKey string) {
 
 // Runtime version defaults. The ghcr tags are plain MAJOR.MINOR.PATCH (no "v").
 // DefaultImageCPU/CUDA are derived from DefaultRuntimeVersion so a version bump
-// touches one place. 0.10.0 is drop-in compatible with the 0.7.3 facts in spike
-// 001, re-verified in spike 006.
+// touches one place. 0.12.0 is drop-in compatible with the 0.10.0 facts in spike
+// 006 (re-verified in spike 008: serve, RO store, pull, sha256(manifest)==/api/ps
+// digest, warmup, /v1/systemone shape, prefetch classification, upgrade path and
+// the device gate are all unchanged; the only additive /api/ps field,
+// context_length, is not read by Inspect).
 const (
 	// DefaultRuntimeVersion is the Ollaya release this operator build defaults to
 	// when a DecisionModel pins no version and sets no explicit image.
-	DefaultRuntimeVersion = "0.10.0"
+	DefaultRuntimeVersion = "0.12.0"
 	// MinRuntimeVersion is the oldest release we have verified; older versions are
 	// rejected by ValidateRuntimeVersion.
 	MinRuntimeVersion = "0.7.3"
@@ -984,12 +990,78 @@ const (
 	imageRepo = "ghcr.io/ollaya-dev/ollaya"
 )
 
-// Exported runtime image defaults, derived from DefaultRuntimeVersion.
+// runtimeImageDigest holds the multi-arch OCI image index digests for a runtime
+// version's CPU and CUDA images. The index digest (not a per-arch manifest) is
+// used so amd64 and arm64 nodes both resolve the same reference. A tag plus this
+// digest (repo:tag@sha256:...) pins the exact bytes: if upstream re-pushes the
+// tag, the digest no longer matches and the pull fails loudly instead of running
+// different bytes under one revision hash.
+type runtimeImageDigest struct {
+	// cpu is the sha256 of the CPU image's OCI index (empty if unknown).
+	cpu string
+	// cuda is the sha256 of the -cuda image's OCI index (empty if unknown).
+	cuda string
+}
+
+// runtimeImageDigests pins the engine's known runtime versions to their image
+// index digests. Only versions listed here render by digest; a version absent
+// from the map (e.g. a user runtimeVersion newer than this build's table) renders
+// by tag, and RuntimeImagePinned reports false for it so the controller can refuse
+// it unless unpinned runtime images are explicitly allowed.
+//
+// Digests captured with `docker buildx imagetools inspect ghcr.io/ollaya-dev/ollaya:<tag>`
+// (the top-level "Digest:" of the OCI image index), 2026-10-07:
+//
+//	0.7.3        index sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9  (linux/amd64 + linux/arm64)
+//	0.7.3-cuda   index sha256:b35eedf0c0464455240820a32f755f58d53e68e99c0007c75c8c60fb2309c8d6  (linux/amd64 only)
+//	0.10.0       index sha256:13fd0aad32f60cc2e5e7bb8007eed51194052dd75a066bf87f5dfbece4edbaa8  (linux/amd64 + linux/arm64)
+//	0.10.0-cuda  index sha256:1e4d7708405b1c28e46bb7c2d79bebb250c05131bc899fc0bff54008d2f22938  (linux/amd64 only)
+//	0.11.0       index sha256:5f96bc111bf6ca2af9691c0a33a6d04c61e16c4918fb002850f212cbc998de60  (linux/amd64 + linux/arm64)
+//	0.11.0-cuda  index sha256:239045853b01fc919a33f5206b51c0e3a4d8a744bed3f94998a650589561baec  (linux/amd64 only)
+//	0.12.0       index sha256:f79e865fda7af45aa66617b85fe16b08688d27f83a3137a21c75d3b137d8cf39  (linux/amd64 + linux/arm64)
+//	0.12.0-cuda  index sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7  (linux/amd64 only)
+var runtimeImageDigests = map[string]runtimeImageDigest{
+	"0.7.3": {
+		cpu:  "sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9",
+		cuda: "sha256:b35eedf0c0464455240820a32f755f58d53e68e99c0007c75c8c60fb2309c8d6",
+	},
+	"0.10.0": {
+		cpu:  "sha256:13fd0aad32f60cc2e5e7bb8007eed51194052dd75a066bf87f5dfbece4edbaa8",
+		cuda: "sha256:1e4d7708405b1c28e46bb7c2d79bebb250c05131bc899fc0bff54008d2f22938",
+	},
+	"0.11.0": {
+		cpu:  "sha256:5f96bc111bf6ca2af9691c0a33a6d04c61e16c4918fb002850f212cbc998de60",
+		cuda: "sha256:239045853b01fc919a33f5206b51c0e3a4d8a744bed3f94998a650589561baec",
+	},
+	"0.12.0": {
+		cpu:  "sha256:f79e865fda7af45aa66617b85fe16b08688d27f83a3137a21c75d3b137d8cf39",
+		cuda: "sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7",
+	},
+}
+
+// digestForVersion returns the known index digest for a version and device, or
+// "" when the version is not in runtimeImageDigests (or the device's digest is
+// unset).
+func digestForVersion(version, device string) string {
+	d, ok := runtimeImageDigests[version]
+	if !ok {
+		return ""
+	}
+	if device == engine.DeviceCUDA {
+		return d.cuda
+	}
+	return d.cpu
+}
+
+// Exported runtime image defaults, derived from DefaultRuntimeVersion and pinned
+// by the index digest from runtimeImageDigests (so the default always resolves to
+// fixed bytes). If a future DefaultRuntimeVersion is set without a digest entry,
+// these fall back to the bare tag and TestDefaultImagesArePinned fails to catch it.
 var (
-	// DefaultImageCPU is the CPU serving/prefetch image.
-	DefaultImageCPU = imageRepo + ":" + DefaultRuntimeVersion
-	// DefaultImageCUDA is the CUDA serving image (still amd64-only).
-	DefaultImageCUDA = imageRepo + ":" + DefaultRuntimeVersion + "-cuda"
+	// DefaultImageCPU is the CPU serving/prefetch image (digest-pinned).
+	DefaultImageCPU = imageForVersion(DefaultRuntimeVersion, engine.DeviceCPU)
+	// DefaultImageCUDA is the CUDA serving image (digest-pinned; still amd64-only).
+	DefaultImageCUDA = imageForVersion(DefaultRuntimeVersion, engine.DeviceCUDA)
 )
 
 // runtimeVersionRE matches a plain MAJOR.MINOR.PATCH version (no "v" prefix, no
@@ -1073,17 +1145,24 @@ func ResolvedRuntimeVersion(p engine.Params) string {
 // invalid version falls back to DefaultRuntimeVersion (defence in depth: the
 // controller validates with ValidateRuntimeVersion before building specs, but a
 // spec-building method cannot return an error, so it must never emit a malformed
-// tag).
+// tag). When the (resolved) version has a known index digest it is appended as
+// repo:tag@sha256:... so the reference is immutable; otherwise the bare tag is
+// returned and RuntimeImagePinned reports false for it.
 func imageForVersion(version, device string) string {
 	if ValidateRuntimeVersion(version) != nil {
 		version = DefaultRuntimeVersion
 	} else if version == "" {
 		version = DefaultRuntimeVersion
 	}
+	tag := version
 	if device == engine.DeviceCUDA {
-		return imageRepo + ":" + version + "-cuda"
+		tag += "-cuda"
 	}
-	return imageRepo + ":" + version
+	ref := imageRepo + ":" + tag
+	if digest := digestForVersion(version, device); digest != "" {
+		ref += "@" + digest
+	}
+	return ref
 }
 
 // DefaultRuntimeVersion implements engine.RuntimeVersioner: the release used when
@@ -1109,6 +1188,23 @@ func (e *Engine) CompareRuntimeVersions(a, b string) int {
 	return compareVersions(a, b)
 }
 
+// RuntimeImagePinned implements engine.RuntimeImagePinner: it reports whether the
+// image this engine renders for a version ("" = the engine default) and device is
+// pinned by an immutable digest. True only when the resolved version has a known
+// index digest in runtimeImageDigests for the device, i.e. exactly when
+// imageForVersion appends @sha256:... . A user spec.image is never rendered by
+// this engine (the controller handles --allow-image-override separately), so this
+// method only speaks to engine-rendered images.
+func (e *Engine) RuntimeImagePinned(version, device string) bool {
+	v := version
+	if v == "" || ValidateRuntimeVersion(v) != nil {
+		// Empty or invalid renders as the default (defence in depth); report the
+		// default's pinned-ness so the two agree.
+		v = DefaultRuntimeVersion
+	}
+	return digestForVersion(v, device) != ""
+}
+
 // comparableVersion reports whether v is a concrete, orderable runtime version:
 // a well-formed MAJOR.MINOR.PATCH string that is not below the minimum. The empty
 // "use the default" sentinel and any malformed or below-minimum string are not
@@ -1118,16 +1214,21 @@ func comparableVersion(v string) bool {
 }
 
 // RuntimeVersionFromImage implements engine.RuntimeVersioner: it extracts the
-// MAJOR.MINOR.PATCH release from one of the engine's default image tags
-// (ghcr.io/ollaya-dev/ollaya:<v> or :<v>-cuda). Anything else — a different
-// repository, a digest-only reference, or a mirror of the image under another
-// registry — returns "" (the version is then unknown).
+// MAJOR.MINOR.PATCH release from one of the engine's default image references
+// (ghcr.io/ollaya-dev/ollaya:<v>, :<v>-cuda, optionally pinned with
+// @sha256:<digest>). Anything else — a different repository, a digest-only
+// reference, or a mirror of the image under another registry — returns "" (the
+// version is then unknown).
 func (e *Engine) RuntimeVersionFromImage(image string) string {
 	prefix := imageRepo + ":"
 	if !strings.HasPrefix(image, prefix) {
 		return ""
 	}
 	tag := strings.TrimPrefix(image, prefix)
+	// Drop a pinned digest (repo:tag@sha256:...) before parsing the tag.
+	if i := strings.IndexByte(tag, '@'); i >= 0 {
+		tag = tag[:i]
+	}
 	tag = strings.TrimSuffix(tag, "-cuda")
 	if ValidateRuntimeVersion(tag) != nil {
 		return ""
@@ -1217,6 +1318,59 @@ func downloadTokenEnv(p engine.Params) *corev1.EnvVar {
 	}
 }
 
+// threadsSupportVersion is the first Ollaya release that reads OLLAYA_THREADS
+// (spike 008 §2: shipped in 0.11.0). Older runtimes ignore the env, so setting
+// it would only churn their Pod template on an operator upgrade for no effect.
+const threadsSupportVersion = "0.11.0"
+
+// supportsThreadsEnv reports whether the runtime these Params will run supports
+// OLLAYA_THREADS. The version must be known AND at least threadsSupportVersion:
+//   - a user-set spec.image is an unknown version -> false (never set the env,
+//     the image may be any release or a fork);
+//   - an empty RuntimeVersion resolves to the engine default;
+//   - otherwise the recorded/explicit RuntimeVersion is compared.
+//
+// Gating on the version keeps a recorded 0.10.0 stable rendering byte-identical
+// to the pre-OLLAYA_THREADS output, so an operator upgrade does not restart it.
+func supportsThreadsEnv(p engine.Params) bool {
+	if p.Image != "" {
+		return false
+	}
+	v := resolvedRuntimeVersion(p)
+	if !comparableVersion(v) {
+		return false
+	}
+	return compareVersions(v, threadsSupportVersion) >= 0
+}
+
+// ollayaThreadsEnv returns an OLLAYA_THREADS env var set to floor(cpu limit) when
+// the user set a CPU limit on the serving container AND the runtime supports the
+// env (>= 0.11.0, see supportsThreadsEnv), or nil otherwise.
+// Pinning the runtime's worker threads to the container's CPU limit measurably
+// lowers and tightens inference latency on the ONNX models (spike 008 §2: ~20%
+// lower median on laya:en, flat memory) and is expected to help the GGUF/llama.cpp
+// runner more. It is a serving-only env (the prefetch Job does not run inference),
+// derived from resources.limits.cpu — already a revision-hash input — so it adds
+// no new hash dimension: a Pod template with OLLAYA_THREADS appears only for a DM
+// that set a CPU limit, which the user already controls. No limit, an older
+// runtime, or a user-set image -> unset -> the runtime's own default.
+func ollayaThreadsEnv(p engine.Params) *corev1.EnvVar {
+	if !supportsThreadsEnv(p) {
+		return nil
+	}
+	lim, ok := p.Resources.Limits[corev1.ResourceCPU]
+	if !ok {
+		return nil
+	}
+	// floor of the CPU quantity in whole cores; at least 1. MilliValue()/1000
+	// floors (e.g. "1500m" -> 1, "2" -> 2, "500m" -> 0 -> clamped to 1).
+	cores := lim.MilliValue() / 1000
+	if cores < 1 {
+		cores = 1
+	}
+	return &corev1.EnvVar{Name: "OLLAYA_THREADS", Value: strconv.FormatInt(cores, 10)}
+}
+
 // ServingPodSpec returns the PodSpec for serving Pods. The model store is
 // mounted read-only at /models; a writable emptyDir backs /home/ollaya/.ollaya.
 func (e *Engine) ServingPodSpec(p engine.Params) corev1.PodSpec {
@@ -1227,6 +1381,9 @@ func (e *Engine) ServingPodSpec(p engine.Params) corev1.PodSpec {
 		// §6: OLLAYA_KEEP_ALIVE accepts a negative value ("-1") to keep a model
 		// loaded until the server stops; Warmup also pins via the API.
 		{Name: "OLLAYA_KEEP_ALIVE", Value: "-1"},
+	}
+	if te := ollayaThreadsEnv(p); te != nil {
+		env = append(env, *te)
 	}
 	if ake := apiKeyEnv(p); ake != nil {
 		env = append(env, *ake)

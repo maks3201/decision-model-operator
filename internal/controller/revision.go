@@ -46,8 +46,28 @@ type revisionInputs struct {
 	Placement string                      `json:"placement,omitempty"`
 }
 
-// hashInputs returns the first 10 hex chars of the sha256 over the canonical JSON.
+// revisionHashWidth is the number of hex chars in a new revision hash (64 bits).
+// Earlier operator versions used legacyRevisionHashWidth (40 bits); a revision
+// recorded with the old width keeps its name — the two share a prefix because
+// the wider hash is a longer prefix of the same sha256, so recognising a legacy
+// revision is just a width-10 comparison (legacyRevisionHash / recomputeHashWidth).
+const (
+	revisionHashWidth       = 16
+	legacyRevisionHashWidth = 10
+)
+
+// hashInputs returns the first revisionHashWidth hex chars of the sha256 over the
+// canonical JSON (new revisions). A revision recorded at legacyRevisionHashWidth
+// is still recognised by legacyRevisionHash, which hashes the same bytes to the
+// old width (the two share a prefix).
 func hashInputs(in revisionInputs) string {
+	return hashInputsWidth(in, revisionHashWidth)
+}
+
+// hashInputsWidth hashes the canonical JSON of in and returns the first width hex
+// chars. The sha256 is independent of width, so a wider hash is a longer prefix
+// of a narrower one for the same inputs.
+func hashInputsWidth(in revisionInputs, width int) string {
 	// json.Marshal of a struct is deterministic: fields are emitted in declaration
 	// order and map keys (inside ResourceRequirements) are sorted. The inputs are
 	// plain data types that always marshal; an error is a programming error.
@@ -56,7 +76,7 @@ func hashInputs(in revisionInputs) string {
 		panic(err)
 	}
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])[:10]
+	return hex.EncodeToString(sum[:])[:width]
 }
 
 // placementHash is the short hash of a SchedulingSpec, or "" when it carries no
@@ -121,28 +141,36 @@ func RevisionHash(spec decisionmodelv1alpha1.DecisionModelSpec, resolvedDigest s
 }
 
 // legacyRevisionHash is RevisionHash as computed before placement became a
-// revision input. It is only used to recognise a stable revision that was created
-// by an earlier operator version (see adoptLegacyStable).
+// revision input AND at the earlier 40-bit width. It is only used to recognise a
+// stable revision that was created by an earlier operator version (see
+// adoptLegacyStable). The width is legacyRevisionHashWidth so it matches the
+// 10-hex name such a stable was recorded under.
 func legacyRevisionHash(spec decisionmodelv1alpha1.DecisionModelSpec, resolvedDigest string, image string) string {
-	return hashInputs(revisionInputs{
+	return hashInputsWidth(revisionInputs{
 		Engine:    spec.Engine,
 		Model:     spec.Model,
 		Digest:    resolvedDigest,
 		Device:    spec.Device,
 		Image:     image,
 		Resources: spec.Resources,
-	})
+	}, legacyRevisionHashWidth)
 }
 
 // revisionHashFromStatus recomputes the revision hash from a recorded
 // RevisionStatus, using the same inputs as RevisionHash. It lets the controller
-// verify a rendered Pod still hashes to that revision. Returns "" for a
-// nil revision.
+// verify a rendered Pod still hashes to that revision. The width matches the
+// recorded hash (legacyRevisionHashWidth for a revision recorded by an older
+// operator, revisionHashWidth otherwise), so verification works for both widths.
+// Returns "" for a nil revision.
 func revisionHashFromStatus(rev *decisionmodelv1alpha1.RevisionStatus) string {
 	if rev == nil {
 		return ""
 	}
-	return hashInputs(revisionInputs{
+	width := revisionHashWidth
+	if len(rev.Hash) == legacyRevisionHashWidth {
+		width = legacyRevisionHashWidth
+	}
+	return hashInputsWidth(revisionInputs{
 		Engine:    rev.Engine,
 		Model:     rev.Model,
 		Digest:    rev.Digest,
@@ -150,7 +178,7 @@ func revisionHashFromStatus(rev *decisionmodelv1alpha1.RevisionStatus) string {
 		Image:     rev.Image,
 		Resources: rev.Resources,
 		Placement: placementInput(rev.Placement),
-	})
+	}, width)
 }
 
 // sameIdentity reports whether a recorded revision is the revision that the

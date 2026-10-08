@@ -177,7 +177,7 @@ var _ = Describe("Eval-gated rollout", func() {
 	markJobComplete := func(dmName, rev string) {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: dmName + "-prefetch-" + rev,
+			Namespace: namespace, Name: jobName(dmName, rev),
 		}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now

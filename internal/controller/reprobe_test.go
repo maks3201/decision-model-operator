@@ -74,7 +74,7 @@ var _ = Describe("restart re-probe", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rp"}, dm)).To(Succeed())
 		rev := RevisionHash(dm.Spec, defaultDigest, fakeImage)
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rp-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("rp", rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime, job.Status.CompletionTime = &now, &now
 		job.Status.Conditions = []batchv1.JobCondition{

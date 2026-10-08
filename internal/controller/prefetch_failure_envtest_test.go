@@ -65,7 +65,7 @@ var _ = Describe("prefetch failure classification", func() {
 	// the given message.
 	failPrefetch := func(name, rev, termMsg string, exit int32) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.Conditions = []batchv1.JobCondition{
@@ -77,11 +77,11 @@ var _ = Describe("prefetch failure classification", func() {
 		yes := true
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: namespace, Name: name + "-prefetch-" + rev + "-abc",
+				Namespace: namespace, Name: jobName(name, rev) + "-abc",
 				Labels: map[string]string{
 					decisionmodelv1alpha1.LabelName:             name,
 					decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-					"job-name": name + "-prefetch-" + rev,
+					"job-name": jobName(name, rev),
 				},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
@@ -164,11 +164,11 @@ var _ = Describe("prefetch failure classification", func() {
 		mkPod := func(name, rev, suffix, msg string, exit int32, ownerUID types.UID) {
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace, Name: name + "-prefetch-" + rev + "-" + suffix,
+					Namespace: namespace, Name: jobName(name, rev) + "-" + suffix,
 					Labels: map[string]string{
 						decisionmodelv1alpha1.LabelName:             name,
 						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-						"job-name": name + "-prefetch-" + rev,
+						"job-name": jobName(name, rev),
 					},
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
@@ -176,7 +176,7 @@ var _ = Describe("prefetch failure classification", func() {
 			if ownerUID != "" {
 				yes := true
 				pod.OwnerReferences = []metav1.OwnerReference{{
-					APIVersion: "batch/v1", Kind: "Job", Name: name + "-prefetch-" + rev,
+					APIVersion: "batch/v1", Kind: "Job", Name: jobName(name, rev),
 					UID: ownerUID, Controller: &yes, BlockOwnerDeletion: &yes,
 				}}
 			}
@@ -210,7 +210,7 @@ var _ = Describe("prefetch failure classification", func() {
 			rec(r, name) // resolve + create prefetch Job
 			rev = RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
 			job = &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 			Expect(job.UID).NotTo(BeEmpty())
 		})
 
@@ -247,15 +247,15 @@ var _ = Describe("prefetch failure classification", func() {
 			mkPod(name, rev, "old", "old reason", 1, job.UID)
 			// Create the second owned Pod with a strictly later start time.
 			old := &corev1.Pod{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev + "-old"}, old)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev) + "-old"}, old)).To(Succeed())
 			yes := true
 			newPod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace, Name: name + "-prefetch-" + rev + "-new",
+					Namespace: namespace, Name: jobName(name, rev) + "-new",
 					Labels: map[string]string{
 						decisionmodelv1alpha1.LabelName:             name,
 						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-						"job-name": name + "-prefetch-" + rev,
+						"job-name": jobName(name, rev),
 					},
 					OwnerReferences: []metav1.OwnerReference{{
 						APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
