@@ -1570,8 +1570,17 @@ if [ -n "${MANIFEST_SEED_B64:-}" ]; then
   if [ -z "${EXPECT_DIGEST:-}" ] || [ -z "${MANIFEST_PATH:-}" ]; then
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
   fi
-  seed_tmp="$(mktemp)"
-  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+  # Write the temp file inside the writable store mount, next to its destination,
+  # so (a) it never touches the read-only root filesystem (/tmp is RO on the
+  # serving/prefetch container) and (b) the final mv is a rename on the same
+  # filesystem, i.e. atomic. A ".seed." prefix keeps it out of the prune's
+  # revision-hash match (hex-only) and off any tag path. Clean up a stale temp a
+  # previous crashed run may have left before creating a new one.
+  seed_dir="$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
+  mkdir -p "$seed_dir"
+  rm -f "$seed_dir"/.seed.* 2>/dev/null || true
+  seed_tmp="$(mktemp "$seed_dir/.seed.XXXXXX")"
+  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -f "$seed_tmp"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
   seed_digest="$(sha256sum "$seed_tmp" | cut -d' ' -f1)"
   if [ "$seed_digest" != "$EXPECT_DIGEST" ]; then
     echo "seed manifest digest $seed_digest != expected $EXPECT_DIGEST; refusing to write" >&2
@@ -1580,7 +1589,6 @@ if [ -n "${MANIFEST_SEED_B64:-}" ]; then
     want_short="$(printf '%s' "$EXPECT_DIGEST" | cut -c1-12)"
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + ` "recorded $want_short, seed $seed_short"
   fi
-  mkdir -p "$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
   mv "$seed_tmp" "$OLLAYA_MODELS/$MANIFEST_PATH"
   echo "seeded manifest for $seed_digest at $MANIFEST_PATH"
 fi
