@@ -183,29 +183,37 @@ func TestSameIdentity(t *testing.T) {
 		return r
 	}
 	tests := []struct {
-		name string
-		a, b *decisionmodelv1alpha1.RevisionStatus
-		want bool
+		name           string
+		a, b           *decisionmodelv1alpha1.RevisionStatus
+		engineRendered bool
+		want           bool
 	}{
-		{"equal", base(), base(), true},
-		{"hash name is ignored (adopted legacy keeps its name)", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Hash = "old" }), base(), true},
-		{"precision is not identity", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Precision = "F16" }), base(), true},
+		{"equal", base(), base(), true, true},
+		{"hash name is ignored (adopted legacy keeps its name)", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Hash = "old" }), base(), true, true},
+		{"precision is not identity", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Precision = "F16" }), base(), true, true},
 		{"equivalent quantities", mut(func(r *decisionmodelv1alpha1.RevisionStatus) {
 			r.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1024Mi")
-		}), base(), true},
-		{"model", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Model = "kev:en" }), base(), false},
-		{"digest", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Digest = "x" }), base(), false},
-		{"device", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Device = "cuda" }), base(), false},
-		{"image", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "x" }), base(), false},
-		{"placement", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Placement = "abc" }), base(), false},
+		}), base(), true, true},
+		{"model", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Model = "kev:en" }), base(), true, false},
+		{"digest", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Digest = "x" }), base(), true, false},
+		{"device", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Device = "cuda" }), base(), true, false},
+		{"image", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "x" }), base(), true, false},
+		{"placement", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Placement = "abc" }), base(), true, false},
 		{"resources", mut(func(r *decisionmodelv1alpha1.RevisionStatus) {
 			r.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
-		}), base(), false},
-		{"nil", nil, base(), false},
+		}), base(), true, false},
+		{"nil", nil, base(), true, false},
+		// Engine-rendered: tag-only recorded vs same tag digest-pinned collapses.
+		{"engine-rendered tag vs same-tag pin", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0" }),
+			mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0@sha256:abc" }), true, true},
+		// User override (engineRendered=false): the same pair must NOT collapse —
+		// the user pinned, a new revision must start.
+		{"user override tag vs same-tag pin does not collapse", mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0" }),
+			mut(func(r *decisionmodelv1alpha1.RevisionStatus) { r.Image = "repo:1.0@sha256:abc" }), false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sameIdentity(tt.a, tt.b); got != tt.want {
+			if got := sameIdentity(tt.a, tt.b, tt.engineRendered); got != tt.want {
 				t.Errorf("sameIdentity = %v, want %v", got, tt.want)
 			}
 		})
@@ -254,7 +262,7 @@ var _ = Describe("in-place updates", func() {
 	}
 	markJob := func(dmName, rev string, failed bool) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		if failed {
@@ -453,7 +461,7 @@ var _ = Describe("in-place updates", func() {
 			newRev := dm.Status.CandidateRevision.Hash
 			Expect(newRev).NotTo(Equal(h1))
 			Expect(dm.Status.CandidateRevision.Placement).NotTo(Equal(dm.Status.StableRevision.Placement))
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "up2-prefetch-" + newRev}, &batchv1.Job{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("up2", newRev)}, &batchv1.Job{})).To(Succeed())
 			stable := getDep("up2", h1)
 			Expect(stable.ResourceVersion).To(Equal(stableRV), "the running stable is not touched")
 			Expect(stable.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{"pool": "gpu"}))
@@ -481,15 +489,32 @@ var _ = Describe("in-place updates", func() {
 			r := newR()
 			newDM("up4", nil)
 			rev := stableNow(r, "up4", fakeImage)
-			// Make the stable look like one recorded by an older operator.
+			// Make the stable look like one recorded by an older operator (no
+			// recorded placement). Its hash is modern here (16-hex), but the
+			// adoption path keys on placement=="" + the recorded fields, so the
+			// invariant under test — no candidate is started on the first reconcile
+			// after an upgrade — holds regardless of width.
 			Expect(updateDMStatus(ctx, namespace, "up4", func(d *decisionmodelv1alpha1.DecisionModel) {
 				d.Status.StableRevision.Placement = ""
 			})).To(Succeed())
 			rec(r, "up4")
 			dm := getDM("up4")
-			Expect(dm.Status.CandidateRevision).To(BeNil())
-			Expect(dm.Status.StableRevision.Hash).To(Equal(rev))
-			Expect(dm.Status.StableRevision.Placement).To(Equal(placementNone))
+			Expect(dm.Status.CandidateRevision).To(BeNil(), "no candidate after the upgrade")
+			Expect(dm.Status.StableRevision.Hash).To(Equal(rev), "the stable keeps its recorded hash")
+
+			// A real spec change now starts a candidate with a 16-hex (64-bit) hash.
+			Expect(updateDM(ctx, namespace, "up4", func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = "kev:en"
+			})).To(Succeed())
+			rec(r, "up4")
+			cand := getDM("up4").Status.CandidateRevision
+			Expect(cand).NotTo(BeNil(), "a spec change starts a candidate")
+			Expect(cand.Hash).To(HaveLen(16), "new revisions use the 16-hex hash")
+			// The 16-hex candidate's prefetch Job uses the short "-pf-" name.
+			Expect(prefetchName(getDM("up4"), cand.Hash)).To(HavePrefix("up4-pf-"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: namespace, Name: jobName("up4", cand.Hash)}, &batchv1.Job{})).
+				To(Succeed(), "the 16-hex candidate's prefetch Job exists under its -pf- name")
 		})
 	})
 

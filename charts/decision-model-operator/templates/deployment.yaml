@@ -53,6 +53,9 @@ spec:
             {{- if .Values.manager.allowImageOverride }}
             - --allow-image-override
             {{- end }}
+            {{- if .Values.manager.allowUnpinnedRuntimeImages }}
+            - --allow-unpinned-runtime-images
+            {{- end }}
             {{- with .Values.manager.maxConcurrentReconciles }}
             - --max-concurrent-reconciles={{ . }}
             {{- end }}

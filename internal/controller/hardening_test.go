@@ -52,9 +52,10 @@ func TestDerivedNamesForMaxLengthDM(t *testing.T) {
 	}
 	spec := decisionmodelv1alpha1.DecisionModelSpec{Engine: "ollaya", Model: "laya:en", Device: "cpu"}
 	rev := RevisionHash(spec, defaultDigest, fakeImage)
-	if len(rev) != 10 {
-		t.Fatalf("revision hash length = %d, want 10 (MaxNameLength assumes 10)", len(rev))
+	if len(rev) != 16 {
+		t.Fatalf("revision hash length = %d, want 16 (MaxNameLength assumes 16)", len(rev))
 	}
+	legacyRev := legacyRevisionHash(spec, defaultDigest, fakeImage) // 10-hex, old revisions
 
 	dm := dmFor(decisionmodelv1alpha1.MaxNameLength)
 	tests := []struct {
@@ -64,12 +65,17 @@ func TestDerivedNamesForMaxLengthDM(t *testing.T) {
 	}{
 		{"service", dm.Name, validation.IsDNS1035Label},
 		{"deployment", revisionName(dm, rev), validation.IsDNS1123Label},
-		{"prefetch job", prefetchName(dm, rev), validation.IsDNS1123Label},
-		{"store pvc", storeNameRev(dm, rev), validation.IsDNS1123Label},
-		{"legacy store pvc", storeName(dm), validation.IsDNS1123Label},
+		{"prefetch job (16-hex, -pf-)", prefetchName(dm, rev), validation.IsDNS1123Label},
+		{"prefetch job (10-hex, -prefetch-)", prefetchName(dm, legacyRev), validation.IsDNS1123Label},
+		// PVC names are DNS-1123 subdomains (<= 253), not labels; a 16-hex store
+		// name is 66 chars, which is valid for a PVC (only the prefetch Job name is
+		// bound by the 63-char job-name label).
+		{"store pvc", storeNameRev(dm, rev), validation.IsDNS1123Subdomain},
+		{"legacy store pvc", storeName(dm), validation.IsDNS1123Subdomain},
 		{"pdb", pdbName(dm, rev), validation.IsDNS1123Label},
 		{"name label value", dm.Name, validation.IsValidLabelValue},
-		{"job-name label value", prefetchName(dm, rev), validation.IsValidLabelValue},
+		{"job-name label value (16-hex)", prefetchName(dm, rev), validation.IsValidLabelValue},
+		{"job-name label value (10-hex)", prefetchName(dm, legacyRev), validation.IsValidLabelValue},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -79,9 +85,19 @@ func TestDerivedNamesForMaxLengthDM(t *testing.T) {
 		})
 	}
 
-	// MaxNameLength is tight: one more character overflows the prefetch Job name.
+	// Both prefetch Job name forms are exactly at the 63-char job-name limit for a
+	// MaxNameLength DM, and one more character overflows either form.
+	if n := len(prefetchName(dm, rev)); n != 63 {
+		t.Errorf("16-hex prefetch name is %d chars, want 63 (tight)", n)
+	}
+	if n := len(prefetchName(dm, legacyRev)); n != 63 {
+		t.Errorf("10-hex prefetch name is %d chars, want 63 (tight)", n)
+	}
 	if got := prefetchName(dmFor(decisionmodelv1alpha1.MaxNameLength+1), rev); len(got) <= 63 {
-		t.Errorf("prefetch name for MaxNameLength+1 is %d chars; MaxNameLength is not tight", len(got))
+		t.Errorf("16-hex prefetch name for MaxNameLength+1 is %d chars; not tight", len(got))
+	}
+	if got := prefetchName(dmFor(decisionmodelv1alpha1.MaxNameLength+1), legacyRev); len(got) <= 63 {
+		t.Errorf("10-hex prefetch name for MaxNameLength+1 is %d chars; not tight", len(got))
 	}
 }
 
@@ -390,7 +406,7 @@ var _ = Describe("hardening", func() {
 
 	markJobComplete := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.CompletionTime = &now
@@ -459,7 +475,7 @@ var _ = Describe("hardening", func() {
 			reconcileOnce(r, "rc1")
 			rev := RevisionHash(getDM("rc1").Spec, defaultDigest, fakeImage)
 			job := &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rc1-prefetch-" + rev}, job)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("rc1", rev)}, job)).To(Succeed())
 			Expect(job.Spec.Template.Spec.RuntimeClassName).To(BeNil(), "prefetch Job needs no GPU runtime")
 
 			markJobComplete("rc1", rev)
@@ -489,7 +505,7 @@ var _ = Describe("hardening", func() {
 			Expect(dm.Status.StableRevision.Hash).To(Equal(rev), "the stable keeps serving")
 			Expect(dm.Status.CandidateRevision).NotTo(BeNil())
 			Expect(dm.Status.CandidateRevision.Hash).To(Equal(newRev))
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rc1-prefetch-" + newRev}, &batchv1.Job{})).
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("rc1", newRev)}, &batchv1.Job{})).
 				To(Succeed(), "the candidate gets its own prefetch Job")
 			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
 			Expect(dep.ResourceVersion).To(Equal(stableDepRV), "the running stable Deployment is not touched")
@@ -506,7 +522,7 @@ var _ = Describe("hardening", func() {
 			reconcileOnce(r, "px1")
 			rev := RevisionHash(getDM("px1").Spec, defaultDigest, fakeImage)
 			job := &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "px1-prefetch-" + rev}, job)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("px1", rev)}, job)).To(Succeed())
 			Expect(job.Spec.Template.Spec.Containers[0].Env).To(ContainElement(
 				corev1.EnvVar{Name: "HTTPS_PROXY", Value: "http://proxy.corp:3128"}))
 

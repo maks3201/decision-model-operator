@@ -91,6 +91,114 @@ func TestServingPodSpecCPUEnv(t *testing.T) {
 	if _, ok := env["OLLAYA_API_KEY"]; ok {
 		t.Errorf("OLLAYA_API_KEY must be absent when APIKey is nil")
 	}
+	// No CPU limit on baseParams -> OLLAYA_THREADS unset (runtime default).
+	if _, ok := env["OLLAYA_THREADS"]; ok {
+		t.Errorf("OLLAYA_THREADS must be unset when no CPU limit is set")
+	}
+}
+
+func TestServingPodSpecOllayaThreadsFromCPULimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit string
+		want  string // "" means the env must be absent
+	}{
+		{"whole cores", "4", "4"},
+		{"fractional rounds down", "1500m", "1"},
+		{"two cores exact", "2", "2"},
+		{"sub-core clamps to 1", "500m", "1"},
+		{"large", "16", "16"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := baseParams()
+			// baseParams has an empty RuntimeVersion, which resolves to the
+			// engine default (>= 0.11.0, supports OLLAYA_THREADS).
+			p.Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(tt.limit)}
+			env := envMap(New().ServingPodSpec(p).Containers[0].Env)
+			if env["OLLAYA_THREADS"].Value != tt.want {
+				t.Errorf("OLLAYA_THREADS = %q, want %q (cpu limit %s)", env["OLLAYA_THREADS"].Value, tt.want, tt.limit)
+			}
+		})
+	}
+}
+
+// TestServingPodSpecOllayaThreadsVersionGate: OLLAYA_THREADS (added in 0.11.0)
+// is set only when the runtime version is known AND supports it. A recorded
+// pre-0.11.0 stable, or a user-set spec.image of unknown version, must not gain
+// the env on an operator upgrade — otherwise every such stable with a CPU limit
+// rolls for no behavioural reason.
+func TestServingPodSpecOllayaThreadsVersionGate(t *testing.T) {
+	tests := []struct {
+		name           string
+		runtimeVersion string
+		image          string
+		wantSet        bool
+	}{
+		{"default (empty) sets it", "", "", true},
+		{"0.12.0 sets it", "0.12.0", "", true},
+		{"0.11.0 (first supporting) sets it", "0.11.0", "", true},
+		{"0.10.0 does not set it", "0.10.0", "", false},
+		{"0.7.3 does not set it", "0.7.3", "", false},
+		{"user image (unknown version) does not set it", "", "example.com/custom:tag", false},
+		{"user image wins over a known version", "0.12.0", "example.com/custom:tag", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := baseParams()
+			p.RuntimeVersion = tt.runtimeVersion
+			p.Image = tt.image
+			p.Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}
+			env := envMap(New().ServingPodSpec(p).Containers[0].Env)
+			_, got := env["OLLAYA_THREADS"]
+			if got != tt.wantSet {
+				t.Errorf("OLLAYA_THREADS present = %v, want %v (version %q image %q)",
+					got, tt.wantSet, tt.runtimeVersion, tt.image)
+			}
+			if tt.wantSet && env["OLLAYA_THREADS"].Value != "4" {
+				t.Errorf("OLLAYA_THREADS = %q, want %q", env["OLLAYA_THREADS"].Value, "4")
+			}
+		})
+	}
+}
+
+// TestServingPodSpecPre011StableUnchanged pins that a recorded pre-0.11.0 stable
+// (here 0.10.0) with a CPU limit renders with exactly the env set it had before
+// OLLAYA_THREADS was introduced: the four base vars and nothing else. This is the
+// golden that proves an operator upgrade does not restart such a stable.
+func TestServingPodSpecPre011StableUnchanged(t *testing.T) {
+	p := baseParams()
+	p.RuntimeVersion = "0.10.0"
+	p.Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}
+	env := envMap(New().ServingPodSpec(p).Containers[0].Env)
+
+	want := map[string]string{
+		"OLLAYA_HOST":       "0.0.0.0:11435",
+		"OLLAYA_MODELS":     modelsMount,
+		"OLLAYA_DEVICE":     "cpu",
+		"OLLAYA_KEEP_ALIVE": "-1",
+	}
+	if len(env) != len(want) {
+		t.Fatalf("env has %d vars %v, want exactly %d %v", len(env), env, len(want), want)
+	}
+	for k, v := range want {
+		if env[k].Value != v {
+			t.Errorf("%s = %q, want %q", k, env[k].Value, v)
+		}
+	}
+}
+
+// TestPrefetchHasNoOllayaThreads: the prefetch Job runs `ollaya pull` (download,
+// no inference), so OLLAYA_THREADS is a serving-only env and must never appear on
+// the Job even when the (serving) resources carry a CPU limit.
+func TestPrefetchHasNoOllayaThreads(t *testing.T) {
+	p := baseParams()
+	p.Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}
+	for _, e := range New().PrefetchJobSpec(p).Template.Spec.Containers[0].Env {
+		if e.Name == "OLLAYA_THREADS" {
+			t.Errorf("prefetch Job must not set OLLAYA_THREADS")
+		}
+	}
 }
 
 func TestServingPodSpecProbes(t *testing.T) {

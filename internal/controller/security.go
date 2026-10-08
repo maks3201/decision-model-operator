@@ -112,7 +112,13 @@ func (r *DecisionModelReconciler) guardSecurity(
 			Message: message,
 		})
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseFailed)
-		res, err := r.finish(ctx, dm, ctrl.Result{}, nil)
+		// Abandon any in-flight candidate (persist-then-act): a first rollout that
+		// is refused mid-flight by a security guard must not keep holding its
+		// Deployment/Job/PVC and a rollout-budget slot. On a conflicting/failed
+		// write this requeues with a nil error so the next reconcile retries;
+		// only on a durable write is the TerminalError returned (the violation is
+		// permanent and must not be retried by the workqueue).
+		res, err := r.abandonCandidateThenFinish(ctx, dm, ctrl.Result{}, nil)
 		if err != nil {
 			// Status write failed (e.g. conflict) — let the caller requeue.
 			return res, err, true

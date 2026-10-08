@@ -91,11 +91,12 @@ const (
 )
 
 // MaxNameLength is the longest metadata.name a DecisionModel may have. The
-// operator derives Service (<dm>), Job (<dm>-prefetch-<rev>), PVC
-// (<dm>-store-<rev>), Deployment/PDB (<dm>-<rev>) names and the
-// decisionmodel.io/name label value from it; the longest is the prefetch Job,
-// which must stay within 63 chars (the job-name Pod label): 63 - len("-prefetch-")
-// (10) - len(revision hash) (10) = 43. The CEL rule on DecisionModel repeats this
+// operator derives Service (<dm>), Job (<dm>-prefetch-<rev> or <dm>-pf-<rev>),
+// PVC (<dm>-store-<rev>), Deployment/PDB (<dm>-<rev>) names and the
+// decisionmodel.io/name label value from it; the binding limit is the prefetch
+// Job name (a job-name Pod label value, <= 63). A new revision's 16-hex hash uses
+// the short "-pf-" prefix (43 + 4 + 16 = 63); a legacy 10-hex revision keeps
+// "-prefetch-" (43 + 10 + 10 = 63). The CEL rule on DecisionModel repeats this
 // number as a literal (markers cannot reference constants); a unit test and an
 // envtest keep the two in sync.
 const MaxNameLength = 43

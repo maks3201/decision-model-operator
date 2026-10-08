@@ -78,7 +78,7 @@ var _ = Describe("GPU usability", func() {
 
 	getJob := func(dmName, rev string) *batchv1.Job {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		return job
 	}
 
@@ -134,12 +134,15 @@ var _ = Describe("GPU usability", func() {
 		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
 	}
 
-	// cudaRev computes the revision hash for a cuda DM. The resolved serving
-	// image is always the engine's CUDA default (spec.image override does not
-	// flow into the serving image via paramsFor), so the revision hash uses
-	// fakeImageCUDA regardless of spec.image.
+	// cudaRev computes the revision hash for a cuda DM. The serving image is the
+	// engine's CUDA default, unless the user set spec.image, which is now the
+	// serving image verbatim and feeds the revision hash.
 	cudaRev := func(dm *decisionmodelv1alpha1.DecisionModel) string {
-		return RevisionHash(dm.Spec, defaultDigest, fakeImageCUDA)
+		img := fakeImageCUDA
+		if dm.Spec.Image != "" {
+			img = dm.Spec.Image
+		}
+		return RevisionHash(dm.Spec, defaultDigest, img)
 	}
 
 	hasToleration := func(spec corev1.PodSpec, key string) bool {
@@ -182,14 +185,16 @@ var _ = Describe("GPU usability", func() {
 		})
 
 		It("prefetches with spec.image when the user overrides it", func() {
-			const override = "registry.example.com/ollaya:pinned"
+			const override = "registry.example.com/ollaya:pinned@sha256:" +
+				"1111111111111111111111111111111111111111111111111111111111111111"
 			eng := newFakeEngine()
 			r := newReconciler(eng, &fakeProber{})
 			createDM("p2", func(dm *decisionmodelv1alpha1.DecisionModel) {
 				dm.Spec.Device = "cuda"
 				dm.Spec.Image = override
 			})
-			// spec.image requires the operator to allow overrides.
+			// spec.image requires the operator to allow overrides. The image is
+			// pinned by digest, so the runtime-image pinning gate admits it.
 			r.AllowImageOverride = true
 
 			reconcileOnce(r, "p2")

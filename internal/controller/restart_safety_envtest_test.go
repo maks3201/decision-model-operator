@@ -67,7 +67,7 @@ var _ = Describe("restart safety", func() {
 	}
 	failJob := func(name, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.Conditions = []batchv1.JobCondition{
@@ -77,7 +77,7 @@ var _ = Describe("restart safety", func() {
 		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 	}
 	jobExists := func(name, rev string) bool {
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, &batchv1.Job{})
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, &batchv1.Job{})
 		return err == nil
 	}
 

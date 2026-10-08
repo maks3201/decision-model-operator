@@ -65,7 +65,7 @@ var _ = Describe("prefetch failure classification", func() {
 	// the given message.
 	failPrefetch := func(name, rev, termMsg string, exit int32) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.Conditions = []batchv1.JobCondition{
@@ -77,11 +77,11 @@ var _ = Describe("prefetch failure classification", func() {
 		yes := true
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: namespace, Name: name + "-prefetch-" + rev + "-abc",
+				Namespace: namespace, Name: jobName(name, rev) + "-abc",
 				Labels: map[string]string{
 					decisionmodelv1alpha1.LabelName:             name,
 					decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-					"job-name": name + "-prefetch-" + rev,
+					"job-name": jobName(name, rev),
 				},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,
@@ -155,6 +155,43 @@ var _ = Describe("prefetch failure classification", func() {
 		Entry("transient", "connection reset by peer", "Transient"),
 	)
 
+	// A moved upstream tag is a permanent prefetch failure: the recorded digest
+	// no longer matches what the registry serves and re-pulling the tag cannot
+	// fix a pinned revision. The termination message carries both short digests
+	// (recorded vs. the one the registry now serves); the controller passes the
+	// classifier detail through to the PrefetchFailed condition, the Event and
+	// status.failedRevision.message, so a user sees exactly what moved.
+	It("candidate path surfaces UpstreamTagMoved with both short digests", func() {
+		name := "moved"
+		r := newR()
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+			},
+		})).To(Succeed())
+		rec(r, name)
+		rev := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		// The engine's prefetch container writes the classification plus both
+		// short digests to the termination message (reason line + detail line).
+		termMsg := "reason: UpstreamTagMoved\ntag moved upstream: recorded aaaaaaaaaaaa, registry now serves bbbbbbbbbbbb"
+		failPrefetch(name, rev, termMsg, 5)
+		rec(r, name)
+
+		dm := getDM(name)
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseFailed))
+		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg).NotTo(BeNil())
+		Expect(deg.Reason).To(Equal(reasonPrefetchFailed), "condition reason stays PrefetchFailed")
+		Expect(deg.Message).To(ContainSubstring("UpstreamTagMoved"))
+		Expect(deg.Message).To(ContainSubstring("permanent"))
+		Expect(deg.Message).To(ContainSubstring("aaaaaaaaaaaa"), "recorded short digest surfaced")
+		Expect(deg.Message).To(ContainSubstring("bbbbbbbbbbbb"), "registry short digest surfaced")
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("UpstreamTagMoved"))
+		Expect(drainHas(r, "UpstreamTagMoved")).To(BeTrue(), "the Event names the classified reason")
+	})
+
 	// newestFailedPrefetchTermination trusts the current prefetch Job's UID, not
 	// the labels (which anyone with Pod create rights can set). A Pod is read only
 	// when its controller OwnerReference is that Job.
@@ -164,11 +201,11 @@ var _ = Describe("prefetch failure classification", func() {
 		mkPod := func(name, rev, suffix, msg string, exit int32, ownerUID types.UID) {
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace, Name: name + "-prefetch-" + rev + "-" + suffix,
+					Namespace: namespace, Name: jobName(name, rev) + "-" + suffix,
 					Labels: map[string]string{
 						decisionmodelv1alpha1.LabelName:             name,
 						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-						"job-name": name + "-prefetch-" + rev,
+						"job-name": jobName(name, rev),
 					},
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "prefetch", Image: fakeImage}}},
@@ -176,7 +213,7 @@ var _ = Describe("prefetch failure classification", func() {
 			if ownerUID != "" {
 				yes := true
 				pod.OwnerReferences = []metav1.OwnerReference{{
-					APIVersion: "batch/v1", Kind: "Job", Name: name + "-prefetch-" + rev,
+					APIVersion: "batch/v1", Kind: "Job", Name: jobName(name, rev),
 					UID: ownerUID, Controller: &yes, BlockOwnerDeletion: &yes,
 				}}
 			}
@@ -210,7 +247,7 @@ var _ = Describe("prefetch failure classification", func() {
 			rec(r, name) // resolve + create prefetch Job
 			rev = RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
 			job = &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev}, job)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job)).To(Succeed())
 			Expect(job.UID).NotTo(BeEmpty())
 		})
 
@@ -247,15 +284,15 @@ var _ = Describe("prefetch failure classification", func() {
 			mkPod(name, rev, "old", "old reason", 1, job.UID)
 			// Create the second owned Pod with a strictly later start time.
 			old := &corev1.Pod{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-prefetch-" + rev + "-old"}, old)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev) + "-old"}, old)).To(Succeed())
 			yes := true
 			newPod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace, Name: name + "-prefetch-" + rev + "-new",
+					Namespace: namespace, Name: jobName(name, rev) + "-new",
 					Labels: map[string]string{
 						decisionmodelv1alpha1.LabelName:             name,
 						decisionmodelv1alpha1.LabelPrefetchRevision: rev,
-						"job-name": name + "-prefetch-" + rev,
+						"job-name": jobName(name, rev),
 					},
 					OwnerReferences: []metav1.OwnerReference{{
 						APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID,

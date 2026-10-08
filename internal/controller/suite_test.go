@@ -222,6 +222,13 @@ type safeClock struct {
 
 func newSafeClock() *safeClock { return &safeClock{t: time.Now()} }
 
+// jobName is the prefetch Job name for a DM name + revision in tests. It mirrors
+// prefetchName so a test looks a Job up by the same name the controller created
+// it under (short "-pf-" prefix for 16-hex revisions, "-prefetch-" for 10-hex).
+func jobName(dmName, rev string) string {
+	return prefetchName(&decisionmodelv1alpha1.DecisionModel{ObjectMeta: metav1.ObjectMeta{Name: dmName}}, rev)
+}
+
 func (c *safeClock) now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()

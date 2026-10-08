@@ -86,7 +86,7 @@ var _ = Describe("hygiene", func() {
 	}
 	markJobComplete := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.CompletionTime = &now
@@ -98,7 +98,7 @@ var _ = Describe("hygiene", func() {
 	}
 	markJobFailed := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.Conditions = []batchv1.JobCondition{
@@ -242,7 +242,7 @@ var _ = Describe("hygiene", func() {
 		Expect(deg.Status).To(Equal(metav1.ConditionTrue))
 
 		job := &batchv1.Job{}
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "h4-prefetch-" + rev2}, job)
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("h4", rev2)}, job)
 		Expect(err).To(HaveOccurred(), "failed revision Job must not be recreated")
 	})
 })

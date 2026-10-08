@@ -357,7 +357,11 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	}
 
 	// No Job present (PVC exists, recovery active): create a fresh prefetch.
-	_, done, failed, perr := r.ensurePrefetchJob(ctx, dm, eng, r.stableParams(ctx, dm, stable, claim), stable.Hash)
+	// Seed the recorded manifest so recovery rebuilds exactly the pinned digest
+	// (the tag may have moved since this revision was promoted); a missing
+	// manifest falls back to pull-by-tag + verify.
+	recoveryParams := r.seedManifest(ctx, dm, r.stableParams(ctx, dm, stable, claim), stable.Hash, stable.Digest)
+	_, done, failed, perr := r.ensurePrefetchJob(ctx, dm, eng, recoveryParams, stable.Hash)
 	if perr != nil {
 		res, ferr := r.finish(ctx, dm, ctrl.Result{}, perr)
 		return res, ferr

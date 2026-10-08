@@ -124,6 +124,10 @@
           "type": "boolean",
           "description": "--allow-image-override: permit spec.image to override the engine default image."
         },
+        "allowUnpinnedRuntimeImages": {
+          "type": "boolean",
+          "description": "--allow-unpinned-runtime-images: permit a candidate whose runtime image is a mutable tag (a runtimeVersion this build has no digest for). The operator default image is always digest-pinned regardless."
+        },
         "maxConcurrentReconciles": {
           "type": "integer",
           "minimum": 1,

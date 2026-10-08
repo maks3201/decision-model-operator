@@ -94,7 +94,7 @@ var _ = Describe("ownership and store recovery", func() {
 	}
 	markJob := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.CompletionTime = &now
@@ -271,7 +271,7 @@ var _ = Describe("ownership and store recovery", func() {
 		// The PVC was recreated and a fresh prefetch Job exists for the stable rev.
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: storePVC},
 			&corev1.PersistentVolumeClaim{})).To(Succeed(), "store PVC recreated")
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "lost-prefetch-" + rev},
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("lost", rev)},
 			&batchv1.Job{})).To(Succeed(), "prefetch re-run for the recovered store")
 	})
 
@@ -464,7 +464,7 @@ var _ = Describe("ensure* conflict and legacy recovery", func() {
 		Expect(handled).To(BeTrue())
 		// Mark the fresh prefetch Job complete.
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rec-prefetch-r1"}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("rec", "r1")}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime, job.Status.CompletionTime = &now, &now
 		job.Status.Conditions = []batchv1.JobCondition{

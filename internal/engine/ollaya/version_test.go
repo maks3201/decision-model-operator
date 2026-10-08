@@ -18,6 +18,7 @@ package ollaya
 
 import (
 	"errors"
+	"regexp"
 	"testing"
 
 	"github.com/maks3201/decision-model-operator/internal/engine"
@@ -30,7 +31,7 @@ func TestValidateRuntimeVersion(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty is default (valid)", "", false},
-		{"default version", "0.10.0", false},
+		{"default version", "0.12.0", false},
 		{"minimum version", "0.7.3", false},
 		{"newer version", "1.2.3", false},
 		{"patch above minimum", "0.7.4", false},
@@ -65,35 +66,39 @@ func TestValidateRuntimeVersion(t *testing.T) {
 
 func TestImageForParamsVersion(t *testing.T) {
 	const repo = "ghcr.io/ollaya-dev/ollaya"
+	// The default version is digest-pinned; build the expected pinned refs from
+	// the same table the engine uses so the test tracks a digest refresh.
+	wantDefaultCPU := repo + ":" + DefaultRuntimeVersion + "@" + runtimeImageDigests[DefaultRuntimeVersion].cpu
+	wantDefaultCUDA := repo + ":" + DefaultRuntimeVersion + "-cuda@" + runtimeImageDigests[DefaultRuntimeVersion].cuda
 	tests := []struct {
 		name   string
 		params engine.Params
 		want   string
 	}{
 		{
-			name:   "default cpu",
+			name:   "default cpu is digest-pinned",
 			params: engine.Params{Device: engine.DeviceCPU},
-			want:   repo + ":" + DefaultRuntimeVersion,
+			want:   wantDefaultCPU,
 		},
 		{
-			name:   "default cuda",
+			name:   "default cuda is digest-pinned",
 			params: engine.Params{Device: engine.DeviceCUDA},
-			want:   repo + ":" + DefaultRuntimeVersion + "-cuda",
+			want:   wantDefaultCUDA,
 		},
 		{
-			name:   "explicit version cpu",
+			name:   "explicit version without a known digest renders by tag (cpu)",
 			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: "0.9.0"},
 			want:   repo + ":0.9.0",
 		},
 		{
-			name:   "explicit version cuda",
+			name:   "explicit version without a known digest renders by tag (cuda)",
 			params: engine.Params{Device: engine.DeviceCUDA, RuntimeVersion: "0.9.0"},
 			want:   repo + ":0.9.0-cuda",
 		},
 		{
-			name:   "minimum version cpu",
+			name:   "minimum version cpu is digest-pinned",
 			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: MinRuntimeVersion},
-			want:   repo + ":" + MinRuntimeVersion,
+			want:   repo + ":" + MinRuntimeVersion + "@" + runtimeImageDigests[MinRuntimeVersion].cpu,
 		},
 		{
 			name:   "image override wins over version",
@@ -101,14 +106,14 @@ func TestImageForParamsVersion(t *testing.T) {
 			want:   customImage,
 		},
 		{
-			name:   "invalid version falls back to default (defence in depth)",
+			name:   "invalid version falls back to the (pinned) default (defence in depth)",
 			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: "latest"},
-			want:   repo + ":" + DefaultRuntimeVersion,
+			want:   wantDefaultCPU,
 		},
 		{
-			name:   "below-minimum version falls back to default",
+			name:   "below-minimum version falls back to the (pinned) default",
 			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: "0.7.2"},
-			want:   repo + ":" + DefaultRuntimeVersion,
+			want:   wantDefaultCPU,
 		},
 	}
 	for _, tt := range tests {
@@ -162,13 +167,118 @@ func TestResolvedRuntimeVersion(t *testing.T) {
 }
 
 func TestDefaultImagesDerivedFromDefaultVersion(t *testing.T) {
-	wantCPU := "ghcr.io/ollaya-dev/ollaya:" + DefaultRuntimeVersion
-	wantCUDA := wantCPU + "-cuda"
+	// The default images carry the default version's tag AND its index digest.
+	wantCPU := "ghcr.io/ollaya-dev/ollaya:" + DefaultRuntimeVersion + "@" + runtimeImageDigests[DefaultRuntimeVersion].cpu
+	wantCUDA := "ghcr.io/ollaya-dev/ollaya:" + DefaultRuntimeVersion + "-cuda@" + runtimeImageDigests[DefaultRuntimeVersion].cuda
 	if DefaultImageCPU != wantCPU {
 		t.Errorf("DefaultImageCPU = %q, want %q", DefaultImageCPU, wantCPU)
 	}
 	if DefaultImageCUDA != wantCUDA {
 		t.Errorf("DefaultImageCUDA = %q, want %q", DefaultImageCUDA, wantCUDA)
+	}
+}
+
+// TestDefaultImagesArePinned fails if a future DefaultRuntimeVersion is set
+// without a digest entry for it (CPU and CUDA). This guards the invariant that
+// the engine's default runtime image is always rendered by an immutable digest:
+// if someone bumps DefaultRuntimeVersion without adding its index digests to
+// runtimeImageDigests, this test (and TestDefaultImagesDerivedFromDefaultVersion)
+// catches it before the default silently falls back to a mutable tag.
+func TestDefaultImagesArePinned(t *testing.T) {
+	d, ok := runtimeImageDigests[DefaultRuntimeVersion]
+	if !ok {
+		t.Fatalf("DefaultRuntimeVersion %q has no entry in runtimeImageDigests; add its CPU and CUDA index digests", DefaultRuntimeVersion)
+	}
+	if d.cpu == "" {
+		t.Errorf("DefaultRuntimeVersion %q has no CPU index digest", DefaultRuntimeVersion)
+	}
+	if d.cuda == "" {
+		t.Errorf("DefaultRuntimeVersion %q has no CUDA index digest", DefaultRuntimeVersion)
+	}
+	// Digests must be the sha256:<64 hex> form the pull path expects.
+	digestRE := regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	if !digestRE.MatchString(d.cpu) {
+		t.Errorf("CPU digest %q is not sha256:<64 hex>", d.cpu)
+	}
+	if !digestRE.MatchString(d.cuda) {
+		t.Errorf("CUDA digest %q is not sha256:<64 hex>", d.cuda)
+	}
+	e := New()
+	if !e.RuntimeImagePinned("", engine.DeviceCPU) {
+		t.Errorf("RuntimeImagePinned(default, cpu) = false, want true")
+	}
+	if !e.RuntimeImagePinned("", engine.DeviceCUDA) {
+		t.Errorf("RuntimeImagePinned(default, cuda) = false, want true")
+	}
+}
+
+// TestRuntimeImagePinned covers engine.RuntimeImagePinner: the default and any
+// version in the digest table report true; a valid version without a digest, and
+// an invalid version (which renders as the pinned default), report accordingly.
+func TestRuntimeImagePinned(t *testing.T) {
+	e := New()
+	tests := []struct {
+		name    string
+		version string
+		device  string
+		want    bool
+	}{
+		{"default empty cpu", "", engine.DeviceCPU, true},
+		{"default empty cuda", "", engine.DeviceCUDA, true},
+		{"known version cpu", DefaultRuntimeVersion, engine.DeviceCPU, true},
+		{"known version cuda", DefaultRuntimeVersion, engine.DeviceCUDA, true},
+		{"valid version without a digest cpu", "0.9.0", engine.DeviceCPU, false},
+		{"valid version without a digest cuda", "0.9.0", engine.DeviceCUDA, false},
+		{"minimum version is pinned", MinRuntimeVersion, engine.DeviceCPU, true},
+		// Invalid -> renders as the (pinned) default -> pinned.
+		{"invalid version renders as pinned default", "latest", engine.DeviceCPU, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := e.RuntimeImagePinned(tt.version, tt.device); got != tt.want {
+				t.Errorf("RuntimeImagePinned(%q, %q) = %v, want %v", tt.version, tt.device, got, tt.want)
+			}
+		})
+	}
+}
+
+// verifiedVersions are the runtime releases the project documents as verified
+// (spikes 001/006/008) and must therefore render by digest, so a Pinned
+// candidate recorded under any of them is accepted once the controller enforces
+// pinning. They all lie within [MinRuntimeVersion, DefaultRuntimeVersion].
+var verifiedVersions = []string{"0.7.3", "0.10.0", "0.11.0", "0.12.0"}
+
+// TestVerifiedVersionsArePinned asserts that every verified version has both a
+// CPU and a CUDA index digest and that RuntimeImagePinned reports true for both
+// devices. This is the guard the task asks for: a verified version that is left
+// out of runtimeImageDigests (or loses a device digest) fails here, before a
+// Pinned DecisionModel created under it would be refused on upgrade.
+func TestVerifiedVersionsArePinned(t *testing.T) {
+	e := New()
+	digestRE := regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	for _, v := range verifiedVersions {
+		t.Run(v, func(t *testing.T) {
+			// Within the accepted range.
+			if compareVersions(v, MinRuntimeVersion) < 0 || compareVersions(v, DefaultRuntimeVersion) > 0 {
+				t.Fatalf("verified version %q is outside [%s, %s]", v, MinRuntimeVersion, DefaultRuntimeVersion)
+			}
+			d, ok := runtimeImageDigests[v]
+			if !ok {
+				t.Fatalf("verified version %q has no runtimeImageDigests entry", v)
+			}
+			if !digestRE.MatchString(d.cpu) {
+				t.Errorf("verified version %q CPU digest %q is not sha256:<64 hex>", v, d.cpu)
+			}
+			if !digestRE.MatchString(d.cuda) {
+				t.Errorf("verified version %q CUDA digest %q is not sha256:<64 hex>", v, d.cuda)
+			}
+			if !e.RuntimeImagePinned(v, engine.DeviceCPU) {
+				t.Errorf("RuntimeImagePinned(%q, cpu) = false, want true", v)
+			}
+			if !e.RuntimeImagePinned(v, engine.DeviceCUDA) {
+				t.Errorf("RuntimeImagePinned(%q, cuda) = false, want true", v)
+			}
+		})
 	}
 }
 
@@ -224,6 +334,8 @@ func TestRuntimeVersionFromImage(t *testing.T) {
 		{"cpu default tag", "ghcr.io/ollaya-dev/ollaya:0.10.0", "0.10.0"},
 		{"cuda default tag", "ghcr.io/ollaya-dev/ollaya:0.10.0-cuda", "0.10.0"},
 		{"older cpu tag", "ghcr.io/ollaya-dev/ollaya:0.7.3", "0.7.3"},
+		{"digest-pinned cpu", "ghcr.io/ollaya-dev/ollaya:0.12.0@sha256:f79e865fda7af45aa66617b85fe16b08688d27f83a3137a21c75d3b137d8cf39", "0.12.0"},
+		{"digest-pinned cuda", "ghcr.io/ollaya-dev/ollaya:0.12.0-cuda@sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7", "0.12.0"},
 		{"empty image", "", ""},
 		{"other repository", "docker.io/library/ollaya:0.10.0", ""},
 		{"mirror of the image", "mirror.corp/ollaya-dev/ollaya:0.10.0", ""},
@@ -245,7 +357,7 @@ func TestRuntimeVersionFromImage(t *testing.T) {
 // builds round-trips back to the version it was built from.
 func TestRuntimeVersionFromImageRoundTrip(t *testing.T) {
 	e := New()
-	for _, ver := range []string{"0.7.3", "0.10.0", "1.2.3"} {
+	for _, ver := range []string{"0.7.3", "0.10.0", "1.2.3", DefaultRuntimeVersion} {
 		for _, dev := range []string{engine.DeviceCPU, engine.DeviceCUDA} {
 			img := imageForVersion(ver, dev)
 			if got := e.RuntimeVersionFromImage(img); got != ver {

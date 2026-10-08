@@ -405,6 +405,16 @@ type RevisionStatus struct {
 	// +optional
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 
+	// ImagePinned records whether this revision's runtime image is pinned to an
+	// immutable digest. It is set to false only on a revision admitted with a
+	// mutable-tag runtime image because the operator runs with
+	// --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+	// refuses an unpinned candidate, so an admitted revision is pinned). A false
+	// value is a durable record that this revision breaks the
+	// one-revision-hash-one-bytes guarantee.
+	// +optional
+	ImagePinned *bool `json:"imagePinned,omitempty"`
+
 	// Resources are the compute resource requirements of this revision's serving
 	// container.
 	// +optional
@@ -671,7 +681,8 @@ type DecisionModelStatus struct {
 //
 // metadata.name must be a DNS-1035 label of at most 43 characters (see
 // MaxNameLength): the operator derives a Service named after it (no dots) and
-// Job/PVC names that must stay within 63 characters.
+// Job/PVC names that must stay within 63 characters (a new revision's 16-hex hash
+// uses the short <dm>-pf-<hash> Job name so the worst case still fits 63).
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must be a DNS-1035 label: lowercase letters, digits and '-', starting with a letter and ending with a letter or digit (no dots)"
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 43",message="metadata.name must be at most 43 characters (derived Job and PVC names must fit in 63)"
 // +operator-sdk:csv:customresourcedefinitions:displayName="Decision Model",resources={{Deployment,v1,""},{Service,v1,""},{Job,v1,""},{PersistentVolumeClaim,v1,""},{PodDisruptionBudget,v1,""}}

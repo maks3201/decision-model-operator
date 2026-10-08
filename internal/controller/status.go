@@ -54,6 +54,19 @@ type reconcileState struct {
 	// the reconcile and flushed only after a successful status write, so a
 	// conflicting/failed write never double-counts (same rule as Events).
 	metrics []bufferedMetric
+	// resolvedManifest is the raw model manifest from this reconcile's Resolve
+	// (sha256 == the resolved digest), stashed so the manifest-ConfigMap persist
+	// reuses it instead of calling Resolve a second time. Empty when Resolve was
+	// short-circuited (hard-pinned spec.digest, or a digest reused from status) or
+	// the engine returned no manifest.
+	resolvedManifest []byte
+	// abandonedManifestRevs holds revision hashes whose candidate was cleared this
+	// reconcile without being promoted (superseded / abandoned). gcRevisions
+	// deletes their <dm>-manifest-<rev> ConfigMap by name even when no store PVC
+	// exists to key it to (a candidate queued by the rollout budget never got a
+	// PVC). Set before clearing status.candidateRevision; consumed by the GC pass
+	// that runs on the same reconcile.
+	abandonedManifestRevs []string
 }
 
 type bufferedEvent struct {
@@ -92,6 +105,19 @@ func reconcileStateFrom(ctx context.Context) *reconcileState {
 		return v
 	}
 	return nil
+}
+
+// markManifestAbandoned records that a candidate revision was cleared this
+// reconcile without being promoted, so the GC pass deletes its manifest
+// ConfigMap by name even when the revision never got a store PVC to key it to.
+// A no-op when there is no reconcile state (direct unit calls).
+func markManifestAbandoned(ctx context.Context, rev string) {
+	if rev == "" {
+		return
+	}
+	if st := reconcileStateFrom(ctx); st != nil {
+		st.abandonedManifestRevs = append(st.abandonedManifestRevs, rev)
+	}
 }
 
 // finish patches status (observedGeneration + endpoint) with an optimistic-lock

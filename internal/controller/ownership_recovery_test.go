@@ -123,7 +123,7 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		}
 		rec()
 		rev := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
-		markJobComplete(name + "-prefetch-" + rev)
+		markJobComplete(jobName(name, rev))
 		rec()
 		createGatedPod(name, rev, name+"-pod-0")
 		rec() // probe
@@ -264,12 +264,12 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Eventually(func() bool {
 			rec()
 			job := &batchv1.Job{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "lost-rev-prefetch-" + rev}, job); err != nil {
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("lost-rev", rev)}, job); err != nil {
 				return false
 			}
 			return job.Status.CompletionTime == nil
 		}, "3s", "20ms").Should(BeTrue())
-		markJobComplete("lost-rev-prefetch-" + rev)
+		markJobComplete(jobName("lost-rev", rev))
 		rec() // observe Complete -> clear the annotation
 		rec() // annotation gone -> serve
 
@@ -513,7 +513,7 @@ var _ = Describe("foreign Service not Ready; frozen template on terminating stor
 		}
 		rec()
 		rev := RevisionHash(getDM("fsvc").Spec, defaultDigest, fakeImage)
-		markJobComplete("fsvc-prefetch-" + rev)
+		markJobComplete(jobName("fsvc", rev))
 		rec()
 		createGatedPod("fsvc", rev, "fsvc-pod-0")
 		// Drive several reconciles: the candidate is model-ready but must never be

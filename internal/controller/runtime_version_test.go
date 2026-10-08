@@ -145,3 +145,6 @@ func TestValidRuntimeVersionPolicy(t *testing.T) {
 
 // compile-time: fakeEngine implements RuntimeVersioner; bareEngine does not.
 var _ engine.RuntimeVersioner = (*fakeEngine)(nil)
+
+// compile-time: fakeEngine implements RuntimeImagePinner (bareEngine does not).
+var _ engine.RuntimeImagePinner = (*fakeEngine)(nil)

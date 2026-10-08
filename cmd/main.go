@@ -207,6 +207,11 @@ func main() {
 	var allowImageOverride bool
 	flag.BoolVar(&allowImageOverride, "allow-image-override", false,
 		"Permit spec.image to override the engine default image.")
+	var allowUnpinnedRuntimeImages bool
+	flag.BoolVar(&allowUnpinnedRuntimeImages, "allow-unpinned-runtime-images", false,
+		"Permit a candidate whose runtime image is a mutable tag (not pinned to a "+
+			"digest). Default false: such a candidate is refused so one revision "+
+			"hash always means one set of runtime bytes.")
 	var maxConcurrentReconciles int
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 4,
 		"Maximum number of DecisionModels reconciled concurrently.")
@@ -443,15 +448,16 @@ func main() {
 		Engines: map[string]engine.Engine{
 			"ollaya": ollaya.New(ollayaOpts...),
 		},
-		AllowedRegistries:       allowed,
-		AllowInsecureRegistries: allowInsecureRegistries,
-		AllowImageOverride:      allowImageOverride,
-		MaxConcurrentReconciles: maxConcurrentReconciles,
-		RuntimeVersionPolicy:    runtimeVersionPolicy,
-		MaxConcurrentRollouts:   maxConcurrentRollouts,
-		WatchNamespaces:         watchNamespaces,
-		PrefetchProxyEnv:        prefetchProxyEnv,
-		BaseContext:             signalCtx,
+		AllowedRegistries:          allowed,
+		AllowInsecureRegistries:    allowInsecureRegistries,
+		AllowImageOverride:         allowImageOverride,
+		AllowUnpinnedRuntimeImages: allowUnpinnedRuntimeImages,
+		MaxConcurrentReconciles:    maxConcurrentReconciles,
+		RuntimeVersionPolicy:       runtimeVersionPolicy,
+		MaxConcurrentRollouts:      maxConcurrentRollouts,
+		WatchNamespaces:            watchNamespaces,
+		PrefetchProxyEnv:           prefetchProxyEnv,
+		BaseContext:                signalCtx,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DecisionModel")
 		os.Exit(1)

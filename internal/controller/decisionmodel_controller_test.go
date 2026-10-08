@@ -66,6 +66,10 @@ type fakeEngine struct {
 	digest       string
 	resolveErr   error
 	resolveCalls int
+	// manifest, when set, makes Resolve return these bytes as ModelRef.Manifest
+	// and derive the digest from them (sha256). Used by the manifest-persistence
+	// tests; nil keeps the fixed-digest, no-manifest behaviour.
+	manifest []byte
 	// defaultVersion overrides the engine's default runtime version, to simulate
 	// an operator upgrade that ships a newer default (a fresh reconciler with a
 	// new build). Empty means fakeDefaultRuntimeVersion.
@@ -92,6 +96,12 @@ func (f *fakeEngine) Resolve(_ context.Context, name string) (engine.ModelRef, e
 	f.resolveCalls++
 	if f.resolveErr != nil {
 		return engine.ModelRef{}, f.resolveErr
+	}
+	// When a manifest is configured, return it and derive the digest from it so
+	// the controller's sha256(manifest)==digest check holds; otherwise report the
+	// fixed f.digest with no manifest (the pre-manifest behaviour).
+	if f.manifest != nil {
+		return engine.ModelRef{Name: name, Digest: digestOf(f.manifest), Manifest: f.manifest}, nil
 	}
 	return engine.ModelRef{Name: name, Digest: f.digest}, nil
 }
@@ -184,12 +194,35 @@ func (f *fakeEngine) RuntimeVersionFromImage(image string) string {
 	return tag
 }
 
+// fakeUnpinnedRuntimeVersion is a valid-but-unlisted runtime version the fake
+// engine renders by a mutable tag (no digest), mirroring the real engine's
+// behaviour for a version absent from its digest table. A candidate resolving to
+// this version is unpinned. It must not collide with versions other tests use as
+// a plain "valid version" (0.7.3 / 0.8.0 / 0.9.0 / 0.10.0) or as an operator
+// default-bump target (0.11.0).
+const fakeUnpinnedRuntimeVersion = "0.42.0"
+
+// RuntimeImagePinned implements engine.RuntimeImagePinner: the fake pins every
+// version it knows (the default and anything in its validation range) EXCEPT
+// fakeUnpinnedRuntimeVersion, which it renders by a mutable tag — so controller
+// tests can drive both the pinned and the unpinned candidate paths. Empty or
+// invalid resolves to the (pinned) default.
+func (f *fakeEngine) RuntimeImagePinned(version, _ string) bool {
+	v := version
+	if v == "" || f.ValidateRuntimeVersion(v) != nil {
+		v = f.effectiveDefaultVersion()
+	}
+	return v != fakeUnpinnedRuntimeVersion
+}
+
 // ClassifyPrefetchFailure implements engine.PrefetchFailureClassifier: it maps a
 // failed prefetch Pod's termination message to a classified reason, mirroring the
 // real engine's classes. ModelNotFound and DigestMismatch are permanent; anything
 // else (including an unrecognised message) is Transient.
 func (f *fakeEngine) ClassifyPrefetchFailure(terminationMessage string, _ int32) (string, bool) {
 	switch {
+	case strings.Contains(terminationMessage, "UpstreamTagMoved"):
+		return "UpstreamTagMoved", true
 	case strings.Contains(terminationMessage, "ModelNotFound"):
 		return "ModelNotFound", true
 	case strings.Contains(terminationMessage, "DigestMismatch"):
@@ -292,6 +325,13 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	if p.Image != "" {
 		img = p.Image
 	}
+	env := fakeJobEnv(p)
+	// Mirror the real engine's manifest seed: when the controller passes the
+	// persisted manifest bytes, expose their digest as an env var so tests can
+	// assert the recovery/candidate Job was seeded (not left to pull-by-tag).
+	if len(p.Model.Manifest) > 0 {
+		env = append(env, corev1.EnvVar{Name: "MANIFEST_SEED_DIGEST", Value: digestOf(p.Model.Manifest)})
+	}
 	return batchv1.JobSpec{
 		Template: corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
@@ -299,7 +339,7 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 				Containers: []corev1.Container{{
 					Name:  "prefetch",
 					Image: img,
-					Env:   fakeJobEnv(p),
+					Env:   env,
 				}},
 			},
 		},
@@ -463,7 +503,7 @@ var _ = Describe("DecisionModel Controller", func() {
 	markJob := func(dmName, rev string, condType batchv1.JobConditionType) {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: namespace, Name: dmName + "-prefetch-" + rev,
+			Namespace: namespace, Name: jobName(dmName, rev),
 		}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
@@ -562,7 +602,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1-store-" + rev}, pvc)).To(Succeed())
 
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("s1", rev)}, job)).To(Succeed())
 
 		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching))
 		Expect(meta.IsStatusConditionTrue(dm.Status.Conditions, decisionmodelv1alpha1.ConditionResolved)).To(BeTrue())
@@ -585,7 +625,7 @@ var _ = Describe("DecisionModel Controller", func() {
 
 		rev := revOf(getDM("s1b"))
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "s1b-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("s1b", rev)}, job)).To(Succeed())
 		Expect(job.Spec.Template.Spec.NodeSelector).To(Equal(sched.NodeSelector))
 		Expect(job.Spec.Template.Spec.Tolerations).To(Equal(sched.Tolerations))
 		// Shared SELinux level (store relabel on SELinux-enforcing nodes).
@@ -968,7 +1008,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		// Reconcile again: the failed revision's Job must NOT be recreated.
 		reconcileOnce(r, "t3")
 		job := &batchv1.Job{}
-		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "t3-prefetch-" + rev}, job)
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("t3", rev)}, job)
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "failed revision Job must not be recreated")
 
 		// Change the model -> new revision -> proceeds (new Job created).
@@ -982,7 +1022,7 @@ var _ = Describe("DecisionModel Controller", func() {
 		rev2 := RevisionHash(getDM("t3").Spec, digest2, fakeImage)
 		Expect(rev2).NotTo(Equal(rev))
 		newJob := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "t3-prefetch-" + rev2}, newJob)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("t3", rev2)}, newJob)).To(Succeed())
 	})
 
 	// Caching longer than cacheTimeout with no stable -> CacheTimeout Failed.
@@ -1407,7 +1447,7 @@ var _ = Describe("DecisionModel Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "nsmode2-store-" + rev}, pvc)).To(Succeed())
 			job := &batchv1.Job{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: namespace, Name: "nsmode2-prefetch-" + rev,
+				Namespace: namespace, Name: jobName("nsmode2", rev),
 			}, job)).To(Succeed())
 			Expect(getDM("nsmode2").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseCaching))
 		})

@@ -79,7 +79,7 @@ var _ = Describe("eval blip does not promote", func() {
 	}
 	markJob := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime, job.Status.CompletionTime = &now, &now
 		job.Status.Conditions = []batchv1.JobCondition{

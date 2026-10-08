@@ -72,6 +72,8 @@ manager:
   allowInsecureRegistries: false
   # -- `--allow-image-override`: permit `spec.image` to override the engine default image (lets DM editors run arbitrary images; keep false in multi-tenant).
   allowImageOverride: false
+  # -- `--allow-unpinned-runtime-images`: permit a candidate whose runtime image is a mutable tag (a `spec.runtimeVersion` this operator build has no digest for). Keep false so one revision hash always means one set of runtime bytes; the operator's own default image is always digest-pinned regardless.
+  allowUnpinnedRuntimeImages: false
   # -- `--max-concurrent-reconciles`: max DecisionModels reconciled concurrently.
   maxConcurrentReconciles: 4
   # -- `--ollaya-registry`: default registry base URL for host-less model names. Empty = the operator default (`OLLAYA_REGISTRY` env, else `https://ollaya.dev`); not rendered when empty.

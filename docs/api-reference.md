@@ -91,7 +91,8 @@ DecisionModel is the Schema for the decisionmodels API.
 
 metadata.name must be a DNS-1035 label of at most 43 characters (see
 MaxNameLength): the operator derives a Service named after it (no dots) and
-Job/PVC names that must stay within 63 characters.
+Job/PVC names that must stay within 63 characters (a new revision's 16-hex hash
+uses the short <dm>-pf-<hash> Job name so the worst case still fits 63).
 
 
 
@@ -343,6 +344,7 @@ _Appears in:_
 | `device` _string_ | Device is the target device for this revision. |  |  |
 | `image` _string_ | Image is the resolved serving container image for this revision. |  | Optional: \{\} <br /> |
 | `runtimeVersion` _string_ | RuntimeVersion is the resolved engine runtime version for this revision<br />(e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the<br />version is then unknown. Recorded so a stable revision keeps its runtime<br />version across operator upgrades under --runtime-version-policy=Pinned. |  | Optional: \{\} <br /> |
+| `imagePinned` _boolean_ | ImagePinned records whether this revision's runtime image is pinned to an<br />immutable digest. It is set to false only on a revision admitted with a<br />mutable-tag runtime image because the operator runs with<br />--allow-unpinned-runtime-images; otherwise it is nil (the default policy<br />refuses an unpinned candidate, so an admitted revision is pinned). A false<br />value is a durable record that this revision breaks the<br />one-revision-hash-one-bytes guarantee. |  | Optional: \{\} <br /> |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#resourcerequirements-v1-core)_ | Resources are the compute resource requirements of this revision's serving<br />container. |  | Optional: \{\} <br /> |
 | `precision` _string_ | Precision is the quantization level reported by the engine (e.g. F32, F16). |  |  |
 | `placement` _string_ | Placement is a short hash of spec.scheduling (nodeSelector, tolerations,<br />affinity, runtimeClassName) as it was when this revision was created, or<br />"none" when no scheduling was set. Empty only on a revision recorded by an<br />older operator version, which the controller adopts on its first reconcile.<br />Placement is part of a revision's identity: a change of scheduling starts a<br />new revision (blue-green, own store) instead of rolling the running<br />Deployment in place. A hash is recorded, not the spec, because Affinity is a<br />very large schema and this type appears three times in the CRD. |  | Optional: \{\} <br /> |

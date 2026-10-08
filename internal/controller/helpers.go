@@ -72,9 +72,10 @@ func storeName(dm *decisionmodelv1alpha1.DecisionModel) string {
 
 // storeNameRev is the per-revision model-store PVC name. Each revision
 // owns its store so a blue-green rollout on RWO storage does not deadlock on
-// Multi-Attach (the candidate lands on another node than the stable). It is
-// shorter than prefetchName (<dm>-prefetch-<rev>), so any dm.Name that keeps the
-// prefetch Job name within 63 chars keeps this PVC name within 63 chars too.
+// Multi-Attach (the candidate lands on another node than the stable). A PVC name
+// is a DNS-1123 subdomain (<= 253 chars); with a 43-char DM name and a 16-hex
+// revision it is 66 chars, well within that limit (only the prefetch Job name is
+// bound by the 63-char job-name Pod label).
 func storeNameRev(dm *decisionmodelv1alpha1.DecisionModel, rev string) string {
 	return dm.Name + "-store-" + rev
 }
@@ -84,9 +85,18 @@ func revisionName(dm *decisionmodelv1alpha1.DecisionModel, rev string) string {
 	return dm.Name + "-" + rev
 }
 
-// prefetchName is the prefetch Job name for a revision.
+// prefetchName is the prefetch Job name for a revision. The job-name Pod label
+// (<= 63 chars) binds: a legacy 10-hex revision keeps the "-prefetch-" prefix so
+// an existing Job is still found and GC'd by name (43 + 10 + 10 = 63), while a
+// new 16-hex revision uses the shorter "-pf-" prefix so it still fits
+// (43 + 4 + 16 = 63). Every caller — create, lookup, GC, failure-reason lookup,
+// store recovery, the seeded-manifest path — goes through this one function, so
+// the two widths never disagree on a Job name.
 func prefetchName(dm *decisionmodelv1alpha1.DecisionModel, rev string) string {
-	return dm.Name + "-prefetch-" + rev
+	if len(rev) == legacyRevisionHashWidth {
+		return dm.Name + "-prefetch-" + rev
+	}
+	return dm.Name + "-pf-" + rev
 }
 
 // pdbName is the PodDisruptionBudget name for a revision.

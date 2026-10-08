@@ -259,7 +259,11 @@ cluster-scoped and is installed by a cluster admin.
 - Pods: non-root (UID 1000), `readOnlyRootFilesystem`, drop ALL, `RuntimeDefault` seccomp,
   no service account token.
 - Engine API key from a Secret (`OLLAYA_API_KEY`); the prober and evaluator use the same key.
-  Secrets and ConfigMaps are read through the uncached API reader with `get`-only RBAC.
+  Secrets and user ConfigMaps (golden datasets) are read through the uncached API reader with `get`-only RBAC.
+  The operator also writes one owned ConfigMap per revision, `<dm>-manifest-<rev>`, holding the raw model
+  manifest so a lost store is rebuilt to the recorded digest. It is written in the reconcile that resolves the
+  digest, before the digest is recorded in status, and is deleted by name with its revision. ConfigMap RBAC is
+  `get`, `create` and `delete` only: no `list`, `watch` or informer.
 - Multi-tenant guards: `--allowed-registries` (default `ollaya.dev`),
   `--allow-insecure-registries` (default false), `--allow-image-override` (default false), and
   Secrets referenced by a DecisionModel must carry the label `decisionmodel.io/api-key: "true"`.

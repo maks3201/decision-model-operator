@@ -8,8 +8,9 @@ rules:
   - ""
   resources:
   - configmaps
-  - secrets
   verbs:
+  - create
+  - delete
   - get
 - apiGroups:
   - ""
@@ -40,6 +41,12 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
 - apiGroups:
   - ""
   - events.k8s.io

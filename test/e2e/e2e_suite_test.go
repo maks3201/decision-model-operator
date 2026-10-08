@@ -27,6 +27,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
 	"github.com/maks3201/decision-model-operator/test/utils"
 )
 
@@ -39,9 +40,11 @@ const projectImage = "example.com/decision-model-operator:v0.0.1-e2e"
 var testDevice = envOr("E2E_DEVICE", "cpu")
 
 // ollayaImage is the runtime image the DecisionModel Pods/Jobs use. It is loaded
-// into the kind cluster so nodes never pull from the network. Defaults to the CPU
-// tag; the GPU workflow overrides it via OLLAYA_IMAGE (…:0.10.0-cuda).
-var ollayaImage = envOr("OLLAYA_IMAGE", "ghcr.io/ollaya-dev/ollaya:0.10.0")
+// into the kind cluster so nodes never pull from the network. The default follows
+// the engine's DefaultRuntimeVersion (single source of truth) at the CPU tag, so a
+// runtime-default bump needs no change here; the GPU workflow overrides it via
+// OLLAYA_IMAGE (…:<version>-cuda).
+var ollayaImage = envOr("OLLAYA_IMAGE", "ghcr.io/ollaya-dev/ollaya:"+ollaya.DefaultRuntimeVersion)
 
 // testModel is the model the suite exercises. Per-PR runs use laya:en; the nightly
 // matrix overrides it via E2E_MODEL (e.g. gliclass:latest, nli:latest) to catch a

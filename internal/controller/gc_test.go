@@ -119,7 +119,7 @@ var _ = Describe("revision GC", func() {
 
 	markJobComplete := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.CompletionTime = &now
@@ -132,7 +132,7 @@ var _ = Describe("revision GC", func() {
 
 	markJobFailed := func(dmName, rev string) {
 		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: dmName + "-prefetch-" + rev}, job)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(dmName, rev)}, job)).To(Succeed())
 		now := metav1.Now()
 		job.Status.StartTime = &now
 		job.Status.Conditions = []batchv1.JobCondition{
@@ -278,5 +278,63 @@ var _ = Describe("revision GC", func() {
 		reconcileOnce(r, "gc3")
 		reconcileOnce(r, "gc3")
 		Expect(countEvents(drain(r), eventPromoted)).To(Equal(0))
+	})
+
+	// Mixed-width fleet: a legacy 10-hex revision names its prefetch Job
+	// "<dm>-prefetch-<10>" and a new 16-hex revision names it "<dm>-pf-<16>". GC is
+	// name-independent (it lists owned Jobs by LabelName and deletes by the
+	// decisionmodel.io/revision label + owner UID), so it deletes exactly the stale
+	// revision's Job regardless of which prefix it carries.
+	It("GC deletes the stale revision's Job across both hash widths", func() {
+		eng := newFakeEngine()
+		r := newR(eng)
+		dm := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "gcmix"},
+			Spec:       decisionmodelv1alpha1.DecisionModelSpec{Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1)},
+		}
+		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
+		// Keep a 16-hex revision as stable; a 10-hex revision is stale.
+		keep := "a1b2c3d4e5f60718" // 16 hex
+		stale := "0123456789"      // 10 hex (legacy)
+		Expect(updateDMStatus(ctx, namespace, "gcmix", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{Hash: keep, Engine: "ollaya", Model: model, Digest: eng.digest, Device: "cpu", Image: fakeImage}
+		})).To(Succeed())
+		dm = getDM("gcmix")
+
+		mkJob := func(rev string) {
+			yes := true
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: jobName("gcmix", rev),
+					Labels: map[string]string{
+						decisionmodelv1alpha1.LabelName:     "gcmix",
+						decisionmodelv1alpha1.LabelRevision: rev,
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: decisionmodelv1alpha1.GroupVersion.String(), Kind: "DecisionModel",
+						Name: dm.Name, UID: dm.UID, Controller: &yes, BlockOwnerDeletion: &yes,
+					}},
+				},
+				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever,
+						Containers: []corev1.Container{{Name: "p", Image: fakeImage}}}}},
+			}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+		}
+		mkJob(keep)  // <dm>-pf-<16>
+		mkJob(stale) // <dm>-prefetch-<10>
+		Expect(jobName("gcmix", keep)).To(Equal("gcmix-pf-" + keep))
+		Expect(jobName("gcmix", stale)).To(Equal("gcmix-prefetch-" + stale))
+
+		Expect(r.gcRevisions(ctx, dm)).To(Succeed())
+
+		// The stale 10-hex Job is gone; the kept 16-hex Job survives.
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx,
+				types.NamespacedName{Namespace: namespace, Name: jobName("gcmix", stale)}, &batchv1.Job{}))
+		}, "5s", "50ms").Should(BeTrue(), "the stale 10-hex -prefetch- Job is collected")
+		Expect(k8sClient.Get(ctx,
+			types.NamespacedName{Namespace: namespace, Name: jobName("gcmix", keep)}, &batchv1.Job{})).
+			To(Succeed(), "the kept 16-hex -pf- Job survives")
 	})
 })

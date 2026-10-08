@@ -94,8 +94,39 @@ func (r *DecisionModelReconciler) gcRevisions(
 		&client.DeleteOptions{PropagationPolicy: &jobPolicy}); err != nil {
 		return err
 	}
-	if err := r.gcStaleByRevision(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete); err != nil {
+	// Per-revision manifest ConfigMaps are collected with their revision. They are
+	// read with get-only RBAC (no list/watch), so GC cannot List them; instead it
+	// deletes <dm>-manifest-<rev> BY NAME. Two sources of names:
+	//   1. Every stale store PVC collected this pass. A terminating PVC
+	//      (deletionTimestamp set) is still listed and still yields its revision
+	//      here, so a crash between the PVC delete and the ConfigMap delete is
+	//      recovered on the next pass as long as the PVC lingers.
+	//   2. Candidate revisions abandoned this reconcile that never got a PVC (a
+	//      candidate queued by the rollout budget), recorded on the reconcile
+	//      state before status.candidateRevision was cleared. GC runs after that
+	//      status write on both abandon paths, so this is persist-then-act.
+	// Owner-UID is checked and NotFound is ignored, so a foreign ConfigMap with
+	// our name survives and a double-delete is harmless.
+	stalePVCRevs, err := r.gcStaleByRevisionCollect(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete)
+	if err != nil {
 		return err
+	}
+	manifestRevs := append([]string{}, stalePVCRevs...)
+	if st := reconcileStateFrom(ctx); st != nil {
+		manifestRevs = append(manifestRevs, st.abandonedManifestRevs...)
+	}
+	seen := map[string]struct{}{}
+	for _, rev := range manifestRevs {
+		if rev == "" {
+			continue
+		}
+		if _, dup := seen[rev]; dup {
+			continue
+		}
+		seen[rev] = struct{}{}
+		if err := r.deleteManifestConfigMapIfOwned(ctx, dm, rev); err != nil {
+			return err
+		}
 	}
 	if err := r.gcStaleByRevision(ctx, dm, &policyv1.PodDisruptionBudgetList{}, shouldDelete); err != nil {
 		return err
@@ -129,11 +160,29 @@ func (r *DecisionModelReconciler) gcStaleByRevision(
 	shouldDelete func(rev string) bool,
 	deleteOpts ...client.DeleteOption,
 ) error {
+	_, err := r.gcStaleByRevisionCollect(ctx, dm, list, shouldDelete, deleteOpts...)
+	return err
+}
+
+// gcStaleByRevisionCollect is gcStaleByRevision that also returns the revisions
+// it deleted, so a caller can collect a sibling object keyed by the same revision
+// (the per-revision manifest ConfigMap, which has get-only RBAC and so cannot be
+// listed).
+func (r *DecisionModelReconciler) gcStaleByRevisionCollect(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	list client.ObjectList,
+	shouldDelete func(rev string) bool,
+	deleteOpts ...client.DeleteOption,
+) ([]string, error) {
 	if err := r.List(ctx, list, client.InNamespace(dm.Namespace),
 		client.MatchingLabels{decisionmodelv1alpha1.LabelName: dm.Name}); err != nil {
-		return err
+		return nil, err
 	}
-	var delErr error
+	var (
+		delErr  error
+		deleted []string
+	)
 	if err := meta.EachListItem(list, func(o runtime.Object) error {
 		obj, ok := o.(client.Object)
 		if !ok {
@@ -146,17 +195,20 @@ func (r *DecisionModelReconciler) gcStaleByRevision(
 		if c := metav1.GetControllerOf(obj); c == nil || c.UID != dm.UID {
 			return nil
 		}
-		if !shouldDelete(obj.GetLabels()[decisionmodelv1alpha1.LabelRevision]) {
+		rev := obj.GetLabels()[decisionmodelv1alpha1.LabelRevision]
+		if !shouldDelete(rev) {
 			return nil
 		}
 		if err := r.Delete(ctx, obj, deleteOpts...); err != nil && !apierrors.IsNotFound(err) {
 			delErr = err
+			return nil
 		}
+		deleted = append(deleted, rev)
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	return delErr
+	return deleted, delErr
 }
 
 // gcLegacyStore deletes the legacy shared <dm>-store PVC once no live Deployment
@@ -250,6 +302,10 @@ func (r *DecisionModelReconciler) deleteRevisionWorkloads(
 	// delete any that might exist for symmetry with the other owned objects.
 	if err := r.deleteIfOwned(ctx, dm,
 		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Namespace: dm.Namespace, Name: pdbName(dm, rev)}}); err != nil {
+		return err
+	}
+	// The per-revision manifest ConfigMap is deleted with the failed revision.
+	if err := r.deleteManifestConfigMapIfOwned(ctx, dm, rev); err != nil {
 		return err
 	}
 	return nil
