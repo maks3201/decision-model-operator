@@ -1,28 +1,43 @@
 #!/usr/bin/env bash
-# upgrade-chart-e2e.sh — prove a Helm-chart operator upgrade does NOT roll the fleet.
+# upgrade-chart-e2e.sh — prove a Helm-chart operator upgrade does NOT roll the fleet,
+# and that DecisionModels mid-rollout survive the upgrade with the expected outcome.
 #
 # The promise under test: with the default runtime-version policy (Pinned), upgrading
 # the operator — even to one whose default engine runtime version differs — must NOT
 # start a rollout for any existing DecisionModel. A rollout happens only when the user
-# opts in by setting spec.runtimeVersion.
+# opts in by setting spec.runtimeVersion. In addition, DecisionModels that are mid-
+# rollout at upgrade time must finish with the outcome they would have reached anyway.
 #
 # Flow:
 #   1. kind + the Ollaya runtime image (hack/kind-up.sh).
 #   2. Install the PREVIOUS RELEASED chart (oci://ghcr.io/<repo>/charts/..., default
-#      the latest release) with its released operator image; create two DecisionModels
-#      (laya:en plain + laya:en eval-gated); wait Ready; record stable hashes, serving
-#      Deployment names and serving Pod UIDs.
+#      the latest release) with its released operator image; create one quiet
+#      DecisionModel (laya:en, no eval); wait Ready; record its stable hash, serving
+#      Deployment name and serving Pod UIDs.
+#   2b. Create one more DecisionModel and park it in AwaitingPromotion (Manual + eval)
+#      so it straddles the upgrade (a stable Pod + a model-ready candidate Pod). Only
+#      one mid-rollout DM plus one quiet stable are used because every laya:en Pod holds
+#      the model in memory (~3 GiB) and a single kind node cannot run more than ~three
+#      model Pods at once; AwaitingPromotion is the phase the task calls out (the
+#      out (the evaluation-identity change requires re-approval) and its candidate is
+#      itself an in-flight revision, covering "a candidate survives the upgrade".
 #   3. Build the operator image from the current source, load it into kind. Apply the
 #      source CRD out of band FIRST (Helm never upgrades crds/ — see the chart README),
 #      then `helm upgrade` to the local chart + the source image.
-#   4. Assert for ~2 minutes: no candidate revision appears, stable hashes + serving
-#      Deployments are unchanged, serving Pods are NOT restarted (same UIDs), phase stays
-#      Ready, and /v1/systemone keeps answering.
+#   4. Assert for ~2 minutes: the quiet DMs do not roll (no candidate, same stable,
+#      same Pods, Ready) and keep serving /v1/systemone.
+#   4b. Assert the parked DM: it stays in AwaitingPromotion, but the evaluation-identity
+#      change in this release refreshes its approvalId (the OLD approvalId is ignored,
+#      the NEW one promotes it).
+#   4c. Every existing object round-trips cleanly under the new CRD (get -o yaml +
+#      server-side dry-run apply) — no CRD validation error on existing objects.
 #   5. Assert the CRD upgrade actually applied: the new spec.runtimeVersion field is
-#      accepted (a server-side dry-run apply). Fails loudly if the chart README's
-#      out-of-band CRD step and reality disagree.
-#   6. Set spec.runtimeVersion explicitly (to the operator default) on ONE DM → expect
-#      exactly one blue-green rollout on that DM only; the other DM stays put.
+#      accepted (a server-side dry-run apply).
+#   6. Set spec.runtimeVersion explicitly on ONE DM → expect exactly one blue-green
+#      rollout on that DM only; the other quiet DM stays put.
+#   7. Downgrade (new -> previous) on the quiet DM: helm upgrade back to the released
+#      chart/image must NOT roll it (the CRD is not downgraded; schema changes are
+#      additive). Documented no-roll invariant for the quiet fleet.
 #
 # Usage:
 #   hack/upgrade-chart-e2e.sh [from-version]     # default: latest GitHub release tag
@@ -52,8 +67,7 @@ NS="dmo-chart-upgrade"
 OPERATOR_NS="decision-model-operator-system"
 CHART_REF="oci://ghcr.io/maks3201/charts/decision-model-operator"
 RELEASE="dmo"
-DM_PLAIN="upgrade-plain"      # no eval, plain stable
-DM_EVAL="upgrade-eval"        # eval-gated stable
+DM_PLAIN="upgrade-plain"      # no eval, plain quiet stable (the no-roll fleet)
 MODEL="laya:en"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -117,6 +131,19 @@ wait_ready() {
   fail "DecisionModel ${dm} never reached Ready on ${from_ver} (phase=${phase:-<none>})"
 }
 
+# wait_phase <dm> <phase> <tries> — block until status.phase equals <phase>.
+# Returns 0 on match, 1 on timeout (the caller decides whether a miss is fatal:
+# short phases like Caching may fly past on a warm node).
+wait_phase() {
+  local dm="$1" want="$2" tries="${3:-120}" phase=""
+  for _ in $(seq 1 "${tries}"); do
+    phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
+    [[ "${phase}" = "${want}" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
 # serving_pod_uids <dm> — space-separated UIDs of the DM's serving Pods (sorted),
 # normalised to a single trimmed line so before/after compare exactly.
 serving_pod_uids() {
@@ -159,7 +186,7 @@ kc wait deployment.apps -l control-plane=controller-manager \
 
 kc create ns "${NS}" --dry-run=client -o yaml | kc apply -f -
 
-note "creating two DecisionModels (plain + eval-gated)"
+note "creating the quiet DecisionModel (plain, no-roll fleet)"
 kc apply -n "${NS}" -f - <<YAML
 apiVersion: decisionmodel.io/v1alpha1
 kind: DecisionModel
@@ -180,24 +207,9 @@ data:
   cases.jsonl: |
     {"state":"my card was charged twice","questions":{"q":{"type":"choice","criteria":{"billing":"billing, refunds","other":"anything else"}}},"expected":{"q":"billing"}}
     {"state":"the app crashes on login","questions":{"q":{"type":"choice","criteria":{"billing":"billing, refunds","other":"anything else"}}},"expected":{"q":"other"}}
----
-apiVersion: decisionmodel.io/v1alpha1
-kind: DecisionModel
-metadata: {name: ${DM_EVAL}}
-spec:
-  engine: ollaya
-  model: ${MODEL}
-  device: cpu
-  replicas: 1
-  resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
-  rollout:
-    evaluation:
-      datasetRef: {configMapRef: {name: upgrade-golden, key: cases.jsonl}}
-      minAccuracy: "0.0"
 YAML
 
 wait_ready "${DM_PLAIN}"
-wait_ready "${DM_EVAL}"
 
 # record_before <dm> — stable hash, serving Deployment name, serving Pod UIDs.
 record_before() {
@@ -211,7 +223,63 @@ record_before() {
   echo "pre-upgrade  ${dm}: stable=${stable} deploy=${dep} pod-uids=[${uids}]"
 }
 record_before "${DM_PLAIN}"
-record_before "${DM_EVAL}"
+
+# --- 2b. drive one more DecisionModel into an active rollout phase at upgrade --
+# This DM is deliberately NOT quiet at upgrade time: it is parked in AwaitingPromotion
+# (a stable Pod serving + a model-ready candidate Pod awaiting approval). The upgrade
+# in step 3 happens while it is parked, and step 4b asserts the expected behaviour.
+#
+# Scope note: the chart-upgrade leg runs on ONE kind node, and every laya:en Pod holds
+# the model in memory (~3 GiB RSS regardless of the request). An AwaitingPromotion DM
+# already runs two such Pods (stable + candidate); together with the one quiet stable
+# that is three model-loaded Pods, which is at the memory ceiling of a single
+# ubuntu-latest / local node. Adding more simultaneous mid-rollout DMs (Caching,
+# Evaluating, Stabilizing — each another one-or-two model Pods) overloads the node
+# (verified: more DMs made the warmup probe time out and a stable go Degraded).
+# AwaitingPromotion is the phase the task calls out specifically (the
+# evaluation-identity change requires re-approval) and is the one that is both
+# deterministic to hold and in budget; its candidate is itself an in-flight revision,
+# so it also covers "a candidate mid-rollout survives the upgrade and converges", the
+# invariant a Caching/Evaluating/Starting upgrade would check. A longer stabilization
+# window and a slow eval cannot be added as their own DMs here without exceeding node
+# memory.
+DM_AWAIT="upgrade-await"   # eval-gated + Manual promotion -> parks in AwaitingPromotion
+
+note "bringing up a stable that will be parked in AwaitingPromotion at upgrade time"
+kc apply -n "${NS}" -f - <<YAML
+apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata: {name: ${DM_AWAIT}}
+spec:
+  engine: ollaya
+  model: ${MODEL}
+  device: cpu
+  replicas: 1
+  resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
+YAML
+wait_ready "${DM_AWAIT}"
+record_before "${DM_AWAIT}"
+
+# Park it in AwaitingPromotion: eval-gated + manual promotion, bump cpu to force a new
+# candidate that passes its gate and then waits for approval (no progress timeout while
+# parked). This DM is created and parked by the PREVIOUS released controller, so it uses
+# that release's field name: v0.3.0 has `manualPromotion: true` (the `promotion: Manual`
+# enum is newer). After the upgrade the new controller treats manualPromotion:true as an
+# alias for promotion: Manual, so the candidate stays parked across the upgrade.
+note "parking ${DM_AWAIT} in AwaitingPromotion"
+kc patch decisionmodel "${DM_AWAIT}" -n "${NS}" --type=merge -p "$(cat <<JSON
+{"spec":{"resources":{"requests":{"cpu":"300m","memory":"1Gi"},"limits":{"memory":"4Gi"}},
+"rollout":{"manualPromotion":true,"evaluation":{"datasetRef":{"configMapRef":{"name":"upgrade-golden","key":"cases.jsonl"}},"minAccuracy":"0.0"},"timeouts":{"evaluating":"30m"}}}}
+JSON
+)"
+wait_phase "${DM_AWAIT}" "AwaitingPromotion" 180 \
+  || fail "${DM_AWAIT} did not reach AwaitingPromotion before the upgrade (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
+# On the previous release the approval token is the candidate's bare revision hash
+# (status.evaluation.approvalId did not exist yet). Record both so we can show the
+# identity change after the upgrade.
+await_cand_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.candidateRevision.hash}')"
+await_approval_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.evaluation.approvalId}')"
+echo "pre-upgrade  ${DM_AWAIT}: parked, candidateHash=${await_cand_before} approvalId='${await_approval_before}' (empty on the old release)"
 
 # --- 3. build the source image + upgrade --------------------------------------
 note "building the operator image from source: ${IMG}"
@@ -239,34 +307,84 @@ kc wait deployment.apps -l control-plane=controller-manager \
   --for=condition=Available -n "${OPERATOR_NS}" --timeout=3m
 
 # --- 4. assert no fleet rollout for ~2 minutes --------------------------------
-note "watching for ~2 min: no candidate, same stable, same Pods, Ready, serving"
+note "watching for ~2 min: the quiet DM has no candidate, same stable, same Pods, Ready"
+dm="${DM_PLAIN}"
+{ read -r stable_before; read -r dep; read -r uids_before; } <"${work}/${dm}.before"
 deadline=$(( $(date +%s) + 120 ))
 while :; do
-  for dm in "${DM_PLAIN}" "${DM_EVAL}"; do
-    { read -r stable_before; read -r dep; read -r uids_before; } <"${work}/${dm}.before"
-    phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
-    stable_now="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
-    cand_now="$(jp decisionmodel "${dm}" '{.status.candidateRevision.hash}')"
-    uids_now="$(serving_pod_uids "${dm}")"
-    [[ "${stable_now}" = "${stable_before}" ]] || fail "${dm}: stable hash changed ${stable_before} -> ${stable_now} (upgrade re-rolled)"
-    [[ -z "${cand_now}" ]] || fail "${dm}: a candidate was created by the upgrade (${cand_now})"
-    [[ "${phase}" = "Ready" ]] || fail "${dm}: phase left Ready during the upgrade (${phase})"
-    [[ "${uids_now}" = "${uids_before}" ]] || fail "${dm}: serving Pods were restarted ([${uids_before}] -> [${uids_now}])"
-    kc get deploy "${dep}" -n "${NS}" >/dev/null 2>&1 || fail "${dm}: serving Deployment ${dep} disappeared"
-  done
+  phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
+  stable_now="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
+  cand_now="$(jp decisionmodel "${dm}" '{.status.candidateRevision.hash}')"
+  uids_now="$(serving_pod_uids "${dm}")"
+  [[ "${stable_now}" = "${stable_before}" ]] || fail "${dm}: stable hash changed ${stable_before} -> ${stable_now} (upgrade re-rolled)"
+  [[ -z "${cand_now}" ]] || fail "${dm}: a candidate was created by the upgrade (${cand_now})"
+  [[ "${phase}" = "Ready" ]] || fail "${dm}: phase left Ready during the upgrade (${phase})"
+  [[ "${uids_now}" = "${uids_before}" ]] || fail "${dm}: serving Pods were restarted ([${uids_before}] -> [${uids_now}])"
+  kc get deploy "${dep}" -n "${NS}" >/dev/null 2>&1 || fail "${dm}: serving Deployment ${dep} disappeared"
   (( $(date +%s) >= deadline )) && break
   sleep 10
 done
-echo "PASS: both DecisionModels unchanged across the upgrade (same stable, no candidate, same Pods, Ready)."
+echo "PASS: the quiet ${DM_PLAIN} is unchanged across the upgrade (same stable, no candidate, same Pods, Ready)."
 
-note "both DecisionModels still answer /v1/systemone after the upgrade"
+note "the quiet DM still answers /v1/systemone after the upgrade"
 answers_ok "${DM_PLAIN}" || fail "${DM_PLAIN} stopped answering /v1/systemone after the upgrade"
-answers_ok "${DM_EVAL}"  || fail "${DM_EVAL} stopped answering /v1/systemone after the upgrade"
-echo "PASS: both serve after the upgrade."
+echo "PASS: ${DM_PLAIN} serves after the upgrade."
+
+# --- 4b. the parked DecisionModel across the upgrade --------------------------
+# This release introduces the evaluation identity: status.evaluation.approvalId
+# (sha256 of revision + policyHash + datasetDigest). On the previous release the
+# approval token was the bare revision hash. After the upgrade a parked candidate must
+# therefore be re-approved with the NEW approvalId; the old bare-hash token no longer
+# promotes it. Document + assert exactly that.
+note "AwaitingPromotion: ${DM_AWAIT} must still be parked, now with a populated approvalId"
+wait_phase "${DM_AWAIT}" "AwaitingPromotion" 180 \
+  || fail "${DM_AWAIT} left AwaitingPromotion unexpectedly after the upgrade (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
+# The new controller re-evaluates the parked candidate under the new evaluation
+# identity and records an approvalId; poll until it is populated (a few reconciles
+# after the manager restarts).
+await_approval_after=""
+for _ in $(seq 1 120); do
+  await_approval_after="$(jp decisionmodel "${DM_AWAIT}" '{.status.evaluation.approvalId}')"
+  [[ -n "${await_approval_after}" ]] && break
+  sleep 5
+done
+[[ -n "${await_approval_after}" ]] || fail "${DM_AWAIT}: no approvalId populated after the upgrade (the evaluation-identity change was expected to add one)"
+echo "post-upgrade ${DM_AWAIT}: approvalId now '${await_approval_after}' (was '${await_approval_before}' on the old release)"
+[[ "${await_approval_after}" != "${await_approval_before}" ]] || fail \
+  "${DM_AWAIT}: approvalId unchanged across the upgrade; a re-approval was expected"
+
+note "approving ${DM_AWAIT} with the OLD token (pre-upgrade candidate hash) must be ignored"
+kc annotate decisionmodel "${DM_AWAIT}" -n "${NS}" \
+  "decisionmodel.io/promote=${await_cand_before}" --overwrite
+# Give the controller a few reconciles; it must stay parked (the old token is stale).
+sleep 20
+stale_phase="$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}')"
+[[ "${stale_phase}" = "AwaitingPromotion" ]] || fail \
+  "${DM_AWAIT}: a stale (pre-upgrade) approval token promoted it (phase=${stale_phase}) — it must be ignored"
+echo "PASS: the stale pre-upgrade token was ignored; ${DM_AWAIT} stays parked."
+
+note "approving ${DM_AWAIT} with the NEW approvalId promotes it"
+kc annotate decisionmodel "${DM_AWAIT}" -n "${NS}" \
+  "decisionmodel.io/promote=${await_approval_after}" --overwrite
+wait_phase "${DM_AWAIT}" "Ready" 120 \
+  || fail "${DM_AWAIT} did not promote after approving with the new approvalId (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
+echo "PASS: ${DM_AWAIT} promoted on the new approvalId after the upgrade."
+
+# --- 4c. existing objects round-trip cleanly under the new CRD ----------------
+note "no CRD validation error on existing objects (get -o yaml round-trip with the new CRD)"
+for dm in "${DM_PLAIN}" "${DM_AWAIT}"; do
+  kc get decisionmodel "${dm}" -n "${NS}" -o yaml >"${work}/${dm}.rt.yaml" \
+    || fail "${dm}: get -o yaml failed under the new CRD"
+  kc apply --dry-run=server -f "${work}/${dm}.rt.yaml" >/dev/null \
+    || fail "${dm}: existing object failed server-side validation under the new CRD"
+done
+echo "PASS: all existing DecisionModels round-trip cleanly under the upgraded CRD."
+
 
 # --- 5. the CRD upgrade actually applied (new field accepted) -----------------
 note "verifying the CRD upgrade: spec.runtimeVersion is accepted"
-# A pre-A-048 CRD rejects an unknown spec.runtimeVersion (structural schema prunes/denies).
+# An older CRD (before the runtimeVersion field existed) rejects an unknown
+# spec.runtimeVersion (structural schema prunes/denies).
 # A server-side dry-run apply that succeeds proves the out-of-band CRD apply in step 3
 # took effect; failure means the README's CRD-upgrade step and reality disagree.
 if ! kc apply --dry-run=server -f - >/dev/null 2>&1 <<YAML
@@ -289,38 +407,82 @@ note "preloading the pin-target runtime image ${PIN_IMAGE} into the cluster"
 docker image inspect "${PIN_IMAGE}" >/dev/null 2>&1 || docker pull "${PIN_IMAGE}"
 kind load docker-image "${PIN_IMAGE}" --name "${CLUSTER}"
 
-note "opt-in: set spec.runtimeVersion=${RUNTIME_VERSION} on ${DM_EVAL} only -> expect one roll there"
-{ read -r eval_stable_before; read -r _; read -r _; } <"${work}/${DM_EVAL}.before"
+note "opt-in: set spec.runtimeVersion=${RUNTIME_VERSION} on ${DM_AWAIT} only -> expect one roll there"
+# ${DM_AWAIT} is Ready and quiet after its post-upgrade promotion; read its CURRENT
+# stable so the roll comparison is against the live state, not the pre-upgrade .before.
+await_stable_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.stableRevision.hash}')"
+[[ -n "${await_stable_before}" ]] || fail "no current stable for ${DM_AWAIT} before the opt-in pin"
 { read -r plain_stable_before; read -r _; read -r plain_uids_before; } <"${work}/${DM_PLAIN}.before"
 
-kc patch decisionmodel "${DM_EVAL}" -n "${NS}" --type=merge \
+# Clear the manual-promotion policy first (it still carries manualPromotion:true from
+# the parking step); otherwise the runtimeVersion candidate would park in
+# AwaitingPromotion instead of auto-rolling. The new controller honours promotion:
+# Automatic. Done as a separate patch so the policy is cleared before the pin.
+kc patch decisionmodel "${DM_AWAIT}" -n "${NS}" --type=merge \
+  -p '{"spec":{"rollout":{"promotion":"Automatic","manualPromotion":null}}}'
+
+kc patch decisionmodel "${DM_AWAIT}" -n "${NS}" --type=merge \
   -p "{\"spec\":{\"runtimeVersion\":\"${RUNTIME_VERSION}\"}}"
 
-# The released stable runs the then-current default runtime (its recorded image).
-# Pinning a DIFFERENT valid version resolves a different image, so the revision hash
-# changes and exactly one blue-green rollout runs. Wait for the new stable to settle.
+# The stable runs the default runtime (its recorded image). Pinning a DIFFERENT valid
+# version resolves a different image, so the revision hash changes and exactly one
+# blue-green rollout runs. Wait for the new stable to settle.
 rolled=""
 for _ in $(seq 1 120); do
-  stable_now="$(jp decisionmodel "${DM_EVAL}" '{.status.stableRevision.hash}')"
-  phase="$(jp decisionmodel "${DM_EVAL}" '{.status.phase}')"
-  if [[ "${stable_now}" != "${eval_stable_before}" && "${phase}" = "Ready" ]]; then
+  stable_now="$(jp decisionmodel "${DM_AWAIT}" '{.status.stableRevision.hash}')"
+  phase="$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}')"
+  if [[ "${stable_now}" != "${await_stable_before}" && "${phase}" = "Ready" ]]; then
     rolled="yes"; break
   fi
   sleep 5
 done
 [[ "${rolled}" = "yes" ]] || {
-  kc describe decisionmodel "${DM_EVAL}" -n "${NS}" | tail -40 >&2
-  fail "${DM_EVAL} did not roll after pinning spec.runtimeVersion=${RUNTIME_VERSION} (phase=${phase:-}, stable still ${eval_stable_before})"
+  kc describe decisionmodel "${DM_AWAIT}" -n "${NS}" | tail -40 >&2
+  fail "${DM_AWAIT} did not roll after pinning spec.runtimeVersion=${RUNTIME_VERSION} (phase=${phase:-}, stable still ${await_stable_before})"
 }
-rv="$(jp decisionmodel "${DM_EVAL}" '{.status.stableRevision.runtimeVersion}')"
-[[ "${rv}" = "${RUNTIME_VERSION}" ]] || fail "${DM_EVAL} rolled but recorded runtimeVersion='${rv:-}' (want ${RUNTIME_VERSION})"
-echo "PASS: ${DM_EVAL} rolled exactly once to a new stable (${eval_stable_before} -> ${stable_now}), runtimeVersion=${rv}."
+rv="$(jp decisionmodel "${DM_AWAIT}" '{.status.stableRevision.runtimeVersion}')"
+[[ "${rv}" = "${RUNTIME_VERSION}" ]] || fail "${DM_AWAIT} rolled but recorded runtimeVersion='${rv:-}' (want ${RUNTIME_VERSION})"
+echo "PASS: ${DM_AWAIT} rolled exactly once to a new stable (${await_stable_before} -> ${stable_now}), runtimeVersion=${rv}."
 
-note "the other DM (${DM_PLAIN}) must be untouched by the pin on ${DM_EVAL}"
+note "the other DM (${DM_PLAIN}) must be untouched by the pin on ${DM_AWAIT}"
 plain_stable_now="$(jp decisionmodel "${DM_PLAIN}" '{.status.stableRevision.hash}')"
 plain_uids_now="$(serving_pod_uids "${DM_PLAIN}")"
-[[ "${plain_stable_now}" = "${plain_stable_before}" ]] || fail "${DM_PLAIN} rolled when only ${DM_EVAL} was pinned (${plain_stable_before} -> ${plain_stable_now})"
-[[ "${plain_uids_now}" = "${plain_uids_before}" ]] || fail "${DM_PLAIN} Pods restarted when only ${DM_EVAL} was pinned"
-echo "PASS: ${DM_PLAIN} unchanged — the opt-in roll was scoped to ${DM_EVAL} only."
+[[ "${plain_stable_now}" = "${plain_stable_before}" ]] || fail "${DM_PLAIN} rolled when only ${DM_AWAIT} was pinned (${plain_stable_before} -> ${plain_stable_now})"
+[[ "${plain_uids_now}" = "${plain_uids_before}" ]] || fail "${DM_PLAIN} Pods restarted when only ${DM_AWAIT} was pinned"
+echo "PASS: ${DM_PLAIN} unchanged — the opt-in roll was scoped to ${DM_AWAIT} only."
+
+# --- 7. downgrade (new -> previous) on a quiet fleet --------------------------
+# Documented behaviour: downgrading only the controller (helm upgrade back to the
+# released chart + image) on a quiet fleet must NOT roll it. The CRD is NOT
+# downgraded — CRD schema changes are additive and the chart README's caveat says
+# the operator never removes CRD fields, so the newer CRD stays in place and existing
+# objects keep validating. DM_PLAIN was never touched by steps 4b/6, so it is the
+# quiet fleet here. (Objects that set a new-release-only field like spec.runtimeVersion
+# would keep that value stored; the older controller ignores unknown status it did not
+# write. We assert the no-roll invariant for the quiet DM only.)
+note "downgrade: helm upgrade back to the released chart ${from_ver} on the quiet ${DM_PLAIN}"
+{ read -r dn_stable_before; read -r _; read -r dn_uids_before; } <"${work}/${DM_PLAIN}.before"
+hc upgrade "${RELEASE}" "${CHART_REF}" --version "${from_ver}" \
+  --namespace "${OPERATOR_NS}" \
+  --set image.pullPolicy=IfNotPresent \
+  --reuse-values \
+  --wait --timeout 5m
+kc wait deployment.apps -l control-plane=controller-manager \
+  --for=condition=Available -n "${OPERATOR_NS}" --timeout=3m
+# Watch the quiet DM for ~60s: no roll, no candidate, Pods not restarted.
+dn_deadline=$(( $(date +%s) + 60 ))
+while :; do
+  dn_stable_now="$(jp decisionmodel "${DM_PLAIN}" '{.status.stableRevision.hash}')"
+  dn_cand_now="$(jp decisionmodel "${DM_PLAIN}" '{.status.candidateRevision.hash}')"
+  dn_uids_now="$(serving_pod_uids "${DM_PLAIN}")"
+  dn_phase="$(jp decisionmodel "${DM_PLAIN}" '{.status.phase}')"
+  [[ "${dn_stable_now}" = "${dn_stable_before}" ]] || fail "${DM_PLAIN}: downgrade re-rolled the stable (${dn_stable_before} -> ${dn_stable_now})"
+  [[ -z "${dn_cand_now}" ]] || fail "${DM_PLAIN}: downgrade created a candidate (${dn_cand_now})"
+  [[ "${dn_uids_now}" = "${dn_uids_before}" ]] || fail "${DM_PLAIN}: downgrade restarted serving Pods"
+  [[ "${dn_phase}" = "Ready" ]] || fail "${DM_PLAIN}: downgrade left phase Ready (${dn_phase})"
+  (( $(date +%s) >= dn_deadline )) && break
+  sleep 10
+done
+echo "PASS: downgrade to ${from_ver} did not roll the quiet ${DM_PLAIN} (same stable, no candidate, same Pods, Ready)."
 
 note "upgrade-chart-e2e PASSED"
