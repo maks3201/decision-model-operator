@@ -846,7 +846,14 @@ func (r *DecisionModelReconciler) candidateIdentity(
 	// revision. The legacy hash only matters through this adoption (it ignores
 	// placement), so a scheduling change on an already-adopted legacy stable is a
 	// real new revision — isStable is then false.
-	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, image))
+	//
+	// Legacy releases (0.3.0, 0.4.0) rendered the image as the tag-only form
+	// (repo:tag) and hashed the revision with it; this build renders
+	// repo:tag@sha256:<index> for the same tag. Recognise such a stable by hashing
+	// the legacy formula with the TAG-ONLY image, so an upgrade that only adds the
+	// digest pin does not look like a new revision and roll the fleet.
+	legacyImage, _ := splitImagePin(image)
+	adoptLegacyStable(stable, candidate, legacyRevisionHash(dm.Spec, digest, legacyImage))
 	isStable = stable != nil && (stable.Hash == rev || sameIdentity(stable, candidate))
 	return candidate, rev, effVer, image, isStable
 }

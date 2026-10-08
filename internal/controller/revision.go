@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -186,28 +187,70 @@ func revisionHashFromStatus(rev *decisionmodelv1alpha1.RevisionStatus) string {
 // resources and placement. It compares the recorded fields rather than hash
 // names, so a legacy stable that keeps its old hash name (adoptLegacyStable) is
 // still recognised as the current revision.
+//
+// The serving image is compared with sameServingImage, so a stable recorded by
+// an older operator as the tag-only form (repo:tag) is recognised as the same
+// revision this build computes as repo:tag@sha256:<index> for the SAME tag. That
+// is identity recognition only (not admission): without it an upgrade to a build
+// that digest-pins the default image would roll every quiet DecisionModel, which
+// RELEASING.md forbids.
 func sameIdentity(rev, want *decisionmodelv1alpha1.RevisionStatus) bool {
 	return rev != nil && want != nil &&
 		rev.Engine == want.Engine && rev.Model == want.Model && rev.Digest == want.Digest &&
-		rev.Device == want.Device && rev.Image == want.Image && rev.Placement == want.Placement &&
+		rev.Device == want.Device && sameServingImage(rev.Image, want.Image) && rev.Placement == want.Placement &&
 		equality.Semantic.DeepEqual(rev.Resources, want.Resources)
+}
+
+// splitImagePin splits a serving image reference into its repo:tag part and its
+// @sha256:<hex> pin (if any). "repo:tag@sha256:abc" -> ("repo:tag", "sha256:abc");
+// "repo:tag" -> ("repo:tag", ""). It splits on the first "@" so a tag can never
+// contain one.
+func splitImagePin(image string) (tag, pin string) {
+	if i := strings.IndexByte(image, '@'); i >= 0 {
+		return image[:i], image[i+1:]
+	}
+	return image, ""
+}
+
+// sameServingImage reports whether a recorded revision image and a freshly
+// computed image denote the same revision. They match when equal, or when they
+// have the same repo:tag and AT MOST ONE side carries an @sha256 pin — i.e. an
+// older release recorded the tag-only form and this build adds the pinned digest
+// of the SAME tag (or vice versa). Two DIFFERENT explicit digests of the same tag
+// are not collapsed (a deliberate re-pin is a real revision change); a different
+// tag is never collapsed (a version bump rolls, as it should).
+func sameServingImage(recorded, computed string) bool {
+	if recorded == computed {
+		return true
+	}
+	rTag, rPin := splitImagePin(recorded)
+	cTag, cPin := splitImagePin(computed)
+	if rTag != cTag || rTag == "" {
+		return false
+	}
+	// Same repo:tag: collapse only when at least one side is unpinned (the
+	// tag-only form an older release recorded, now rendered with its digest).
+	return rPin == "" || cPin == ""
 }
 
 // adoptLegacyStable records the current placement on a stable revision that was
 // created before placement was recorded (RevisionStatus.Placement == ""), provided
 // it is the revision the current spec describes under the previous hash formula.
 // That hash equality already proves engine, model, digest, device, image and
-// resources are the current ones, so the image and resources are backfilled too
-// (a stable from before per-revision stores did not record them, and would otherwise never
-// match sameIdentity). Nothing else changes: the stable keeps its hash name,
-// Deployment and store. No-op for a revision that already has a recorded
-// placement, and for a stable the current spec no longer matches (that is an
-// ordinary new candidate).
+// resources are the current ones, so placement and resources are backfilled.
+// The image is backfilled ONLY when it was never recorded (empty): a stable that
+// already recorded a tag-only image keeps it verbatim, so adoption never swaps a
+// tag-form image for this build's digest-pinned form and never rolls the running
+// stable. Nothing else changes: the stable keeps its hash name, Deployment and
+// store. No-op for a revision that already has a recorded placement, and for a
+// stable the current spec no longer matches (that is an ordinary new candidate).
 func adoptLegacyStable(stable, current *decisionmodelv1alpha1.RevisionStatus, legacyHash string) {
 	if stable == nil || stable.Placement != "" || stable.Hash != legacyHash {
 		return
 	}
 	stable.Placement = current.Placement
-	stable.Image = current.Image
+	if stable.Image == "" {
+		stable.Image = current.Image
+	}
 	stable.Resources = *current.Resources.DeepCopy()
 }
