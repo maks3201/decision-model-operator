@@ -14,6 +14,10 @@ on:
         description: "Release tag to smoke-test the artifacts of (default: same as 'from')"
         type: string
         required: false
+      olm:
+        description: "Also run the OLM bundle smoke (slow; off by default)"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       from:
@@ -24,6 +28,10 @@ on:
         description: "Release tag to smoke-test (default: same as 'from')"
         type: string
         required: false
+      olm:
+        description: "Also run the OLM bundle smoke (slow; off by default)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -160,3 +168,38 @@ jobs:
           KIND_NODE_IMAGE: ${{ needs.resolve.outputs.node_newest }}
           KIND_CLUSTER: dmo-smoke
         run: ./hack/release-smoke.sh "${{ needs.resolve.outputs.tag }}"
+
+  # OLM bundle smoke (RELEASING.md item 67). Slow and OLM-dependent, so it is
+  # opt-in via the `olm` input (default false): run it manually before a release,
+  # or set olm: true in the release pipeline's workflow_call. Builds the committed
+  # bundle, installs it through OLM on kind, creates a DecisionModel, runs
+  # bundle-upgrade to a bumped source bundle and asserts no re-roll.
+  olm:
+    name: OLM bundle smoke (k8s ${{ needs.resolve.outputs.newest }})
+    needs: resolve
+    if: ${{ inputs.olm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install operator-sdk
+        run: make operator-sdk
+
+      - name: OLM bundle smoke
+        env:
+          KIND_NODE_IMAGE: ${{ needs.resolve.outputs.node_newest }}
+          KIND_CLUSTER: dmo-olm
+          OPERATOR_SDK: bin/operator-sdk
+        run: ./hack/olm-e2e.sh
