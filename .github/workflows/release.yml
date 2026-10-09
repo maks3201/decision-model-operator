@@ -98,6 +98,26 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
+      # Release Please creates the GitHub Release for a final tag before calling
+      # this workflow. A release candidate tag is pushed by hand, so create its
+      # pre-release here. A final tag without a Release is an error: finals go
+      # through the Release Please PR.
+      - name: Ensure the GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          case "$TAG" in
+            *-*)
+              gh release create "$TAG" --verify-tag --prerelease --title "$TAG" \
+                --notes "Release candidate. Validate it with RELEASING.md before the final release." ;;
+            *)
+              echo "::error::no GitHub Release for $TAG; final releases are created by Release Please"
+              exit 1 ;;
+          esac
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -145,8 +165,19 @@ jobs:
       - name: Add artifacthub.io/changes for this release
         run: hack/chart-annotate-changes.sh "${TAG#v}" charts/decision-model-operator/Chart.yaml
 
+      # A release candidate (vX.Y.Z-rc.N) is tagged from main, where Chart.yaml
+      # still carries the previous release's version. Mark it as a prerelease for
+      # Artifact Hub; the chart version itself always comes from the tag below.
+      - name: Mark a release candidate chart as prerelease
+        if: contains(env.TAG, '-')
+        run: |
+          sed -i "s|^  artifacthub.io/prerelease: .*|  artifacthub.io/prerelease: 'true'|" charts/decision-model-operator/Chart.yaml
+          grep -q "artifacthub.io/prerelease: 'true'" charts/decision-model-operator/Chart.yaml
+
+      # The chart version and appVersion always come from the tag, so a tag
+      # pushed from main can never re-publish an existing chart version.
       - name: Package Helm chart
-        run: helm package charts/decision-model-operator --destination dist
+        run: helm package charts/decision-model-operator --destination dist --version "${TAG#v}" --app-version "${TAG#v}"
 
       # OCI chart: oci://ghcr.io/maks3201/charts/decision-model-operator:<version>
       # (Artifact Hub indexes this repository).
