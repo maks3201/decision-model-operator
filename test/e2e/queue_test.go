@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -177,8 +178,9 @@ spec:
 			// port-forward fail without recovering. A fresh forward per try is robust.
 			Eventually(func(g Gomega) {
 				stop := make(chan struct{})
-				local := portForward(queueDM, queueNS, 11435, stop)
 				defer close(stop)
+				local, ferr := tryPortForward(queueDM, queueNS, 11435, stop)
+				g.Expect(ferr).NotTo(HaveOccurred(), "port-forward to the recreated stable")
 				code, cerr := utils.Run(exec.Command("curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
 					"--max-time", "20", fmt.Sprintf("http://%s/", local)))
 				g.Expect(cerr).NotTo(HaveOccurred())
@@ -228,4 +230,35 @@ func queuedCandidateModel() string {
 func holderDataset() string {
 	return `{"state":"my card was charged twice","questions":{"q":{"type":"choice",` +
 		`"criteria":{"billing":"billing, refunds","other":"anything else"}}},"expected":{"q":"billing"}}` + "\n"
+}
+
+// tryPortForward is portForward without Gomega assertions: it returns an error when
+// the tunnel does not open within 15s, so a caller inside Eventually retries with a
+// fresh forward instead of failing the spec on one slow tunnel. Closing stop (or a
+// failed attempt) kills the kubectl process.
+func tryPortForward(name, namespace string, port int, stop chan struct{}) (string, error) {
+	lp := freePort()
+	local := fmt.Sprintf("127.0.0.1:%d", lp)
+	cmd := exec.Command("kubectl", "port-forward",
+		fmt.Sprintf("svc/%s", name), fmt.Sprintf("%d:%d", lp, port),
+		"-n", namespace)
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	go func() {
+		<-stop
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp", local, time.Second)
+		if err == nil {
+			return local, c.Close()
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("port-forward tunnel to svc/%s did not open: %w", name, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
