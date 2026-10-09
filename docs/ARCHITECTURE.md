@@ -289,8 +289,12 @@ cluster-scoped and is installed by a cluster admin.
 - Engine API key from a Secret (`OLLAYA_API_KEY`); the prober and evaluator use the same key.
   Secrets and user ConfigMaps (golden datasets) are read through the uncached API reader with `get`-only RBAC.
   The operator also writes one owned ConfigMap per revision, `<dm>-manifest-<rev>`, holding the raw model
-  manifest so a lost store is rebuilt to the recorded digest. It is written in the reconcile that resolves the
-  digest, before the digest is recorded in status, and is deleted by name with its revision. ConfigMap RBAC is
+  manifest; the prefetch Job seeds the store from it and verifies the digest. This does **not** rebuild a
+  revision whose tag moved upstream: `ollaya pull <tag>` replaces the seeded manifest with the tag's current one
+  (confirmed upstream, ollaya-dev/ollaya#64), the digest check then fails with `UpstreamTagMoved` and nothing
+  else is served. Until the registry and CLI support pulling by digest, the only way to restore an exact revision
+  after its tag moved is a copy of the store volume (e.g. a VolumeSnapshot of `<dm>-store-<rev>`). The ConfigMap
+  is written after the candidate is admitted and deleted by name with its revision. ConfigMap RBAC is
   `get`, `create` and `delete` only: no `list`, `watch` or informer.
 - Multi-tenant guards: `--allowed-registries` (default `ollaya.dev`),
   `--allow-insecure-registries` (default false), `--allow-image-override` (default false), and

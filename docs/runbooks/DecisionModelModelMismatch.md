@@ -26,6 +26,8 @@ the rate.
 - GPU: ensure the node has `nvidia.com/gpu` capacity and the device plugin is healthy;
   for blue-green, a second GPU is needed for the candidate. Consider MIG / time-slicing.
 - Digest: confirm the prefetch Job pulled the recorded digest; a permanent
-  `UpstreamTagMoved`/`DigestMismatch` prefetch failure explains a store that cannot match.
+  `UpstreamTagMoved`/`DigestMismatch` prefetch failure explains a store that cannot match. `UpstreamTagMoved`
+  on a lost store cannot be repaired by the operator today (the registry has no pull by digest): restore the
+  store volume from a snapshot, or move the DecisionModel to the tag's current digest deliberately.
 - The gate holds mismatched Pods out of the Service, so traffic is not served by a wrong
   model; fix the device/store and the gate flips to ready on the next probe.
