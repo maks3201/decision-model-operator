@@ -5,7 +5,7 @@
 # Build context: hack/mirror/ with a populated ./store/models (blobs/ + manifests/).
 
 # --- build the static mirror server (stdlib only; throwaway module) ---
-FROM golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS build
+FROM mirror.gcr.io/library/golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS build
 WORKDIR /src
 COPY main.go .
 # main.go carries //go:build ignore so the main repo module never compiles it;
