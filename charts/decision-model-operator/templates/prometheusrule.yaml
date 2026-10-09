@@ -1,6 +1,7 @@
 {{- if .Values.prometheusRule.enabled }}
 {{- $rb := trimSuffix "/" .Values.prometheusRule.runbookUrl }}
 {{- $w := .Values.prometheusRule.windows }}
+{{- $t := .Values.prometheusRule.thresholds }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -47,6 +48,22 @@ spec:
             description: "A candidate revision has not become ready/evaluated within {{ $w.candidateTimeout }}."
             runbook_url: "{{ $rb }}/DecisionModelCandidateTimeout.md"
 
+        # A rollout is admitted but cannot start because the concurrent-rollout
+        # cap is full: the DecisionModel sits in Pending (one-hot phase) waiting
+        # for a slot. Fires when it has waited longer than the window.
+        - alert: DecisionModelRolloutQueuedLong
+          expr: |
+            max by (namespace, name) (
+              decisionmodel_phase{phase="Pending"}
+            ) == 1
+          for: {{ $w.rolloutQueued }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} queued waiting for a rollout slot"
+            description: "A DecisionModel has waited in phase Pending for {{ $w.rolloutQueued }}; the concurrent-rollout cap (--max-concurrent-rollouts) is full."
+            runbook_url: "{{ $rb }}/DecisionModelRolloutQueuedLong.md"
+
         # Repeated rollbacks or outright failures: a bad candidate, flaky eval,
         # or a store/probe problem.
         - alert: DecisionModelRolloutFailures
@@ -62,18 +79,21 @@ spec:
             description: "One or more rollbacks/failures in the last 15m."
             runbook_url: "{{ $rb }}/DecisionModelRolloutFailures.md"
 
-        # Evaluation quality regressed: a completed evaluation with low accuracy
-        # or poor calibration. Only fires once an evaluation has run.
+        # Evaluation quality regressed: a completed evaluation with low accuracy,
+        # a low macro-F1 (balanced across classes, catches a model that only does
+        # well on the majority class), or poor calibration. Only fires once an
+        # evaluation has run (the series are absent before the first evaluation).
         - alert: DecisionModelEvaluationPoor
           expr: |
-            decisionmodel_evaluation_accuracy < 0.9
-            or decisionmodel_evaluation_ece > 0.1
+            decisionmodel_evaluation_accuracy < {{ $t.minAccuracy }}
+            or decisionmodel_evaluation_macro_f1 < {{ $t.minMacroF1 }}
+            or decisionmodel_evaluation_ece > {{ $t.maxEce }}
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} evaluation below target"
-            description: "Last evaluation has accuracy < 0.9 or ECE > 0.1."
+            description: "Last evaluation has accuracy < {{ $t.minAccuracy }}, macro-F1 < {{ $t.minMacroF1 }}, or ECE > {{ $t.maxEce }}."
             runbook_url: "{{ $rb }}/DecisionModelEvaluationPoor.md"
 
         # The stable revision is serving on a subset (or none) of its replicas,

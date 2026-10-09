@@ -218,7 +218,18 @@
             "rolloutStuck": { "type": "string", "minLength": 1 },
             "degraded": { "type": "string", "minLength": 1 },
             "candidateTimeout": { "type": "string", "minLength": 1 },
+            "rolloutQueued": { "type": "string", "minLength": 1 },
             "operatorDown": { "type": "string", "minLength": 1 }
+          }
+        },
+        "thresholds": {
+          "type": "object",
+          "description": "Evaluation-quality alert thresholds for DecisionModelEvaluationPoor (decimals in [0,1]).",
+          "additionalProperties": false,
+          "properties": {
+            "minAccuracy": { "type": "number", "minimum": 0, "maximum": 1 },
+            "minMacroF1": { "type": "number", "minimum": 0, "maximum": 1 },
+            "maxEce": { "type": "number", "minimum": 0, "maximum": 1 }
           }
         }
       }

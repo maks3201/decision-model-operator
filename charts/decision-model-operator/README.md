@@ -375,7 +375,11 @@ CRD upgrade caveat above). The listed namespaces must already exist.
 | prometheusRule.namespace | string | `""` | Namespace for the `PrometheusRule` (empty = release namespace). |
 | prometheusRule.labels | object | `{}` | Extra labels on the `PrometheusRule` (e.g. the `release:` label your Prometheus selects on). |
 | prometheusRule.runbookUrl | string | `"https://github.com/maks3201/decision-model-operator/blob/main/docs/runbooks"` | Base URL prepended to each alert's `runbook_url` annotation (points at the docs site or your fork). |
-| prometheusRule.windows | object | `{"candidateTimeout":"20m","degraded":"10m","operatorDown":"5m","rolloutStuck":"15m"}` | Per-alert `for` windows (how long the symptom must hold before firing). |
+| prometheusRule.windows | object | `{"candidateTimeout":"20m","degraded":"10m","operatorDown":"5m","rolloutQueued":"30m","rolloutStuck":"15m"}` | Per-alert `for` windows (how long the symptom must hold before firing). |
+| prometheusRule.thresholds | object | `{"maxEce":0.1,"minAccuracy":0.9,"minMacroF1":0.9}` | Evaluation-quality alert thresholds (`DecisionModelEvaluationPoor`). Decimals in `[0,1]`; set to your promotion target. |
+| prometheusRule.thresholds.minAccuracy | float | `0.9` | Fire when `decisionmodel_evaluation_accuracy` is below this. |
+| prometheusRule.thresholds.minMacroF1 | float | `0.9` | Fire when `decisionmodel_evaluation_macro_f1` is below this (balanced across classes; absent until an evaluation with classifiable questions runs, so it never fires before the first such evaluation). |
+| prometheusRule.thresholds.maxEce | float | `0.1` | Fire when `decisionmodel_evaluation_ece` (Expected Calibration Error) is above this. |
 | grafanaDashboard.enabled | bool | `false` | Create a ConfigMap holding the operator Grafana dashboard, labelled for the Grafana sidecar to auto-import. |
 | grafanaDashboard.namespace | string | `""` | Namespace for the dashboard ConfigMap (empty = release namespace; set to where the Grafana sidecar watches). |
 | grafanaDashboard.labels | object | `{}` | Extra labels on the dashboard ConfigMap (the sidecar label `grafana_dashboard: "1"` is always added). |
