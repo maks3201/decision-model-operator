@@ -119,6 +119,15 @@ jobs:
             mirror: ""
             cluster: dmo-e2e-auth
             free_disk: "false"
+          # The queue spec reconfigures the manager (--max-concurrent-rollouts=1) and
+          # runs two laya:en DMs plus a multilingual admission, so it runs alone on its
+          # own shard with the free-disk step.
+          - name: kind (kustomize queue, CPU, laya:en)
+            install: kustomize
+            label: "!nightly && queue"
+            mirror: ""
+            cluster: dmo-e2e-queue
+            free_disk: "true"
           # helm shard: the Go suite runs only the lifecycle container on helm.
           - name: kind (helm, CPU, laya:en)
             install: helm
