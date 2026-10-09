@@ -122,7 +122,16 @@ prometheusRule:
     rolloutStuck: 15m
     degraded: 10m
     candidateTimeout: 20m
+    rolloutQueued: 30m
     operatorDown: 5m
+  # -- Evaluation-quality alert thresholds (`DecisionModelEvaluationPoor`). Decimals in `[0,1]`; set to your promotion target.
+  thresholds:
+    # -- Fire when `decisionmodel_evaluation_accuracy` is below this.
+    minAccuracy: 0.9
+    # -- Fire when `decisionmodel_evaluation_macro_f1` is below this (balanced across classes; absent until an evaluation with classifiable questions runs, so it never fires before the first such evaluation).
+    minMacroF1: 0.9
+    # -- Fire when `decisionmodel_evaluation_ece` (Expected Calibration Error) is above this.
+    maxEce: 0.1
 
 # Grafana dashboard shipped as a sidecar-discovered ConfigMap (the Grafana
 # `grafana_dashboard: "1"` label). Disabled by default.

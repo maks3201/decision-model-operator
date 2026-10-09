@@ -29,25 +29,35 @@
     {
       "type": "timeseries",
       "title": "Rollout outcomes (rate)",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
       "targets": [
         {"expr": "sum by (result) (rate(decisionmodel_rollouts_total[5m]))", "legendFormat": "{{result}}"}
       ]
     },
     {
       "type": "timeseries",
-      "title": "Probe results (rate)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "title": "Recreate stop/restore (rate)",
+      "description": "Stable revision scaled to zero to free capacity for a candidate (stable_stopped) and scaled back up after a failure/rollback (stable_restored), under the Recreate strategy.",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
       "targets": [
-        {"expr": "sum by (result) (rate(decisionmodel_probe_results_total[5m]))", "legendFormat": "{{result}}"}
+        {"expr": "sum by (result) (rate(decisionmodel_rollouts_total{result=~\"stable_stopped|stable_restored\"}[5m]))", "legendFormat": "{{result}}"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Queued rollouts",
+      "description": "DecisionModels waiting in phase Pending for a rollout slot (--max-concurrent-rollouts is full).",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "targets": [
+        {"expr": "sum(decisionmodel_phase{phase=\"Pending\"} == 1)", "legendFormat": "queued"}
       ]
     },
     {
       "type": "timeseries",
-      "title": "Evaluation accuracy per DecisionModel",
+      "title": "Probe results (rate)",
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
       "targets": [
-        {"expr": "decisionmodel_evaluation_accuracy", "legendFormat": "{{namespace}}/{{name}}"}
+        {"expr": "sum by (result) (rate(decisionmodel_probe_results_total[5m]))", "legendFormat": "{{result}}"}
       ]
     },
     {
@@ -60,8 +70,25 @@
     },
     {
       "type": "timeseries",
+      "title": "Evaluation accuracy per DecisionModel",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "targets": [
+        {"expr": "decisionmodel_evaluation_accuracy", "legendFormat": "{{namespace}}/{{name}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Evaluation macro-F1 per DecisionModel",
+      "description": "Macro-averaged F1 over classifiable (choice/bool) questions; balanced across classes. Absent until an evaluation with classifiable questions runs.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "targets": [
+        {"expr": "decisionmodel_evaluation_macro_f1", "legendFormat": "{{namespace}}/{{name}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
       "title": "Reconcile errors (rate)",
-      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 32},
       "targets": [
         {"expr": "sum(rate(controller_runtime_reconcile_errors_total{controller=\"decisionmodel\"}[5m]))", "legendFormat": "errors"}
       ]
@@ -69,7 +96,7 @@
     {
       "type": "timeseries",
       "title": "Reconcile latency p99",
-      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 32},
       "targets": [
         {"expr": "histogram_quantile(0.99, sum by (le) (rate(controller_runtime_reconcile_time_seconds_bucket{controller=\"decisionmodel\"}[5m])))", "legendFormat": "p99"}
       ]
@@ -77,7 +104,7 @@
     {
       "type": "timeseries",
       "title": "Workqueue depth",
-      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 32},
       "targets": [
         {"expr": "sum(workqueue_depth{name=\"decisionmodel\"})", "legendFormat": "depth"}
       ]
@@ -85,7 +112,7 @@
     {
       "type": "timeseries",
       "title": "Registry resolve duration p99",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
       "targets": [
         {"expr": "histogram_quantile(0.99, sum by (le) (rate(decisionmodel_registry_resolve_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
       ]
@@ -93,7 +120,7 @@
     {
       "type": "timeseries",
       "title": "Phase duration p90",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
       "targets": [
         {"expr": "histogram_quantile(0.90, sum by (le, phase) (rate(decisionmodel_phase_duration_seconds_bucket[30m])))", "legendFormat": "{{phase}}"}
       ]
