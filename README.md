@@ -119,8 +119,8 @@ The full walk-through (first request, scaling, proxies, mirrors) is in the
 | Area | Tested | Notes |
 |---|---|---|
 | Kubernetes | 1.35, 1.36 and 1.37 nightly (kind, default suite); 1.37 on every change; 1.35 and 1.37 in the upgrade E2E of each release | 1.29+ is required by the APIs the operator uses. Versions below 1.35 are not tested ([RELEASING.md](RELEASING.md#5-support-policy)); exact patch versions are in [`hack/k8s-versions.env`](hack/k8s-versions.env). |
-| Runtime: [Ollaya](https://github.com/ollaya-dev/ollaya) | 0.10.0 (default), CPU | 0.7.3 is the oldest accepted `runtimeVersion` (verified in spikes 001 and 006, not in CI). |
-| Device `cuda` | Manual only: one T4 GPU on EKS (Bottlerocket), runtime 0.7.3 | No GPU in CI. CUDA on 0.10.0 is not verified yet. |
+| Runtime: [Ollaya](https://github.com/ollaya-dev/ollaya) | 0.12.0 (default), CPU | Known versions (0.7.3, 0.10.0, 0.11.0, 0.12.0) run as `repo:tag@sha256:<digest>`. A new revision on any other version, or on a `spec.image` without `@sha256:`, is refused (`UnpinnedRuntimeImage`) unless the operator runs with `--allow-unpinned-runtime-images`. 0.7.3 is the oldest accepted `runtimeVersion` (spikes 001 and 006, not in CI). |
+| Device `cuda` | Manual only: one T4 GPU on EKS (Bottlerocket), runtime 0.7.3 | No GPU in CI. CUDA on 0.12.0 is not verified yet. |
 | Storage | `ReadWriteOnce` (kind `standard`, local-path) | `ReadWriteMany` for `replicas > 1` across nodes is supported by the code but not tested. |
 | Models | `laya:en` on every change; more in the nightly matrix | Full list in the [quickstart](https://maks3201.github.io/decision-model-operator/quickstart/#supported-models). |
 | Architectures | Operator image amd64 + arm64 | E2E runs on amd64. |
