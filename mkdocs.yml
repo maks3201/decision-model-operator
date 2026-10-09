@@ -69,6 +69,7 @@ nav:
   - Sizing: sizing.md
   - GitOps: gitops.md
   - Metrics: metrics.md
+  - Testing: testing.md
   - GPU CI: gpu-ci.md
   - API reference: api-reference.md
   - Architecture: ARCHITECTURE.md
