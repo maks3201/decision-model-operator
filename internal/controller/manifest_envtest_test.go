@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -312,8 +313,10 @@ var _ = Describe("per-revision manifest persistence", func() {
 		}
 		createDM("retry")
 
-		// First reconcile: the manifest write fails, so the reconcile errors and
-		// NO candidate digest is recorded (status.candidateRevision stays nil).
+		// First reconcile: the manifest write fails BEFORE the admission status
+		// write, so the reconcile errors and NO candidate digest is recorded
+		// (status.candidateRevision stays nil) — the recorded digest can never
+		// outlive its durable manifest.
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "retry"}})
 		Expect(err).To(HaveOccurred(), "a failed manifest write fails the reconcile")
 		rev := RevisionHash(getDM("retry").Spec, wantDigest, fakeImage)
@@ -332,37 +335,67 @@ var _ = Describe("per-revision manifest persistence", func() {
 		Expect(getDM("retry").Status.CandidateRevision).NotTo(BeNil())
 	})
 
-	It("persists the manifest ConfigMap even while the candidate is queued by the rollout budget", func() {
-		// persistCandidateManifest runs before the fleet rollout-budget gate, so a
-		// candidate that is queued (no slot free) still gets its durable manifest.
-		// Its prefetch Job is not created while queued, but the bytes are safe.
+	It("persists no manifest ConfigMap while the candidate is queued, so repeated spec changes do not leak", func() {
+		// The manifest is persisted only AFTER admission, so a candidate queued
+		// behind the fleet budget writes no manifest ConfigMap. Changing spec.model
+		// three times while queued therefore leaves no orphaned manifests (the leak
+		// the old pre-gate persist caused — one ConfigMap per queued revision until
+		// the DM was deleted).
 		eng := newFakeEngine()
 		eng.manifest = manifestBody
 		r := newR(eng)
-		// Budget of zero free slots: this DM is the only one and MaxConcurrentRollouts=1
-		// with a reservation already held would queue it; simplest: set the budget to a
-		// value already consumed by a reserved slot for another name.
 		r.MaxConcurrentRollouts = 1
 		r.WatchNamespaces = []string{namespace}
-		// Hold the only slot with a reservation for another DM so this candidate
-		// is queued behind the fleet budget (same mechanism restart_safety uses).
+		// Hold the only slot so this DM's candidate is always queued.
 		r.budgetReservations = map[string]string{namespace + "/other": "someother"}
 
 		createDM("queued")
-		rec(r, "queued") // reaches persist, then the budget gate queues it
+		models := []string{"laya:en", "kev:en", "jevk5:en"}
+		revs := map[string]struct{}{}
+		for _, m := range models {
+			Expect(updateDM(ctx, namespace, "queued", func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = m
+			})).To(Succeed())
+			rec(r, "queued")
+			dm := getDM("queued")
+			Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "queued behind the budget")
+			Expect(dm.Status.CandidateRevision).To(BeNil(), "not admitted while queued")
+			revs[RevisionHash(dm.Spec, eng.digest, fakeImage)] = struct{}{}
+		}
 
-		dm := getDM("queued")
-		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "queued behind the budget")
-		Expect(dm.Status.CandidateRevision).To(BeNil(), "not admitted while queued")
-		rev := RevisionHash(dm.Spec, wantDigest, fakeImage)
-		cm, err := manifestCM("queued", rev)
-		Expect(err).NotTo(HaveOccurred(), "the manifest is persisted before the budget gate")
+		// No manifest ConfigMap exists for ANY of the queued revisions: nothing leaked.
+		for rev := range revs {
+			_, err := manifestCM("queued", rev)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"a queued candidate must not persist a manifest ConfigMap (no leak), rev %s", rev)
+		}
+	})
+
+	It("persists and mounts the manifest once the candidate is admitted", func() {
+		// Admitted (no budget limit): the manifest is persisted and the prefetch
+		// Job references the ConfigMap (mounted, not an env var).
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		createDM("admitted")
+		rec(r, "admitted")
+		dm := getDM("admitted")
+		Expect(dm.Status.CandidateRevision).NotTo(BeNil(), "admitted")
+		rev := dm.Status.CandidateRevision.Hash
+		cm, err := manifestCM("admitted", rev)
+		Expect(err).NotTo(HaveOccurred(), "manifest persisted after admission")
 		Expect(cm.BinaryData[manifestKey]).To(Equal(manifestBody))
-		// No prefetch Job yet: the candidate is still queued.
+
+		// The prefetch Job mounts the ConfigMap: a volume references it by name.
 		job := &batchv1.Job{}
-		Expect(apierrors.IsNotFound(
-			k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("queued", rev)}, job),
-		)).To(BeTrue(), "no prefetch Job while queued")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("admitted", rev)}, job)).To(Succeed())
+		mountsCM := false
+		for _, v := range job.Spec.Template.Spec.Volumes {
+			if v.ConfigMap != nil && v.ConfigMap.Name == "admitted-manifest-"+rev {
+				mountsCM = true
+			}
+		}
+		Expect(mountsCM).To(BeTrue(), "the prefetch Job mounts the manifest ConfigMap")
 	})
 
 	It("deletes the manifest ConfigMap of a superseded candidate that never got a PVC", func() {
@@ -467,5 +500,138 @@ var _ = Describe("per-revision manifest persistence", func() {
 			live.Finalizers = nil
 			_ = k8sClient.Update(ctx, live)
 		}
+	})
+
+	It("deletes the manifest ConfigMap before the store PVC (order), so a failed PVC delete loses nothing", func() {
+		// The manifest ConfigMap must be deleted BEFORE its PVC: if the PVC delete
+		// fails/crashes, the manifest is already gone (not orphaned, since GC cannot
+		// list ConfigMaps). Intercept the PVC delete to fail it and assert the
+		// manifest was deleted first.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		wc, werr := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(werr).NotTo(HaveOccurred())
+		var pvcDeleteFailed atomic.Bool
+		failing := interceptor.NewClient(wc, interceptor.Funcs{
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+					pvcDeleteFailed.Store(true)
+					return fmt.Errorf("induced PVC delete failure")
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		})
+		r := &DecisionModelReconciler{
+			Client: failing, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:  map[string]engine.Engine{"ollaya": eng},
+			Prober:   &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: wantDigest, Device: "cpu"}},
+			Recorder: events.NewFakeRecorder(64),
+		}
+		createDM("order")
+		dmObj := getDM("order")
+		staleRev := "0rder5tale1"
+		// A stale revision's store PVC (no finalizer; the interceptor fails its delete)
+		// and its manifest ConfigMap.
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "order-store-" + staleRev, Labels: revisionLabels(dmObj, staleRev),
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, pvc, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "order-manifest-" + staleRev, Labels: revisionLabels(dmObj, staleRev),
+			},
+			BinaryData: map[string][]byte{manifestKey: manifestBody},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, cm, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+		// GC errors on the PVC delete, but the manifest ConfigMap was deleted first.
+		err := r.gcRevisions(ctx, getDM("order"))
+		Expect(err).To(HaveOccurred(), "the induced PVC delete failure surfaces")
+		Expect(pvcDeleteFailed.Load()).To(BeTrue())
+		_, cmErr := manifestCM("order", staleRev)
+		Expect(apierrors.IsNotFound(cmErr)).To(BeTrue(),
+			"the manifest ConfigMap is deleted before the PVC, so a failed PVC delete leaves no orphan")
+	})
+
+	It("repairs a corrupt owned manifest ConfigMap from the verified manifest", func() {
+		// An owned ConfigMap whose stored bytes fail the digest check is deleted and
+		// recreated from this reconcile's verified resolved manifest, restoring
+		// exact-digest recovery instead of silently degrading to pull-by-tag.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		createDM("repair")
+		rec(r, "repair")
+		dm := getDM("repair")
+		Expect(dm.Status.CandidateRevision).NotTo(BeNil())
+		rev := dm.Status.CandidateRevision.Hash
+		cm, err := manifestCM("repair", rev)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cm.BinaryData[manifestKey]).To(Equal(manifestBody))
+
+		// Corrupt it (still owned).
+		cm.BinaryData[manifestKey] = []byte("corrupt-not-the-manifest")
+		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+		// ensureManifestConfigMap on a reconcile that HAS the verified manifest
+		// (resolvedManifest stashed, as the resolve reconcile does) repairs it:
+		// delete + recreate back to the correct bytes.
+		st := &reconcileState{base: dm.DeepCopy(), resolvedManifest: manifestBody}
+		gctx := context.WithValue(ctx, reconcileStateKey{}, st)
+		Expect(r.ensureManifestConfigMap(gctx, dm, rev, wantDigest)).To(Succeed())
+		Eventually(func() []byte {
+			c, gerr := manifestCM("repair", rev)
+			if gerr != nil {
+				return nil
+			}
+			return c.BinaryData[manifestKey]
+		}, "3s", "50ms").Should(Equal(manifestBody), "the corrupt manifest is repaired from the verified bytes")
+	})
+
+	It("leaves a corrupt manifest and warns once when this reconcile has no verified bytes", func() {
+		// With no verified manifest this reconcile (digest reused / hard pin / moved
+		// tag), a corrupt owned ConfigMap is left as is and a single Warning is
+		// emitted — no delete loop.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		rr := events.NewFakeRecorder(32)
+		r := newR(eng)
+		r.Recorder = rr
+		createDM("warn")
+		rec(r, "warn")
+		rev := getDM("warn").Status.CandidateRevision.Hash
+		cm, err := manifestCM("warn", rev)
+		Expect(err).NotTo(HaveOccurred())
+		cm.BinaryData[manifestKey] = []byte("corrupt")
+		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+		// No reconcile state (so no verified resolvedManifest, and events emit
+		// immediately): warn + leave, do not delete.
+		Expect(r.ensureManifestConfigMap(ctx, getDM("warn"), rev, wantDigest)).To(Succeed())
+		// The ConfigMap is still present (not deleted).
+		c, gerr := manifestCM("warn", rev)
+		Expect(gerr).NotTo(HaveOccurred(), "corrupt ConfigMap left in place (no delete loop)")
+		Expect(c.BinaryData[manifestKey]).To(Equal([]byte("corrupt")))
+		// Exactly one ManifestInvalid Warning was emitted.
+		warned := 0
+		for drained := false; !drained; {
+			select {
+			case e := <-rr.Events:
+				if strings.Contains(e, eventManifestInvalid) {
+					warned++
+				}
+			default:
+				drained = true
+			}
+		}
+		Expect(warned).To(Equal(1), "one ManifestInvalid Warning, no loop")
 	})
 })

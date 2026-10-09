@@ -79,46 +79,105 @@ func (r *DecisionModelReconciler) ensureManifestConfigMap(
 	if b := r.manifestBytes(ctx, dm, rev, digest); b != nil {
 		return nil
 	}
-	// Use this reconcile's resolved manifest; persist only when it hashes to the
-	// recorded digest. A moved tag / hard pin / no-manifest Resolve means we cannot
-	// persist and the prefetch falls back to pull-by-tag.
+	// Not valid (missing, tampered, stale, or holding a different digest). Can we
+	// (re)write it from THIS reconcile's verified resolved manifest?
 	st := reconcileStateFrom(ctx)
-	if st == nil || len(st.resolvedManifest) == 0 || digestOf(st.resolvedManifest) != digest {
+	haveVerified := st != nil && len(st.resolvedManifest) > 0 && digestOf(st.resolvedManifest) == digest
+	if !haveVerified {
+		// No verified bytes this reconcile. If an owned-but-invalid ConfigMap
+		// exists, warn ONCE (do not loop deletes) and leave it — the prefetch
+		// falls back to pull-by-tag + verify. A moved tag / hard pin / reused
+		// digest simply has nothing to persist.
+		r.warnInvalidManifestOnce(ctx, dm, rev, digest)
 		return nil
 	}
+	// We have verified bytes. Persist them, repairing an owned-but-invalid existing
+	// ConfigMap by delete-then-recreate (ConfigMaps have no patch RBAC).
+	return r.writeManifestConfigMap(ctx, dm, rev, st.resolvedManifest)
+}
+
+// writeManifestConfigMap creates the per-revision manifest ConfigMap from the
+// given (already digest-verified) bytes. On AlreadyExists it checks ownership: a
+// foreign ConfigMap with our name is a conflict (never overwritten); an owned one
+// is invalid (the caller only reaches here when manifestBytes returned nil), so it
+// is deleted and recreated so exact-digest recovery is restored rather than
+// silently degrading to pull-by-tag.
+func (r *DecisionModelReconciler) writeManifestConfigMap(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+	manifest []byte,
+) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: dm.Namespace,
 			Name:      manifestConfigMapName(dm, rev),
 			Labels:    revisionLabels(dm, rev),
 		},
-		BinaryData: map[string][]byte{manifestKey: st.resolvedManifest},
+		BinaryData: map[string][]byte{manifestKey: manifest},
 	}
 	if err := controllerutil.SetControllerReference(dm, cm, r.Scheme); err != nil {
 		return err
 	}
-	// Create directly (no createOrAdopt): configmaps have get/create/delete RBAC
-	// only — no patch — so we never relabel/adopt. On AlreadyExists, verify through
-	// the uncached APIReader that the existing object is ours (owner UID); a
-	// foreign ConfigMap with our name is a conflict (never overwritten). An object
-	// that is ours is a benign re-create (idempotent).
-	if err := r.Create(ctx, cm); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return err
-		}
-		rdr, rerr := r.reader()
-		if rerr != nil {
-			return rerr
-		}
-		live := &corev1.ConfigMap{}
-		if gerr := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: cm.Name}, live); gerr != nil {
-			return gerr
-		}
-		if !ownedBy(live, dm) {
-			return r.conflictIfNotOwned(ctx, dm, live, "ConfigMap")
-		}
+	err := r.Create(ctx, cm)
+	if err == nil || !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	// AlreadyExists: inspect the live object through the uncached APIReader.
+	rdr, rerr := r.reader()
+	if rerr != nil {
+		return rerr
+	}
+	live := &corev1.ConfigMap{}
+	if gerr := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: cm.Name}, live); gerr != nil {
+		return gerr
+	}
+	if !ownedBy(live, dm) {
+		return r.conflictIfNotOwned(ctx, dm, live, "ConfigMap")
+	}
+	// Ours but invalid (manifestBytes was nil): delete and recreate so the stored
+	// bytes match the recorded digest again. Deleting by the live object (with its
+	// resourceVersion) avoids racing a concurrent writer.
+	if derr := r.Delete(ctx, live); derr != nil && !apierrors.IsNotFound(derr) {
+		return derr
+	}
+	r.event(ctx, dm, corev1.EventTypeNormal, eventManifestRepaired,
+		"repaired the model manifest for revision %s (recreated from the verified manifest)", rev)
+	if cerr := r.Create(ctx, cm); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
+		return cerr
 	}
 	return nil
+}
+
+// warnInvalidManifestOnce emits a single Warning when an owned manifest ConfigMap
+// exists but fails the digest check and this reconcile has no verified bytes to
+// repair it with — the exact-digest recovery is degraded to pull-by-tag. It warns
+// only when the ConfigMap exists and is ours and invalid, so a normal
+// "no manifest persisted" case (hard pin / reused digest) stays quiet, and it does
+// not loop deletes.
+func (r *DecisionModelReconciler) warnInvalidManifestOnce(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev, digest string,
+) {
+	rdr, err := r.reader()
+	if err != nil {
+		return
+	}
+	cm := &corev1.ConfigMap{}
+	if gerr := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: manifestConfigMapName(dm, rev)}, cm); gerr != nil {
+		return // absent or unreadable: nothing to warn about
+	}
+	if !ownedBy(cm, dm) {
+		return
+	}
+	b := cm.BinaryData[manifestKey]
+	if len(b) > 0 && digestOf(b) == digest {
+		return // actually valid (raced with a repair) — no warning
+	}
+	r.event(ctx, dm, corev1.EventTypeWarning, eventManifestInvalid,
+		"model manifest for revision %s is corrupt and cannot be repaired this reconcile "+
+			"(no verified manifest available); falling back to pull-by-tag", rev)
 }
 
 // manifestBytes returns the persisted manifest for a revision, or nil when there
@@ -154,20 +213,33 @@ func (r *DecisionModelReconciler) manifestBytes(
 	return b
 }
 
-// seedManifest sets params.Model.Manifest from the persisted manifest for rev,
-// so the prefetch Job can rebuild exactly the recorded digest. A
-// missing/foreign/stale ConfigMap leaves Manifest empty (pull-by-tag fallback).
-// It only READS: the ConfigMap is written earlier (persistCandidateManifest, in
-// the same reconcile as Resolve, before the digest is recorded in status) so the
-// bytes can never be lost. Called on the prefetch paths only — serving Pods do
-// not need the manifest.
+// seedManifest points the prefetch Job at the persisted manifest for rev so it
+// can rebuild EXACTLY the recorded digest. When an owned, digest-verified
+// ConfigMap exists it sets params.ManifestConfigMap (the Job mounts it read-only,
+// B-070) AND params.Model.Manifest (kept for the env/seed fallback and for engines
+// that read the bytes directly). A missing/foreign/stale ConfigMap leaves both
+// empty (pull-by-tag fallback). It only READS: the ConfigMap is written on the
+// admitted candidate path (persistCandidateManifest) before the prefetch Job, so
+// the bytes exist. Called on the prefetch paths only — serving Pods do not need
+// the manifest.
 func (r *DecisionModelReconciler) seedManifest(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	params engine.Params,
 	rev, digest string,
 ) engine.Params {
-	params.Model.Manifest = r.manifestBytes(ctx, dm, rev, digest)
+	b := r.manifestBytes(ctx, dm, rev, digest)
+	if b == nil {
+		return params
+	}
+	params.Model.Manifest = b
+	// Mount the ConfigMap instead of carrying the bytes in an env var: the
+	// manifest can exceed the 128 KiB argv/env limit. Verified above (manifestBytes
+	// checked ownership + digest), so pointing the Job at it is safe.
+	params.ManifestConfigMap = &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: manifestConfigMapName(dm, rev)},
+		Key:                  manifestKey,
+	}
 	return params
 }
 

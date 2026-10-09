@@ -332,7 +332,7 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	if len(p.Model.Manifest) > 0 {
 		env = append(env, corev1.EnvVar{Name: "MANIFEST_SEED_DIGEST", Value: digestOf(p.Model.Manifest)})
 	}
-	return batchv1.JobSpec{
+	spec := batchv1.JobSpec{
 		Template: corev1.PodTemplateSpec{
 			Spec: corev1.PodSpec{
 				RestartPolicy: corev1.RestartPolicyNever,
@@ -344,6 +344,17 @@ func (f *fakeEngine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 			},
 		},
 	}
+	// Mirror B-070's engine side: when the controller passes a ManifestConfigMap,
+	// the Job mounts it read-only instead of carrying the bytes in an env var.
+	if p.ManifestConfigMap != nil {
+		spec.Template.Spec.Volumes = append(spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "manifest",
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: p.ManifestConfigMap.Name},
+			}},
+		})
+	}
+	return spec
 }
 
 // fakeJobEnv mirrors the real engine's download-token injection so envtests can

@@ -180,6 +180,18 @@ func (r *DecisionModelReconciler) persistStatus(
 	return true, false, nil
 }
 
+// refreshPatchBase resets the optimistic-lock base of the current reconcile to a
+// snapshot of dm, so a SECOND persistStatus/finish later in the same reconcile
+// patches from the just-written state instead of the stale start-of-reconcile
+// base (which would conflict). Call it right after an intermediate persistStatus
+// that must be followed by more status writes in the same reconcile (e.g. the
+// rollout admission write, which precedes the candidate flow's own finish).
+func refreshPatchBase(ctx context.Context, dm *decisionmodelv1alpha1.DecisionModel) {
+	if st := reconcileStateFrom(ctx); st != nil {
+		st.base = dm.DeepCopy()
+	}
+}
+
 // flushEvents emits all buffered Events after a successful status write.
 func (r *DecisionModelReconciler) flushEvents(dm *decisionmodelv1alpha1.DecisionModel, st *reconcileState) {
 	if r.Recorder == nil {

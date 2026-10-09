@@ -96,18 +96,23 @@ func (r *DecisionModelReconciler) gcRevisions(
 	}
 	// Per-revision manifest ConfigMaps are collected with their revision. They are
 	// read with get-only RBAC (no list/watch), so GC cannot List them; instead it
-	// deletes <dm>-manifest-<rev> BY NAME. Two sources of names:
-	//   1. Every stale store PVC collected this pass. A terminating PVC
-	//      (deletionTimestamp set) is still listed and still yields its revision
-	//      here, so a crash between the PVC delete and the ConfigMap delete is
-	//      recovered on the next pass as long as the PVC lingers.
+	// deletes <dm>-manifest-<rev> BY NAME. The manifest ConfigMap is deleted
+	// BEFORE its store PVC: a stale revision's manifest is not needed, and if the
+	// PVC were deleted first a crash in between would lose the revision hash (the
+	// PVC is how GC discovers the stale revision; ConfigMaps cannot be listed), so
+	// the orphaned ConfigMap would leak until the DM is deleted. Two sources of
+	// names:
+	//   1. Every stale store PVC (collected but NOT yet deleted this pass). A
+	//      terminating PVC (deletionTimestamp set) is still listed and still yields
+	//      its revision, so a crash during the manifest delete is recovered next
+	//      pass as long as the PVC lingers.
 	//   2. Candidate revisions abandoned this reconcile that never got a PVC (a
 	//      candidate queued by the rollout budget), recorded on the reconcile
 	//      state before status.candidateRevision was cleared. GC runs after that
 	//      status write on both abandon paths, so this is persist-then-act.
 	// Owner-UID is checked and NotFound is ignored, so a foreign ConfigMap with
 	// our name survives and a double-delete is harmless.
-	stalePVCRevs, err := r.gcStaleByRevisionCollect(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete)
+	stalePVCRevs, err := r.gcStaleRevisionsList(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete)
 	if err != nil {
 		return err
 	}
@@ -127,6 +132,10 @@ func (r *DecisionModelReconciler) gcRevisions(
 		if err := r.deleteManifestConfigMapIfOwned(ctx, dm, rev); err != nil {
 			return err
 		}
+	}
+	// Now delete the stale store PVCs themselves (manifests already gone).
+	if err := r.gcStaleByRevision(ctx, dm, &corev1.PersistentVolumeClaimList{}, shouldDelete); err != nil {
+		return err
 	}
 	if err := r.gcStaleByRevision(ctx, dm, &policyv1.PodDisruptionBudgetList{}, shouldDelete); err != nil {
 		return err
@@ -209,6 +218,42 @@ func (r *DecisionModelReconciler) gcStaleByRevisionCollect(
 		return nil, err
 	}
 	return deleted, delErr
+}
+
+// gcStaleRevisionsList lists the owned objects of one kind and returns the
+// revisions that SHOULD be deleted, WITHOUT deleting them. It lets GC learn a
+// stale revision's hash (e.g. from its store PVC) and act on a sibling object
+// first — the per-revision manifest ConfigMap must be deleted BEFORE the PVC, so
+// a crash cannot orphan the (unlistable) ConfigMap once the PVC it was keyed to is
+// gone. Ownership is checked (foreign objects are ignored).
+func (r *DecisionModelReconciler) gcStaleRevisionsList(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	list client.ObjectList,
+	shouldDelete func(rev string) bool,
+) ([]string, error) {
+	if err := r.List(ctx, list, client.InNamespace(dm.Namespace),
+		client.MatchingLabels{decisionmodelv1alpha1.LabelName: dm.Name}); err != nil {
+		return nil, err
+	}
+	var revs []string
+	if err := meta.EachListItem(list, func(o runtime.Object) error {
+		obj, ok := o.(client.Object)
+		if !ok {
+			return nil
+		}
+		if c := metav1.GetControllerOf(obj); c == nil || c.UID != dm.UID {
+			return nil
+		}
+		rev := obj.GetLabels()[decisionmodelv1alpha1.LabelRevision]
+		if shouldDelete(rev) {
+			revs = append(revs, rev)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return revs, nil
 }
 
 // gcLegacyStore deletes the legacy shared <dm>-store PVC once no live Deployment

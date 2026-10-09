@@ -107,6 +107,35 @@ var _ = Describe("Recreate rollout strategy", func() {
 	depExists := func(name, rev string) bool {
 		return k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, &appsv1.Deployment{}) == nil
 	}
+	svcRev := func(name string) string {
+		svc := &corev1.Service{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, svc); err != nil {
+			return ""
+		}
+		return svc.Spec.Selector[decisionmodelv1alpha1.LabelRevision]
+	}
+	// settleDeployment marks a revision's Deployment as a completed rollout
+	// (Progressing=True/NewReplicaSetAvailable, observedGeneration == generation),
+	// so stableRolloutState reports rolloutIdle and a later Pod shortfall counts as
+	// a health failure (not a rollout in progress).
+	settleDeployment := func(name, rev string) {
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + rev}, dep)).To(Succeed())
+		spec := int32(1)
+		if dep.Spec.Replicas != nil {
+			spec = *dep.Spec.Replicas
+		}
+		dep.Status.ObservedGeneration = dep.Generation
+		dep.Status.Replicas = spec
+		dep.Status.UpdatedReplicas = spec
+		dep.Status.AvailableReplicas = spec
+		dep.Status.ReadyReplicas = spec
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue,
+			Reason: "NewReplicaSetAvailable", Message: "ReplicaSet has successfully progressed.",
+		}}
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+	}
 	stableProber := func() *revProber {
 		return &revProber{fallback: engine.Loaded{Name: model1, Digest: defaultDigest, Device: "cpu"}}
 	}
@@ -125,6 +154,34 @@ var _ = Describe("Recreate rollout strategy", func() {
 			return getDM(name).Status.Phase
 		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 		return rev1
+	}
+
+	// driveRecreatePromote takes an already-stable Recreate DM through a full
+	// candidate rollout to promotion: new model -> cached -> stable stopped ->
+	// stable Pods deleted -> candidate started and model-ready -> promoted. Returns
+	// (prevRev, newStableRev). After it the old stable is PreviousRevision (at 0)
+	// inside the stabilization window.
+	driveRecreatePromote := func(r *DecisionModelReconciler, pr *revProber, name, prevRev, ip string) string {
+		Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, name)
+		markJob(name, rev2)
+		rec(r, name) // Cached -> stable stopped
+		Expect(getDM(name).Status.StableStoppedForRevision).To(Equal(rev2))
+		deleteStablePod(name, prevRev)
+		rec(r, name) // candidate started
+		gatedPod(name, rev2, ip)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, name)
+			return getDM(name).Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(rev2))
+		Expect(getDM(name).Status.PreviousRevision).NotTo(BeNil())
+		Expect(getDM(name).Status.PreviousRevision.Hash).To(Equal(prevRev))
+		return rev2
 	}
 
 	BeforeEach(func() {
@@ -265,6 +322,111 @@ var _ = Describe("Recreate rollout strategy", func() {
 		Expect(depReplicas("bg", rev1)).To(Equal(int32(1)), "stable keeps serving (BlueGreen)")
 		rec(r, "bg")
 		Expect(depExists("bg", rev2)).To(BeTrue(), "candidate runs alongside the stable")
+	})
+
+	It("keeps the previous revision scaled to 0 during the stabilization window and stages a capacity-safe rollback when the new stable turns unhealthy", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rbk"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "rbk")
+		rev2 := driveRecreatePromote(r, pr, "rbk", rev1, "10.0.5.2")
+
+		// Point 1: the previous revision (old stable) stays scaled to 0 for the
+		// whole window — it was stopped for the Recreate rollout and must not take
+		// the single GPU back.
+		prevDep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rbk-" + rev1}, prevDep)).To(Succeed())
+		Expect(prevDep.Spec.Replicas).NotTo(BeNil())
+		Expect(*prevDep.Spec.Replicas).To(Equal(int32(0)), "previous revision stays at 0 during the window")
+
+		// Make the new stable unhealthy within the window: delete its only Pod
+		// (quorum shortfall). Reconcile once to start the unhealthy debounce, then
+		// advance past it so the rollback fires on the next reconcile.
+		settleDeployment("rbk", rev2) // rollout complete, so the shortfall is a health failure
+		deleteStablePod("rbk", rev2)
+		rec(r, "rbk") // observes the shortfall, starts the debounce clock
+		clock.add(postPromotionDebounce + time.Minute)
+
+		// The staged rollback starts: RecreateRollback recorded, failed workloads
+		// deleted, Service NOT yet switched to the target.
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "rbk")
+			return getDM("rbk").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil(), "staged Recreate rollback recorded")
+		Expect(getDM("rbk").Status.RecreateRollback.Target).To(Equal(rev1))
+		Expect(getDM("rbk").Status.RecreateRollback.Failed).To(Equal(rev2))
+		Expect(getDM("rbk").Status.StableRevision.Hash).To(Equal(rev1), "status stable is the target")
+		Expect(svcRev("rbk")).NotTo(Equal(rev1), "Service not switched to the target until it is model-ready")
+
+		// The target comes up on the freed GPU: make it model-ready; the Service
+		// then switches and the marker clears.
+		gatedPod("rbk", rev1, "10.0.5.3")
+		Eventually(func() string {
+			rec(r, "rbk")
+			return svcRev("rbk")
+		}, "5s", "50ms").Should(Equal(rev1), "Service switched to the target once it is model-ready")
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "rbk")
+			return getDM("rbk").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil(), "rollback marker cleared")
+		Expect(getDM("rbk").Status.FailedRevision).NotTo(BeNil())
+		Expect(getDM("rbk").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	It("resumes a staged Recreate rollback after a restart", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rbk2"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "rbk2")
+		rev2 := driveRecreatePromote(r, pr, "rbk2", rev1, "10.0.6.2")
+		settleDeployment("rbk2", rev2)
+		deleteStablePod("rbk2", rev2)
+		rec(r, "rbk2") // start the unhealthy debounce
+		clock.add(postPromotionDebounce + time.Minute)
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "rbk2")
+			return getDM("rbk2").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil())
+
+		// Fresh reconciler (empty RAM): it must resume the staged rollback from
+		// status alone — keep the Service off the target until it is ready, then
+		// switch and clear the marker.
+		pr2 := stableProber()
+		pr2.set(rev1, engine.Loaded{Name: model1, Digest: defaultDigest, Device: "cpu"})
+		pr2.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		r2 := newReconciler(eng, pr2)
+		r2.Now = clock.now
+		rec(r2, "rbk2")
+		Expect(getDM("rbk2").Status.RecreateRollback).NotTo(BeNil(), "rollback still staged after restart")
+		Expect(svcRev("rbk2")).NotTo(Equal(rev1), "Service still not on the target before it is ready")
+
+		gatedPod("rbk2", rev1, "10.0.6.3")
+		Eventually(func() string {
+			rec(r2, "rbk2")
+			return svcRev("rbk2")
+		}, "5s", "50ms").Should(Equal(rev1), "restarted reconciler finishes the rollback")
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r2, "rbk2")
+			return getDM("rbk2").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil())
 	})
 
 	It("rejects strategy Recreate combined with Manual promotion (CEL)", func() {
