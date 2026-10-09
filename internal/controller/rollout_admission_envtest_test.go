@@ -317,6 +317,66 @@ var _ = Describe("durable rollout admission", func() {
 		// Steady state: exactly the budget is in flight (the rest queued), none lost.
 		Expect(admitted()).To(Equal(limit), "exactly the budget is admitted once things settle")
 	})
+
+	// Item 13: budget scoped across two watched namespaces, limit 1. One admission
+	// across the pair holds the only slot; a DM in the other watched namespace
+	// queues. A DM in a THIRD, unwatched namespace is neither counted nor
+	// reconciled (so it cannot occupy or be blocked by the budget).
+	It("scopes the budget across watched namespaces and ignores unwatched ones", func() {
+		nsA := namespace + "-a"
+		nsB := namespace + "-b"
+		nsOut := namespace + "-out"
+		for _, n := range []string{nsA, nsB, nsOut} {
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: n}})).To(Succeed())
+		}
+		prober := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := &DecisionModelReconciler{
+			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines: map[string]engine.Engine{"ollaya": newFakeEngine()}, Prober: prober,
+			Recorder: events.NewFakeRecorder(128), MaxConcurrentRollouts: 1,
+			WatchNamespaces: []string{nsA, nsB},
+			Now:             func() time.Time { return clock },
+		}
+		mk := func(ns, name, model string) {
+			Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+				Spec: decisionmodelv1alpha1.DecisionModelSpec{
+					Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				},
+			})).To(Succeed())
+		}
+		get := func(ns, name string) *decisionmodelv1alpha1.DecisionModel {
+			dm := &decisionmodelv1alpha1.DecisionModel{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, dm)).To(Succeed())
+			return dm
+		}
+		recNS := func(ns, name string) {
+			_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		}
+
+		mk(nsA, "a", "laya:en")
+		mk(nsB, "b", "kev:en")
+		mk(nsOut, "c", "laya:en")
+		for _, nm := range []struct{ ns, n, model string }{{nsA, "a", "laya:en"}, {nsB, "b", "kev:en"}} {
+			rev := RevisionHash(get(nm.ns, nm.n).Spec, defaultDigest, fakeImage)
+			prober.set(rev, engine.Loaded{Name: nm.model, Digest: defaultDigest, Device: "cpu"})
+		}
+
+		// A (nsA) is admitted and holds the only cross-namespace slot.
+		recNS(nsA, "a")
+		Expect(get(nsA, "a").Status.CandidateRevision).NotTo(BeNil(), "A admitted")
+
+		// B (nsB) must queue behind A even though it is a different namespace.
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			recNS(nsB, "b")
+			return get(nsB, "b").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhasePending), "B queued behind A across namespaces")
+
+		// C (unwatched nsOut) is ignored: a reconcile is a no-op (no status written),
+		// and it is not counted against the budget.
+		recNS(nsOut, "c")
+		Expect(get(nsOut, "c").Status.Phase).To(BeEmpty(), "an unwatched DM is not reconciled")
+	})
 })
 
 // namespaceDMName maps a store PVC name (<dm>-store-<rev>) back to the DM name by

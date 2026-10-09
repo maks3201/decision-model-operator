@@ -169,7 +169,13 @@ Rollout strategy (`rollout.strategy`, default `BlueGreen`):
     at every step). Serving is therefore **down from the moment the new stable is declared
     unhealthy until the restored revision is model-ready** — the price of a single-GPU rollback.
     With BlueGreen the previous revision keeps running through the window, so its rollback is
-    instant (just a Service switch).
+    instant (just a Service switch). The restored revision's readiness is **availability-first**:
+    the Service is switched as soon as **one** replica is model-ready (restore serving sooner),
+    but `Ready` is reported only when **all** desired replicas are model-ready; while a subset is
+    ready the DecisionModel is `Degraded` (`ReplicasNotModelReady`). A `Recreate` rollout that
+    stopped the stable also reports `Ready=False` (`StableRestoring`) while the stable is scaling
+    back up on any ending path (candidate rejected, spec reverted, strategy flipped), never a
+    premature `Ready` while the stable sits at zero replicas.
 
 In-place rules:
 - A running stable is rendered from its recorded identity; its placement and resources are frozen

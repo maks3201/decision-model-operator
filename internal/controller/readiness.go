@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -445,6 +446,64 @@ func (r *DecisionModelReconciler) requeueIfShort(ready, desired int32) ctrl.Resu
 		return ctrl.Result{RequeueAfter: probeRequeue}
 	}
 	return ctrl.Result{}
+}
+
+// degradeStableWhileQueued surfaces a stable-revision health problem on the
+// Degraded condition (and an Event) WHILE a candidate is RolloutQueued, WITHOUT
+// flipping the phase: a broken production stable must not hide behind "queued".
+// It only touches ModelReady + Degraded (never phase or Ready — the stable keeps
+// serving on whatever replicas are up, and the phase stays Pending/RolloutQueued
+// owned by the queue). When all desired replicas are model-ready it clears the
+// replica-shortfall Degraded it had set (preserving any other Degraded cause set
+// elsewhere this reconcile is out of scope here — this path only sets/clears the
+// replica reason). The Warning is emitted once per transition into a shortfall.
+func (r *DecisionModelReconciler) degradeStableWhileQueued(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	ready, desired int32,
+) {
+	if ready >= desired {
+		// Healthy: if we previously set a replica-shortfall Degraded, clear it.
+		if cur := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded); cur != nil &&
+			(cur.Reason == reasonReplicasNotModelReady || cur.Reason == reasonNoModelReadyPods) {
+			setStatusCondition(dm, metav1.Condition{
+				Type:    decisionmodelv1alpha1.ConditionDegraded,
+				Status:  metav1.ConditionFalse,
+				Reason:  reasonReady,
+				Message: "stable revision model-ready on all replicas",
+			})
+		}
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionModelReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  reasonReady,
+			Message: fmt.Sprintf("%d/%d replicas model-ready", ready, desired),
+		})
+		return
+	}
+	reason := reasonReplicasNotModelReady
+	if ready == 0 {
+		reason = reasonNoModelReadyPods
+	}
+	msg := fmt.Sprintf("stable revision degraded while a candidate is queued: %d/%d replicas model-ready", ready, desired)
+	// Emit the Warning once per transition into (or change of reason for) the
+	// shortfall, not on every requeue.
+	cur := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	if cur == nil || cur.Status != metav1.ConditionTrue || cur.Reason != reason {
+		r.event(ctx, dm, corev1.EventTypeWarning, reason, "%s", msg)
+	}
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionModelReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: msg,
+	})
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: msg,
+	})
 }
 
 func (r *DecisionModelReconciler) prober() Prober {

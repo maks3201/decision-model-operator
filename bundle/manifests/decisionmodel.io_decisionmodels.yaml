@@ -541,6 +541,13 @@ spec:
                     true (production would be down while the candidate waits for approval)'
                   rule: '!(has(self.strategy) && self.strategy == ''Recreate'') ||
                     (!has(self.manualPromotion) || !self.manualPromotion)'
+                - message: 'strategy: Recreate with evaluation requires a non-zero
+                    minAccuracy: relative gates (maxAccuracyDrop/maxECEIncrease/maxMacroF1Drop)
+                    are skipped under Recreate because the stopped stable gives no
+                    baseline, so a zero minAccuracy would promote with no effective
+                    gate'
+                  rule: '!(has(self.strategy) && self.strategy == ''Recreate'' &&
+                    has(self.evaluation)) || !self.evaluation.minAccuracy.matches(''^0(\\.0+)?$'')'
               runtimeVersion:
                 description: |-
                   RuntimeVersion pins the engine runtime release (e.g. "0.10.0", plain

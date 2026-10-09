@@ -330,4 +330,50 @@ var _ = Describe("stable maintenance while a candidate is RolloutQueued", func()
 		}, "5s", "50ms").Should(BeTrue(), "stable PDB recreated while the candidate is queued")
 		Expect(getDM("pdb-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "still queued after the PDB recreate")
 	})
+
+	It("surfaces a stable health problem on Degraded while the candidate stays RolloutQueued", func() {
+		proberB := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		rB := newRec(proberB, 1)
+		stableRev := drive1(rB, proberB, "deg-b", "laya:en", "10.0.4.2")
+
+		// Occupy the only slot, then queue a new candidate for deg-b.
+		proberHold := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		rHold := newRec(proberHold, 1)
+		occupySlot(rHold, proberHold, "holder4", "10.0.4.1")
+		_, _ = queueCandidate(rB, proberB, "deg-b")
+		Expect(getDM("deg-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending))
+
+		// Break the stable: delete its only model-ready Pod. While still queued, the
+		// next reconcile must report Degraded (the broken production stable is not
+		// hidden behind "RolloutQueued"), and the phase stays Pending.
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "deg-b-pod-" + stableRev}, pod)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+
+		Eventually(func() string {
+			rec(rB, "deg-b")
+			d := meta_Find(getDM("deg-b"), decisionmodelv1alpha1.ConditionDegraded)
+			if d == nil || d.Status != metav1.ConditionTrue {
+				return ""
+			}
+			return d.Reason
+		}, "5s", "50ms").Should(Equal(reasonNoModelReadyPods), "stable shortfall surfaced on Degraded while queued")
+		Expect(getDM("deg-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "phase stays queued, not flipped")
+		// Ready reason remains the queue reason (the candidate is still queued).
+		ready := meta_Find(getDM("deg-b"), decisionmodelv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal(reasonRolloutQueued))
+
+		// Restore the stable Pod: Degraded clears, still queued.
+		gatedPod("deg-b", stableRev, "10.0.4.3")
+		Eventually(func() metav1.ConditionStatus {
+			rec(rB, "deg-b")
+			d := meta_Find(getDM("deg-b"), decisionmodelv1alpha1.ConditionDegraded)
+			if d == nil {
+				return metav1.ConditionUnknown
+			}
+			return d.Status
+		}, "5s", "50ms").Should(Equal(metav1.ConditionFalse), "Degraded clears once the stable is model-ready again")
+		Expect(getDM("deg-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "still queued")
+	})
 })

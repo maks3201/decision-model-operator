@@ -71,7 +71,10 @@ func TestDerivedNamesForMaxLengthDM(t *testing.T) {
 		// name is 66 chars, which is valid for a PVC (only the prefetch Job name is
 		// bound by the 63-char job-name label).
 		{"store pvc", storeNameRev(dm, rev), validation.IsDNS1123Subdomain},
+		{"store pvc (10-hex)", storeNameRev(dm, legacyRev), validation.IsDNS1123Subdomain},
 		{"legacy store pvc", storeName(dm), validation.IsDNS1123Subdomain},
+		{"manifest configmap (16-hex)", manifestConfigMapName(dm, rev), validation.IsDNS1123Subdomain},
+		{"manifest configmap (10-hex)", manifestConfigMapName(dm, legacyRev), validation.IsDNS1123Subdomain},
 		{"pdb", pdbName(dm, rev), validation.IsDNS1123Label},
 		{"name label value", dm.Name, validation.IsValidLabelValue},
 		{"job-name label value (16-hex)", prefetchName(dm, rev), validation.IsValidLabelValue},

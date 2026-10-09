@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -208,6 +209,49 @@ func recreateRestoreStable(ctx context.Context, r *DecisionModelReconciler,
 	dm.Status.StableStoppedForRevision = ""
 }
 
+// clearStopMarkerThenRequeue clears a stale stopped-stable marker on the stable
+// path and persists it BEFORE the stable is rendered, then requeues so the stable
+// is rendered at its real replicas from clean state. It is the single place that
+// recovers from a Recreate rollout that stopped the stable and then ended on any
+// path other than promote/rollbackOrFail (spec reverted to the stable, a new
+// candidate rejected in preflight, strategy flipped to BlueGreen, …): without it
+// desiredReplicasForRevision would hold the stable at 0 forever. Returns
+// handled=true when it cleared the marker (the caller must return res/err).
+// While the marker is being cleared the stable is NOT yet model-ready, so Ready
+// is set False/StableRestoring; the normal stable path sets the honest Ready on
+// the requeued reconcile once the Pods come back.
+func (r *DecisionModelReconciler) clearStopMarkerThenRequeue(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+) (ctrl.Result, error) {
+	stable := dm.Status.StableRevision
+	dm.Status.StableStoppedForRevision = ""
+	if stable != nil {
+		r.event(ctx, dm, corev1.EventTypeNormal, eventStableRestored,
+			"restoring stable revision %s: the Recreate rollout that stopped it has ended", stable.Hash)
+		bufferRollout(ctx, rolloutStableRestored)
+	}
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  reasonStableRestoring,
+		Message: "scaling the stable revision back up after a Recreate rollout",
+	})
+	r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseStarting)
+	persisted, conflict, err := r.persistStatus(ctx, dm)
+	if conflict {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !persisted {
+		return ctrl.Result{}, nil
+	}
+	// Marker durably cleared; requeue so the stable renders at its real replicas.
+	return ctrl.Result{RequeueAfter: probeRequeue}, nil
+}
+
 // recreateBaselineUnavailable reports whether a Recreate rollout has the stable
 // scaled to 0, so a relative eval gate's baseline (which needs a live stable Pod)
 // cannot be measured and must be skipped rather than failing closed. It is only
@@ -350,7 +394,8 @@ func (r *DecisionModelReconciler) reconcileRecreateRollback(
 		}
 		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
 	}
-	// 4. Target is up: switch the Service to it, clear the marker, announce.
+	// 4. Target has >= 1 model-ready Pod: switch the Service to it (availability
+	// first — restore serving as soon as one Pod is up), clear the marker, announce.
 	if serr := r.ensureService(ctx, dm, eng, target.Hash); serr != nil {
 		if errors.Is(serr, errResourceConflict) {
 			return r.finish(ctx, dm, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil)
@@ -361,13 +406,12 @@ func (r *DecisionModelReconciler) reconcileRecreateRollback(
 		"Recreate rollback complete: restored revision %s and switched traffic to it", target.Hash)
 	bufferRollout(ctx, rolloutStableRestored)
 	dm.Status.RecreateRollback = nil
-	setStatusCondition(dm, metav1.Condition{
-		Type:    decisionmodelv1alpha1.ConditionReady,
-		Status:  metav1.ConditionTrue,
-		Reason:  reasonCandidateRejected,
-		Message: fmt.Sprintf("rolled back to %s; it is serving again", target.Hash),
-	})
-	return r.finish(ctx, dm, r.regateRequeue(), nil)
+	// Honest readiness for N replicas: the Service is switched at ready>=1, but
+	// Ready is True only when ALL desired replicas are model-ready; while
+	// ready<desired the DM is Degraded=ReplicasNotModelReady (serving on a subset).
+	// applyStableReadiness sets phase + Ready/ModelReady/Degraded accordingly.
+	r.applyStableReadiness(ctx, dm, ready, desiredReplicas(dm), false)
+	return r.finish(ctx, dm, r.requeueIfShort(ready, desiredReplicas(dm)), nil)
 }
 
 // recreateRollbackTimedOut abandons a staged Recreate rollback whose target never

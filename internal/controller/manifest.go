@@ -53,10 +53,14 @@ func digestOf(b []byte) string {
 }
 
 // ensureManifestConfigMap persists the raw model manifest for a revision as an
-// owned, revision-labelled ConfigMap (binaryData), so a lost store can later be
-// rebuilt to EXACTLY the recorded digest even if the upstream tag moved. It is
-// idempotent and runs before the prefetch Job (persist-then-act): the durable
-// bytes exist before the Job that seeds them.
+// owned, revision-labelled ConfigMap (binaryData), so a lost store can be rebuilt
+// from the recorded bytes rather than by re-resolving the tag. When the upstream
+// tag still serves the recorded bytes this reaches EXACTLY the recorded digest;
+// when the tag has MOVED, `ollaya pull <tag>` overwrites the seed with the moved
+// bytes (ollaya-dev/ollaya#64), so the rebuild surfaces as UpstreamTagMoved rather
+// than silently serving the wrong model. It is idempotent and runs before the
+// prefetch Job (persist-then-act): the durable bytes exist before the Job that
+// seeds them.
 //
 //   - If an owned ConfigMap already holds bytes whose sha256 == digest, it is a
 //     no-op (recovery / a resumed candidate reuses it).
@@ -269,7 +273,9 @@ func (r *DecisionModelReconciler) manifestBytes(
 }
 
 // seedManifest points the prefetch Job at the persisted manifest for rev so it
-// can rebuild EXACTLY the recorded digest. When an owned, digest-verified
+// can rebuild from the recorded bytes (reaching the recorded digest when the tag
+// still serves them; a moved tag overwrites the seed and surfaces as
+// UpstreamTagMoved). When an owned, digest-verified
 // ConfigMap exists it sets params.ManifestConfigMap (the Job mounts it read-only)
 // AND params.Model.Manifest (kept for the env/seed fallback and for engines
 // that read the bytes directly). A missing/foreign/stale ConfigMap leaves both

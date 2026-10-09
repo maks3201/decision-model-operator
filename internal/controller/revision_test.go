@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,17 @@ import (
 
 // ptrInt32 is a small helper for building *int32 spec fields in tests.
 func ptrInt32(v int32) *int32 { return &v }
+
+// hashFormat is the invariant shape of a current revision hash: 16 lowercase hex.
+var hashFormat = regexp.MustCompile(`^[a-f0-9]{16}$`)
+
+// assertHashFormat fails the test unless h matches ^[a-f0-9]{16}$.
+func assertHashFormat(t *testing.T, h string) {
+	t.Helper()
+	if !hashFormat.MatchString(h) {
+		t.Errorf("hash %q does not match %s", h, hashFormat)
+	}
+}
 
 func baseSpec() decisionmodelv1alpha1.DecisionModelSpec {
 	return decisionmodelv1alpha1.DecisionModelSpec{
@@ -166,6 +178,7 @@ func TestRevisionHash(t *testing.T) {
 				if got == baseline {
 					t.Errorf("expected hash to change when %s changes, still %q", tc.name, got)
 				}
+				assertHashFormat(t, got)
 			})
 		}
 	})
@@ -178,6 +191,27 @@ func TestRevisionHash(t *testing.T) {
 			{
 				name: "replicas",
 				spec: func() decisionmodelv1alpha1.DecisionModelSpec { s := baseSpec(); s.Replicas = ptrInt32(5); return s },
+			},
+			{
+				name: "rollout",
+				spec: func() decisionmodelv1alpha1.DecisionModelSpec {
+					s := baseSpec()
+					s.Rollout = &decisionmodelv1alpha1.RolloutSpec{
+						Strategy:  decisionmodelv1alpha1.RolloutRecreate,
+						Promotion: decisionmodelv1alpha1.PromotionAutomatic,
+					}
+					return s
+				},
+			},
+			{
+				name: "cache.downloadToken",
+				spec: func() decisionmodelv1alpha1.DecisionModelSpec {
+					s := baseSpec()
+					s.Cache = &decisionmodelv1alpha1.CacheSpec{DownloadTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "hf"}, Key: "token",
+					}}
+					return s
+				},
 			},
 			{
 				name: "cache",
@@ -210,6 +244,7 @@ func TestRevisionHash(t *testing.T) {
 				if got != baseline {
 					t.Errorf("expected hash unchanged when %s changes, got %q want %q", tc.name, got, baseline)
 				}
+				assertHashFormat(t, got)
 			})
 		}
 	})

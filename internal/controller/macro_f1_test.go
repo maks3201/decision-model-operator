@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
@@ -188,6 +190,72 @@ func TestMacroF1SummaryOrderAndTruncation(t *testing.T) {
 	}
 	if hasQuestion(questions, "q24") {
 		t.Errorf("best question q24 should have been truncated out")
+	}
+}
+
+// Item 74: controller-side status bounds. A huge run (5000 cases, 200 questions,
+// 300-char ids) must still produce a small, bounded status.evaluation: the
+// per-question list caps at macroF1SummaryLimit, every id is <= maxQuestionIDLen,
+// and the serialized status stays well under a few KiB (so the API server never
+// rejects the object and etcd is not bloated).
+func TestEvaluationStatusStaysBoundedForHugeRun(t *testing.T) {
+	longID := func(n int) string {
+		return "question-" + strings.Repeat("x", 300) + "-" + pad2(n)
+	}
+	var records []eval.Record
+	for n := 0; n < 200; n++ {
+		id := longID(n)
+		correct := n % 7
+		for i := 0; i < correct; i++ {
+			records = append(records, eval.Record{QuestionID: id, Expected: "a", Predicted: "a"})
+		}
+		records = append(records, eval.Record{QuestionID: id, Expected: "b", Predicted: "a"})
+		records = append(records, eval.Record{QuestionID: id, Expected: "a", Predicted: "a"})
+	}
+	_, questions, truncated := macroF1Summary(records)
+	if !truncated {
+		t.Fatalf("expected truncated=true for 200 questions")
+	}
+	if len(questions) != macroF1SummaryLimit {
+		t.Fatalf("summary not capped: %d questions", len(questions))
+	}
+
+	candRes := evalResult{
+		accuracy:           0.9123,
+		ece:                0.0456,
+		brier:              0.0789,
+		macroF1:            0.8765,
+		total:              5000,
+		failedCases:        3,
+		calibratedCases:    5000,
+		classifiableCases:  5000,
+		questions:          questions,
+		questionsTruncated: truncated,
+	}
+	evalSpec := &decisionmodelv1alpha1.EvaluationSpec{
+		DatasetRef:  decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+		MinAccuracy: "0.90",
+	}
+	candidate := &decisionmodelv1alpha1.RevisionStatus{Hash: "abcdef0123456789"}
+	es := buildEvaluationStatus(evalSpec, candidate, candRes, nil, "p0l1cyh4sh000000", "d4t4d1g3st000000", time.Unix(1_700_000_000, 0))
+
+	// Per-question list and id lengths are bounded.
+	if len(es.Questions) > macroF1SummaryLimit {
+		t.Errorf("status carries %d questions, want <= %d", len(es.Questions), macroF1SummaryLimit)
+	}
+	for _, q := range es.Questions {
+		if len(q.ID) > maxQuestionIDLen {
+			t.Errorf("question id %q is %d chars, want <= %d", q.ID, len(q.ID), maxQuestionIDLen)
+		}
+	}
+	// The whole status.evaluation marshals small regardless of dataset size.
+	b, err := json.Marshal(es)
+	if err != nil {
+		t.Fatalf("marshal status.evaluation: %v", err)
+	}
+	const ceiling = 8 << 10 // 8 KiB — comfortably under the API server object limit
+	if len(b) > ceiling {
+		t.Errorf("status.evaluation is %d bytes, want < %d", len(b), ceiling)
 	}
 }
 

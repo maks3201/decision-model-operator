@@ -437,6 +437,21 @@ var _ = Describe("ensure* conflict and legacy recovery", func() {
 			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}}},
 		})).To(Succeed())
 		Expect(r().ensurePDB(ctx, dm, "r1")).To(MatchError(errResourceConflict))
+
+		// A foreign prefetch Job with our name is refused too (never adopted).
+		dmj := mkDM("j")
+		Expect(k8sClient.Create(ctx, &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: jobName("j", "r1"), Labels: foreignLabels},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: "x", Image: fakeImage}},
+				}},
+			},
+		})).To(Succeed())
+		jparams := r().paramsFor(dmj, defaultDigest, fakeImage, "r1")
+		_, _, _, jerr := r().ensurePrefetchJob(ctx, dmj, r().Engines["ollaya"], jparams, "r1")
+		Expect(jerr).To(MatchError(errResourceConflict))
 	})
 
 	It("recovers a lost legacy shared store under its own name", func() {
