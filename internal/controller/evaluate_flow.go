@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -636,13 +637,32 @@ func questionEvaluations(qs []eval.QuestionSummary) []decisionmodelv1alpha1.Ques
 	out := make([]decisionmodelv1alpha1.QuestionEvaluation, 0, len(qs))
 	for _, q := range qs {
 		out = append(out, decisionmodelv1alpha1.QuestionEvaluation{
-			ID:       q.ID,
+			ID:       truncateQuestionID(q.ID),
 			Cases:    int32(q.Cases),
 			Accuracy: formatDecimal(q.Accuracy),
 			MacroF1:  formatDecimal(q.MacroF1),
 		})
 	}
 	return out
+}
+
+// maxQuestionIDLen bounds a question id in status (CRD MaxLength on the field).
+const maxQuestionIDLen = 63
+
+// truncateQuestionID keeps a question id within maxQuestionIDLen. A longer id is
+// cut and given a short sha256-derived suffix so two long ids that share a prefix
+// do not collapse to the same status entry.
+func truncateQuestionID(id string) string {
+	if len(id) <= maxQuestionIDLen {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	const suffix = 9 // "-" + 8 hex
+	cut := maxQuestionIDLen - suffix
+	for cut > 0 && !utf8.RuneStart(id[cut]) { // never split a multi-byte rune
+		cut--
+	}
+	return id[:cut] + "-" + hex.EncodeToString(sum[:])[:8]
 }
 
 // buildEvaluationStatus assembles the EvaluationStatus for a finished candidate

@@ -201,6 +201,60 @@ var _ = Describe("macro-F1 evaluation gate", func() {
 		Expect(cond.Reason).To(Equal(reasonClassificationUnavailable))
 	})
 
+	// The review blocker: the fake only ever answers q1 ("billing"); a dataset
+	// that also expects a minority-class question q2 the model never answers must
+	// NOT score macro-F1 1.0 — the missing q2 answers are misses, dragging macro-F1
+	// below the floor.
+	It("fails when the candidate skips a minority-class question (missing answers are misses)", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		// Every case answers q1 ("billing") correctly and also expects q2 ("refund"),
+		// which the fake never returns -> missing -> a miss for class "refund".
+		line := `{"state":{},"questions":{"q1":{"type":"choice"},"q2":{"type":"choice"}},"expected":{"q1":"billing","q2":"refund"}}` + "\n"
+		data := ""
+		for i := 0; i < 10; i++ {
+			data += line
+		}
+		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-skip"},
+			Data:       map[string]string{"cases.jsonl": data},
+		})).To(Succeed())
+		dm := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "skip"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+					DatasetRef:  decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden-skip", Key: "cases.jsonl"}},
+					MinAccuracy: "0.40", // accuracy is 0.5 (q1 right, q2 wrong) -> passes
+					MinMacroF1:  "0.80",
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
+		rec(r, "skip")
+		rev := RevisionHash(getDM("skip").Spec, defaultDigest, fakeImage)
+		markJob("skip", rev)
+		rec(r, "skip")
+		createReadyPod("skip", rev, "skip-pod-0", "10.0.0.34")
+
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "skip")
+			return getDM("skip").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseFailed), "a skipped class must fail the macro-F1 floor")
+
+		ev := getDM("skip").Status.Evaluation
+		Expect(ev).NotTo(BeNil())
+		Expect(ev.Result).To(Equal(decisionmodelv1alpha1.EvaluationFailed))
+		Expect(ev.Reason).To(ContainSubstring("minMacroF1"))
+		// q2 is a classifiable question too, so it appears with a low macro-F1.
+		ids := map[string]bool{}
+		for _, q := range ev.Questions {
+			ids[q.ID] = true
+		}
+		Expect(ids["q2"]).To(BeTrue(), "the skipped minority question is recorded")
+		Expect(ev.ClassifiableCases).To(Equal(int32(20)), "both q1 and q2 cases feed macro-F1 (10 each)")
+	})
+
 	// A balanced dataset the fake answers perfectly promotes, and status records
 	// a macro-F1 of 1 with the per-question entry.
 	It("promotes and records macro-F1 when the candidate passes", func() {

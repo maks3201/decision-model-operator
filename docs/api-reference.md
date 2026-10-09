@@ -261,7 +261,7 @@ _Appears in:_
 | `maxEceIncrease` _string_ | MaxECEIncrease echoes the relative ECE-increase limit the gate applied, if any. |  | Optional: \{\} <br /> |
 | `minMacroF1` _string_ | MinMacroF1 echoes the macro-F1 floor the gate applied, if any. |  | Optional: \{\} <br /> |
 | `maxMacroF1Drop` _string_ | MaxMacroF1Drop echoes the macro-F1-drop limit the gate applied, if any. |  | Optional: \{\} <br /> |
-| `questions` _[QuestionEvaluation](#questionevaluation) array_ | Questions is a bounded per-question breakdown (at most 20 entries, worst<br />macro-F1 first) carried for visibility. It covers the choice/bool questions<br />that fed macro-F1; score questions are not listed. Truncated is true when<br />more questions existed than are listed. |  | Optional: \{\} <br /> |
+| `questions` _[QuestionEvaluation](#questionevaluation) array_ | Questions is a bounded per-question breakdown (at most 20 entries, worst<br />macro-F1 first) carried for visibility. It covers the choice/bool questions<br />that fed macro-F1; score questions are not listed. Truncated is true when<br />more questions existed than are listed. |  | MaxItems: 20 <br />Optional: \{\} <br /> |
 | `truncated` _boolean_ | Truncated is true when the Questions list was capped and does not show every<br />classifiable question. |  | Optional: \{\} <br /> |
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
@@ -325,7 +325,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `id` _string_ | ID is the question id. |  |  |
+| `id` _string_ | ID is the question id. Truncated with a short hash suffix when longer than<br />63 characters, so status stays bounded and two long ids do not collide. |  | MaxLength: 63 <br />Optional: \{\} <br /> |
 | `cases` _integer_ | Cases is the number of scored records for this question. |  | Optional: \{\} <br /> |
 | `accuracy` _string_ | Accuracy is the per-question accuracy (decimal string). |  | Optional: \{\} <br /> |
 | `macroF1` _string_ | MacroF1 is the per-question macro-F1 (decimal string). |  | Optional: \{\} <br /> |

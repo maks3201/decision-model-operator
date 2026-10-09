@@ -199,7 +199,74 @@ func TestMacroF1SummaryEmpty(t *testing.T) {
 	}
 }
 
-// scorePrediction marks choice and noul answers as classifiable with the right
+// expectedClass classifies a golden expected value by type: string -> choice
+// label, bool -> noul class, everything else not classifiable.
+func TestExpectedClass(t *testing.T) {
+	tests := []struct {
+		raw        string
+		wantLabel  string
+		wantClassC bool
+	}{
+		{`"billing"`, "billing", true},
+		{`""`, "", true}, // an empty expected label is still a (degenerate) class
+		{`true`, "true", true},
+		{`false`, "false", true},
+		{`2`, "", false},    // score question
+		{`2.5`, "", false},  // number
+		{`null`, "", false}, // null
+		{`{"a":1}`, "", false},
+	}
+	for _, tc := range tests {
+		label, ok := expectedClass([]byte(tc.raw))
+		if ok != tc.wantClassC || label != tc.wantLabel {
+			t.Errorf("expectedClass(%s) = (%q,%v), want (%q,%v)", tc.raw, label, ok, tc.wantLabel, tc.wantClassC)
+		}
+	}
+}
+
+// A missing answer for the minority class is recorded as a miss (predicted
+// noClass), so macro-F1 drops below 1 — this is the core of the review blocker:
+// a candidate that only ever answers the majority class must not score 1.0.
+func TestMacroF1CountsMissingAnswersAsMiss(t *testing.T) {
+	// q_major: answered correctly every time. q_minor: never answered (missing).
+	var records []eval.Record
+	for i := 0; i < 9; i++ {
+		records = append(records, eval.Record{QuestionID: "q_major", Expected: "billing", Predicted: "billing"})
+	}
+	// The minority question's expected class is recorded with the sentinel as the
+	// prediction (the model skipped it).
+	records = append(records, eval.Record{QuestionID: "q_minor", Expected: "refund", Predicted: noClass})
+
+	overall, questions, _ := macroF1Summary(records)
+	if overall >= 1.0 {
+		t.Fatalf("overall macro-F1 = %v, must be < 1 when a class is never answered", overall)
+	}
+	// q_minor's macro-F1 is 0 (both "refund" and "<none>" have F1 0); it sorts first.
+	if len(questions) == 0 || questions[0].ID != "q_minor" || questions[0].MacroF1 != 0 {
+		t.Fatalf("expected q_minor worst with macroF1 0, got %+v", questions)
+	}
+}
+
+// truncateQuestionID keeps ids within the status bound and gives two long ids a
+// distinct suffix so they do not collide.
+func TestTruncateQuestionID(t *testing.T) {
+	short := "q1"
+	if truncateQuestionID(short) != short {
+		t.Errorf("short id must be unchanged")
+	}
+	long := strings.Repeat("a", 200)
+	tr := truncateQuestionID(long)
+	if len(tr) > maxQuestionIDLen {
+		t.Errorf("truncated id length %d > %d", len(tr), maxQuestionIDLen)
+	}
+	// Two long ids sharing the first 63 chars must not collapse.
+	a := strings.Repeat("x", 100) + "A"
+	b := strings.Repeat("x", 100) + "B"
+	if truncateQuestionID(a) == truncateQuestionID(b) {
+		t.Errorf("two distinct long ids collided: %q", truncateQuestionID(a))
+	}
+}
+
 // expected/predicted class labels (what macro-F1 is computed from), and never
 // marks a score answer classifiable.
 func TestScorePredictionClassifiable(t *testing.T) {
@@ -239,10 +306,10 @@ func TestScorePredictionClassifiable(t *testing.T) {
 			wantClass: true, wantExp: "true", wantPred: "false", wantCorrect: false,
 		},
 		{
-			name:      "noul nil counts as the opposite class, a miss",
+			name:      "noul nil counts as the sentinel class, a miss",
 			ans:       engine.Answer{Type: "noul"},
 			expected:  `true`,
-			wantClass: true, wantExp: "true", wantPred: "false", wantCorrect: false,
+			wantClass: true, wantExp: "true", wantPred: noClass, wantCorrect: false,
 		},
 		{
 			name:      "score is never classifiable",
@@ -294,7 +361,7 @@ func TestEvalPolicyHashMacroF1Compatibility(t *testing.T) {
 	legacyHash := evalPolicyHash(legacy)
 	withF1Hash := evalPolicyHash(withF1)
 
-	if pinned0_4_0 != "" && legacyHash != pinned0_4_0 {
+	if legacyHash != pinned0_4_0 {
 		t.Errorf("legacy policyHash drifted: got %q, pinned %q", legacyHash, pinned0_4_0)
 	}
 	if legacyHash == withF1Hash {

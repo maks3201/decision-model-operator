@@ -539,7 +539,10 @@ const (
 // question id, how many records it had, its accuracy and its macro-F1. Only
 // choice/bool questions appear (the ones that feed macro-F1).
 type QuestionEvaluation struct {
-	// ID is the question id.
+	// ID is the question id. Truncated with a short hash suffix when longer than
+	// 63 characters, so status stays bounded and two long ids do not collide.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
 	ID string `json:"id,omitempty"`
 	// Cases is the number of scored records for this question.
 	// +optional
@@ -613,6 +616,7 @@ type EvaluationStatus struct {
 	// more questions existed than are listed.
 	// +optional
 	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=20
 	Questions []QuestionEvaluation `json:"questions,omitempty"`
 	// Truncated is true when the Questions list was capped and does not show every
 	// classifiable question.

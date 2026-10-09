@@ -144,6 +144,14 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 			return scoreOutcome{scored: false}
 		}
 		cls := scoreOutcome{classifiable: true, expectedClass: want, predictedClass: a.Choice}
+		// An empty predicted choice is "no usable answer": map it to the sentinel
+		// so it is a miss for macro-F1 like a missing answer, not its own ""
+		// class. A non-empty but wrong label stays its own class (sklearn
+		// union-of-labels; the full choice set / criteria is not available here to
+		// distinguish an out-of-set label from a legitimate alternative).
+		if a.Choice == "" {
+			cls.predictedClass = noClass
+		}
 		if p, ok := calibration.FromChoice(a.Probabilities, a.Choice, want); ok {
 			cls.scored, cls.correct, cls.pred, cls.hasCalibration = true, p.Correct, p, true
 			return cls
@@ -158,10 +166,11 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 		}
 		cls := scoreOutcome{classifiable: true, expectedClass: boolClass(want)}
 		if a.Noul == nil {
-			// No predicted side: scored, wrong, and counted as the opposite class
-			// so it is a miss for macro-F1 (never silently dropped).
+			// No predicted side: scored, wrong, and counted as the sentinel class
+			// (not the opposite class) so all "no usable answer" cases are treated
+			// alike — a miss for the expected class, never a silent pass.
 			cls.scored, cls.correct = true, false
-			cls.predictedClass = boolClass(!want)
+			cls.predictedClass = noClass
 			cls.pred, cls.hasCalibration = calibration.Prediction{Confidence: 0, Correct: false}, true
 			return cls
 		}
@@ -197,6 +206,39 @@ func boolClass(v bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// noClass is the sentinel predicted label for a case whose answer is missing,
+// unscorable, empty or an unknown type. Using one sentinel (rather than the
+// opposite class, or each distinct garbage label) means every "no usable answer"
+// contributes at most one extra zero-F1 class to the question, not one per bad
+// label — while still counting as a miss for the expected class so a candidate
+// that skips the minority class cannot score macro-F1 1.0.
+const noClass = "<none>"
+
+// expectedClass returns the class label of a golden expected value for a
+// classifiable (choice/bool) question, and whether it is classifiable at all. A
+// JSON string is a choice label; a JSON bool is a noul class ("true"/"false").
+// Anything else (a number for a score question, null, malformed) is not
+// classifiable and does not feed macro-F1. This reads the EXPECTED value only, so
+// a record is produced for every classifiable case regardless of what the model
+// answered (missing, unscorable) — the predicted side is the noClass sentinel
+// then.
+func expectedClass(want json.RawMessage) (label string, classifiable bool) {
+	// json.Unmarshal of "null" into a string/bool is a no-op (no error), so reject
+	// it explicitly rather than reading it as an empty choice label.
+	if len(want) == 0 || string(bytes.TrimSpace(want)) == "null" {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(want, &s); err == nil {
+		return s, true
+	}
+	var b bool
+	if err := json.Unmarshal(want, &b); err == nil {
+		return boolClass(b), true
+	}
+	return "", false
 }
 
 // evalResult is the outcome of an evaluation run.
@@ -285,10 +327,17 @@ func runEvaluation(
 		}
 		for qid, want := range c.Expected {
 			total++
+			expClass, classifiable := expectedClass(want)
 			ans, ok := resp.Answers[qid]
 			if !ok {
+				// Missing answer: a miss for the expected class. Still record it for
+				// macro-F1 (predicted = sentinel) so a candidate that skips a class
+				// cannot score macro-F1 1.0 on the classes it did answer.
 				failed++
 				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
+				if classifiable {
+					records = append(records, eval.Record{QuestionID: qid, Expected: expClass, Predicted: noClass})
+				}
 				continue
 			}
 			tol := scoreTolerance
@@ -299,8 +348,14 @@ func runEvaluation(
 			}
 			out := scorePrediction(ans, want, tol)
 			if !out.scored {
+				// Unknown answer type or malformed expected value: a miss. Record it
+				// against the expected class (sentinel predicted) when the expected
+				// value itself is classifiable.
 				failed++
 				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
+				if classifiable {
+					records = append(records, eval.Record{QuestionID: qid, Expected: expClass, Predicted: noClass})
+				}
 				continue
 			}
 			if out.hasCalibration {
