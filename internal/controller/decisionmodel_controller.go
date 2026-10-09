@@ -202,6 +202,8 @@ const (
 	eventUnpinnedRuntimeImage  = "UnpinnedRuntimeImage"
 	eventServingImageApplied   = "ServingImageApplied"
 	eventReplicasCoLocated     = "ReplicasCoLocated"
+	eventStableStopped         = "StableStopped"
+	eventStableRestored        = "StableRestored"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -524,13 +526,22 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	// --max-concurrent-rollouts; a queued candidate must not create its
 	// per-revision PVC (provision a volume) while it waits, and must keep its
 	// previous revision + Stabilizing condition so the current window still
-	// protects it (an unhealthy stable can still roll back while queued — the
-	// stable path owns that, reached on the next reconcile for a DM with a stable
-	// revision). An already-admitted candidate, or one reusing its own window's
-	// slot, bypasses the gate so an in-flight rollout cannot deadlock.
+	// protects it. While queued (and in the store-terminating / cache-guard early
+	// returns below) the stable is still fully maintained by
+	// maintainStableWhileCandidatePending — a deleted Deployment/Service/PDB is
+	// recreated, an API-key rotation applied, Pods re-gated, and an unhealthy
+	// stable can still roll back — without creating any candidate object. An
+	// already-admitted candidate, or one reusing its own window's slot, bypasses
+	// the gate so an in-flight rollout cannot deadlock.
 	if queued, qres, qerr := r.gateRolloutBudget(ctx, dm, rev); qerr != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, qerr)
 	} else if queued {
+		// Maintain the stable while the candidate waits for a slot. A stabilization
+		// rollback (unhealthy new stable) outranks the queued candidate and returns
+		// its own result; otherwise keep the candidate parked in RolloutQueued.
+		if handled, mres, merr := r.maintainStableWhileCandidatePending(ctx, dm, eng, apiKey); handled {
+			return mres, merr
+		}
 		return qres, nil
 	}
 
@@ -555,6 +566,12 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 		return r.finish(ctx, dm, ctrl.Result{}, err)
 	}
 	if storeTerminating {
+		// The candidate's own store PVC is still terminating (a rapid re-roll of
+		// the same revision): the candidate cannot start yet, so keep the stable
+		// maintained meanwhile, exactly as in the queued branch.
+		if handled, mres, merr := r.maintainStableWhileCandidatePending(ctx, dm, eng, apiKey); handled {
+			return mres, merr
+		}
 		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
 	}
 	cacheDegraded, cacheErr := r.guardCacheSharing(ctx, dm, pvc)
@@ -1298,6 +1315,93 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	return r.finish(ctx, dm, res, nil)
 }
 
+// maintainStableWhileCandidatePending keeps the stable revision fully maintained
+// while a candidate cannot yet start — i.e. before reconcileCandidate is reached:
+// the candidate is queued behind the rollout budget, or its store PVC is
+// terminating, or the cache guard flagged it. Without this, a queued/blocked
+// candidate would leave the stable unmanaged: a deleted Deployment/Service/PDB
+// would not be recreated, an API-key rotation would not apply, Pods would not be
+// re-gated, and an unhealthy stable in its stabilization window would not roll
+// back (the comment that "the stable path owns that, reached on the next
+// reconcile" was wrong — the next reconcile takes the same blocked branch).
+//
+// It reuses the stable path's building blocks (maintainStable = Deployment+PDB+
+// regate, ensureService, reconcileStabilization) but deliberately does NOT set
+// the Ready/Degraded phase or clear status.candidateRevision: the caller owns the
+// candidate's phase (Pending/RolloutQueued), so maintaining the stable must not
+// flip the phase to Ready/Degraded and back every reconcile. The one phase it may
+// change is a stabilization rollback (an unhealthy stable rolling back to the
+// previous revision outranks a queued candidate): then handled=true and the
+// caller returns the rollback result.
+//
+// handled=true means the caller must return (res, err) now (an error, a
+// foreign-Service conflict, or a stabilization rollback). handled=false means the
+// stable is maintained and the caller proceeds with the candidate's blocked/queued
+// handling. No candidate object (PVC/Job/Deployment) is created here.
+func (r *DecisionModelReconciler) maintainStableWhileCandidatePending(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	apiKey string,
+) (handled bool, res ctrl.Result, err error) {
+	stable := dm.Status.StableRevision
+	if stable == nil {
+		return false, ctrl.Result{}, nil
+	}
+	// Deployment (rendered from recorded identity) + PDB + regate, and the Service.
+	if h, mres, merr := r.maintainStableDuringCandidate(ctx, dm, eng, apiKey); h {
+		return true, mres, merr
+	}
+	// Probe for the model-ready count the stabilization window needs. A Pod-list
+	// failure must abort (back off), not be read as 0 ready.
+	ready, _, probeErr := r.probePods(ctx, dm, eng, stable, apiKey)
+	if errors.Is(probeErr, errPodListFailed) {
+		return true, ctrl.Result{}, probeErr
+	}
+	// Post-promotion stabilization: an unhealthy new stable must still be able to
+	// roll back to the previous revision while a fresh candidate sits queued.
+	if sr := r.reconcileStabilization(ctx, dm, eng, stable, ready); sr.rolledBack || sr.err != nil {
+		return true, sr.res, sr.err
+	}
+	return false, ctrl.Result{}, nil
+}
+
+// maintainStableDuringCandidate keeps the stable revision serving while a
+// candidate rolls out: it restores the stable Deployment (rendered from recorded
+// identity, scaled to 0 only while a Recreate stop is in progress) and re-asserts
+// the Service on the stable. Returns handled=true (with the result/err the caller
+// must finish with) on an error or a foreign-Service conflict; handled=false when
+// there is no stable or everything is in sync so the caller proceeds.
+func (r *DecisionModelReconciler) maintainStableDuringCandidate(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	apiKey string,
+) (handled bool, res ctrl.Result, err error) {
+	stable := dm.Status.StableRevision
+	if stable == nil {
+		return false, ctrl.Result{}, nil
+	}
+	if merr := r.maintainStable(ctx, dm, eng, stable, apiKey); merr != nil {
+		return true, ctrl.Result{}, merr
+	}
+	if serr := r.ensureService(ctx, dm, eng, stable.Hash); serr != nil {
+		if errors.Is(serr, errResourceConflict) {
+			// A foreign Service holds our name: do not report Ready; the candidate
+			// flow still runs but traffic cannot reach the stable.
+			setStatusCondition(dm, metav1.Condition{
+				Type:    decisionmodelv1alpha1.ConditionReady,
+				Status:  metav1.ConditionFalse,
+				Reason:  reasonResourceConflict,
+				Message: fmt.Sprintf("Service %q is not owned by this DecisionModel; traffic would not reach our Pods", dm.Name),
+			})
+			return true, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil
+		}
+		return true, ctrl.Result{}, serr
+	}
+	return false, ctrl.Result{}, nil
+}
+
 // reconcileCandidate drives Caching -> Starting -> Promoting -> Ready for a
 // candidate revision (or Failed / RolledBack on failure).
 func (r *DecisionModelReconciler) reconcileCandidate(
@@ -1368,24 +1472,8 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 	// maintained: restore its Deployment if deleted, apply a key
 	// rotation, and regate its Pods — rendered from status.stableRevision, never
 	// the live spec. The Service re-assert below keeps traffic on the stable.
-	if stable := dm.Status.StableRevision; stable != nil {
-		if err := r.maintainStable(ctx, dm, eng, stable, apiKey); err != nil {
-			return r.finish(ctx, dm, ctrl.Result{}, err)
-		}
-		if err := r.ensureService(ctx, dm, eng, stable.Hash); err != nil {
-			if errors.Is(err, errResourceConflict) {
-				// A foreign Service holds our name: do not report Ready; the
-				// candidate flow still runs but traffic cannot reach the stable.
-				setStatusCondition(dm, metav1.Condition{
-					Type:    decisionmodelv1alpha1.ConditionReady,
-					Status:  metav1.ConditionFalse,
-					Reason:  reasonResourceConflict,
-					Message: fmt.Sprintf("Service %q is not owned by this DecisionModel; traffic would not reach our Pods", dm.Name),
-				})
-				return r.finish(ctx, dm, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil)
-			}
-			return r.finish(ctx, dm, ctrl.Result{}, err)
-		}
+	if handled, mres, merr := r.maintainStableDuringCandidate(ctx, dm, eng, apiKey); handled {
+		return r.finish(ctx, dm, mres, merr)
 	}
 
 	// GC stale revisions on the candidate path too: a quick successive
@@ -1442,6 +1530,15 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 		Reason:  reasonCached,
 		Message: "model present in store",
 	})
+
+	// Recreate strategy: once the model is cached, free the capacity the candidate
+	// needs by stopping the stable (scale to 0, recorded in status first) and wait
+	// until its Pods are gone before starting the candidate. BlueGreen keeps the
+	// stable running and skips this entirely. On a candidate failure the stable is
+	// scaled back (rollbackOrFail).
+	if handled, sres, serr := r.maybeRecreateStop(ctx, dm, eng, candidate); handled {
+		return r.finish(ctx, dm, sres, serr)
+	}
 
 	// 6. Serving Deployment.
 	depExisted, err := r.deploymentExists(ctx, dm, rev)

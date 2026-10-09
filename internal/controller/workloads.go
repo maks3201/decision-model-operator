@@ -298,7 +298,7 @@ func (r *DecisionModelReconciler) ensureDeployment(
 	freezeTemplate bool,
 ) error {
 	labels := revisionLabels(dm, rev)
-	desired := desiredReplicas(dm)
+	desired := desiredReplicasForRevision(dm, rev)
 
 	dep := &appsv1.Deployment{}
 	key := types.NamespacedName{Namespace: dm.Namespace, Name: revisionName(dm, rev)}
