@@ -130,6 +130,84 @@ func intstrFromInt32(p int32) intstr.IntOrString {
 	return intstr.FromInt32(p)
 }
 
+// hostnameTopologyKey is the standard node-name topology key: a pod-affinity term
+// on it co-locates Pods onto the same node.
+const hostnameTopologyKey = "kubernetes.io/hostname"
+
+// applyColocation pins a revision's serving Pods to the node already running the
+// revision's own Pods, so that with a non-shareable (ReadWriteOnce) store and
+// replicas > 1 every replica lands on the single node that holds the volume
+// instead of hanging on a Multi-Attach error on another node. It adds a REQUIRED
+// pod-affinity term (topologyKey kubernetes.io/hostname, labelSelector =
+// revisionLabels) and is a no-op when the store is shareable (RWX/ROX) or
+// replicas <= 1.
+//
+// The term is merged into any affinity already on the PodSpec (the user's
+// spec.scheduling.affinity, applied earlier) — user terms are never replaced. It
+// is a pure function of (access modes, replicas) and is applied on every reconcile
+// after freezeFromLive, so a frozen stable gets it re-derived from its current
+// replicas/cache rather than from the live Deployment. Because it is derived from
+// in-place fields (replicas, cache), it is deliberately NOT part of the revision
+// hash: scaling 1 -> 2 is an in-place update, not a new revision.
+func applyColocation(spec *corev1.PodSpec, labels map[string]string, replicas int32, modes []corev1.PersistentVolumeAccessMode) {
+	if replicas <= 1 || accessModesShareable(modes) {
+		return
+	}
+	term := corev1.PodAffinityTerm{
+		TopologyKey:   hostnameTopologyKey,
+		LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+	}
+	if spec.Affinity == nil {
+		spec.Affinity = &corev1.Affinity{}
+	}
+	if spec.Affinity.PodAffinity == nil {
+		spec.Affinity.PodAffinity = &corev1.PodAffinity{}
+	}
+	// Idempotent: do not append a duplicate of our own term if it is already there
+	// (e.g. a frozen stable whose live template already carried it).
+	for _, t := range spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		if colocationTermEqual(t, term) {
+			return
+		}
+	}
+	spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+		spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, term)
+}
+
+// colocationTermEqual reports whether an existing pod-affinity term is our
+// co-location term (same topology key and the same revisionLabels selector), so
+// applyColocation stays idempotent across reconciles.
+func colocationTermEqual(a, b corev1.PodAffinityTerm) bool {
+	if a.TopologyKey != b.TopologyKey || a.LabelSelector == nil || b.LabelSelector == nil {
+		return false
+	}
+	if len(a.LabelSelector.MatchLabels) != len(b.LabelSelector.MatchLabels) {
+		return false
+	}
+	for k, v := range b.LabelSelector.MatchLabels {
+		if a.LabelSelector.MatchLabels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// hasColocationTerm reports whether a PodSpec affinity already carries our
+// co-location term for the given revision labels, so the ReplicasCoLocated Event
+// fires only on the transition into co-location, not on every reconcile.
+func hasColocationTerm(a *corev1.Affinity, labels map[string]string) bool {
+	if a == nil || a.PodAffinity == nil {
+		return false
+	}
+	want := corev1.PodAffinityTerm{TopologyKey: hostnameTopologyKey, LabelSelector: &metav1.LabelSelector{MatchLabels: labels}}
+	for _, t := range a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		if colocationTermEqual(t, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // applyScheduling applies nodeSelector/tolerations/affinity passthrough to a PodSpec.
 func applyScheduling(spec *corev1.PodSpec, s *decisionmodelv1alpha1.SchedulingSpec) {
 	if s == nil {

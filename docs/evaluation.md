@@ -302,7 +302,7 @@ the API (safe to alert on):
 | `Ready` | `CandidateRejected` | a candidate was rejected (or rolled back after promotion); the surviving revision keeps serving |
 | `Degraded` | `EvaluationFailed` | the candidate failed a gate (message names it) |
 | `Degraded` | `PostPromotionUnhealthy` | the new stable was rolled back to the previous revision during the stabilization window |
-| `Degraded` | `CacheNotShareable` / `StoreTerminating` / `StoreLost` / `StorePrefetchFailed` | a store issue that does not stop serving |
+| `Degraded` | `StoreTerminating` / `StoreLost` / `StorePrefetchFailed` | a store issue that does not stop serving |
 | `Degraded` | `SecretNotAllowed` / `DownloadTokenInvalid` | a referenced Secret is not usable |
 
 ## Events

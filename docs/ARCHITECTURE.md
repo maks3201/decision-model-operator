@@ -198,7 +198,7 @@ while waiting; the first revision is never held.
 
 Other phases: `AwaitingPromotion` (manual promotion, §5) and `Degraded` (not all stable replicas
 are model-ready, or a referenced Secret is not allowed). The `Degraded` *condition* additionally
-flags issues that do not stop serving, e.g. `CacheNotShareable` or `StoreTerminating`. `Promoting`
+flags issues that do not stop serving, e.g. `StoreTerminating`. `Promoting`
 is reserved and never observed: promotion persists `status.stableRevision` and then moves the
 Service in one reconcile.
 
@@ -230,8 +230,10 @@ delete models. `fsGroup: 1000` (`fsGroupChangePolicy: OnRootMismatch`) on both.
 - SELinux: on enforcing nodes whose CSI driver lacks SELinux mount support the runtime relabels the
   volume to the mounting Pod's MCS level; the operator sets one stable level per DecisionModel on
   the prefetch and serving Pods so they can share the store.
-- `replicas: 1` or single node: RWO is enough. `replicas > 1` across nodes needs RWX
-  (`spec.cache.accessModes`); otherwise the operator sets `Degraded` reason `CacheNotShareable`.
+- `replicas: 1` or single node: RWO is enough. `replicas > 1` on an RWO store: the operator
+  co-locates all replicas on the node holding the volume (required host pod-affinity;
+  informational Event `ReplicasCoLocated`, a node failure then takes all replicas down). Use RWX
+  (`spec.cache.accessModes`) to spread replicas across nodes.
 - Later: node-local cache or OCI image volumes (model as an image), similar to KServe
   LocalModelCache / modelcars.
 - Air-gapped: `--ollaya-registry` / `OLLAYA_REGISTRY` → internal mirror.

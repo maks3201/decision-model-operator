@@ -113,7 +113,6 @@ const (
 	reasonProbeError         = "ProbeError"
 	reasonStartTimeout       = "StartTimeout"
 	reasonCacheTimeout       = "CacheTimeout"
-	reasonCacheNotShareable  = "CacheNotShareable"
 	reasonCacheSpecImmutable = "CacheSpecImmutable"
 
 	reasonEvaluationUnsupported     = "EvaluationUnsupported"
@@ -202,6 +201,7 @@ const (
 	eventRetryNoop             = "RetryNoop"
 	eventUnpinnedRuntimeImage  = "UnpinnedRuntimeImage"
 	eventServingImageApplied   = "ServingImageApplied"
+	eventReplicasCoLocated     = "ReplicasCoLocated"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -1141,8 +1141,8 @@ func (r *DecisionModelReconciler) preflightResolve(
 // the full stable maintenance path so a bad candidate never stops serving the
 // stable. The candidate failure is surfaced on the Resolved condition
 // (Resolved=False with the specific reason); the Degraded condition is left to
-// the stable path so a real stable-side problem (CacheNotShareable,
-// PostPromotionUnhealthy, replica shortfall) is never hidden by the candidate
+// the stable path so a real stable-side problem (PostPromotionUnhealthy, replica
+// shortfall) is never hidden by the candidate
 // reason. A Warning Event is emitted only when the Resolved reason/message
 // changes, so a persistently bad spec does not spam one per reconcile; a
 // transient failure (registry 5xx) stays quiet (no Degraded, Event only on
