@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"sort"
 	"strings"
 	"time"
 
@@ -68,16 +67,13 @@ var _ = Describe("Eval-gated macro-F1 gate", Label("eval"), Ordered, func() {
 
 	// Learned once in BeforeAll from the live model.
 	var (
-		// majorityLabel is the choice laya:en returns for most of f1Pool.
-		majorityLabel string
-		// minorityLabel is a valid, different criterion key used as the lone
-		// minority expected label the model gets "wrong".
+		// minorityLabel is a valid criterion key the model did not predict, used as
+		// the lone minority expected label (recall 0 -> drags macro-F1 down).
 		minorityLabel string
-		// imbalanced is the golden JSONL: all pool cases expected=majorityLabel,
-		// except index minorityIdx expected=minorityLabel.
+		// imbalanced is the golden JSONL built from the measured predictions with one
+		// case flipped to the minority class.
 		imbalanced string
-		// minorityIdx is the single case whose expected label is the minority
-		// class (predicted majority by the model -> a miss for that class).
+		// minorityIdx is the single case whose expected label is the minority class.
 		minorityIdx int
 	)
 
@@ -115,24 +111,19 @@ spec:
 		}
 
 		By("building the imbalanced golden set from the measured predictions")
-		majorityLabel, minorityLabel, minorityIdx = buildImbalanced(preds)
+		var labels []string
+		labels, minorityLabel, minorityIdx = buildImbalanced(preds)
 		_, _ = fmt.Fprintf(GinkgoWriter,
-			"majority=%q minority=%q minorityIdx=%d\n", majorityLabel, minorityLabel, minorityIdx)
-		Expect(majorityLabel).NotTo(BeEmpty(),
-			"could not find a dominant predicted class in the pool (predictions=%v)", preds)
-		Expect(minorityLabel).NotTo(Equal(majorityLabel))
-
-		labels := make([]string, len(f1Pool))
-		for i := range labels {
-			labels[i] = majorityLabel
-		}
-		labels[minorityIdx] = minorityLabel
+			"labels=%v minority=%q minorityIdx=%d\n", labels, minorityLabel, minorityIdx)
+		Expect(labels).NotTo(BeEmpty(),
+			"could not build an imbalanced golden set from the pool (predictions=%v)", preds)
+		Expect(minorityLabel).NotTo(BeEmpty())
 		imbalanced = poolDatasetJSONL(labels)
 
 		// Sanity-check the construction locally: accuracy is high (only the single
-		// minority case is "wrong" vs the measured majority prediction), macro-F1 is
-		// low (the minority class has recall 0). This mirrors what the operator will
-		// score, so the thresholds below are chosen to straddle them.
+		// minority case is "wrong" vs the measured prediction), macro-F1 is low (the
+		// minority class has recall 0). This mirrors what the operator will score, so
+		// the thresholds below are chosen to straddle them.
 		correct := 0
 		for i := range preds {
 			if preds[i] == labels[i] {
@@ -326,70 +317,54 @@ func measureChoice(local, state string) string {
 	return resp.Answers["q"].Choice
 }
 
-// buildImbalanced inspects the MEASURED pool predictions and returns the dominant
-// predicted class (the majority label), a different valid criterion key to use as
-// the lone minority expected label, and the pool index to assign that minority
-// label to. The minority index is a case the model predicted as the majority class,
-// so with expected=minority it is a miss for the minority class (recall 0 -> F1 0)
-// while the rest of the majority class stays correct: high accuracy, low macro-F1.
-// It returns an empty majority label when no class reaches the size needed to keep
-// accuracy above the floor (the caller fails with a clear message).
-func buildImbalanced(preds []string) (majority, minority string, minorityIdx int) {
+// buildImbalanced inspects the MEASURED pool predictions and returns a per-case
+// expected-label vector that is high-accuracy but low-macro-F1, robustly for ANY
+// model (it does not assume one predicted class already dominates). Construction:
+//
+//   - label every case with its OWN measured prediction, so those cases are correct;
+//   - flip exactly ONE case's expected label to a "minority" class the model did not
+//     predict for any case. That one case becomes a miss (accuracy = (n-1)/n), and
+//     the minority class has one expected instance with zero predictions -> recall 0,
+//     F1 0, which drags macro-F1 (the unweighted mean over classes) well below the
+//     per-class scores while accuracy stays high.
+//
+// This needs only n >= 4 pool cases (so (n-1)/n >= 0.75) and at least one of the
+// four criterion keys left unpredicted to use as the minority class -- both hold for
+// the billing-heavy pool across models. It returns the full expected-label vector,
+// the minority label and the flipped index; majority is "" only if no unpredicted
+// criterion key exists (the caller fails with a clear message), which would mean the
+// model somehow used all four classes on a 6-case billing pool.
+func buildImbalanced(preds []string) (labels []string, minority string, minorityIdx int) {
+	// Start from the model's own predictions: every case correct.
+	labels = append([]string(nil), preds...)
+
 	counts := map[string]int{}
 	for _, p := range preds {
 		counts[p]++
 	}
-	// Pick the most frequent predicted class deterministically (ties broken by
-	// label order) so the construction is stable across runs.
-	type kv struct {
-		label string
-		n     int
-	}
-	ranked := make([]kv, 0, len(counts))
-	for l, n := range counts {
-		ranked = append(ranked, kv{l, n})
-	}
-	sort.Slice(ranked, func(i, j int) bool {
-		if ranked[i].n != ranked[j].n {
-			return ranked[i].n > ranked[j].n
-		}
-		return ranked[i].label < ranked[j].label
-	})
-	if len(ranked) == 0 || ranked[0].n < 4 {
-		// Need >=4 in one class so that with one case flipped to the minority label
-		// accuracy stays >= 0.75 over the pool. The billing-heavy pool makes this
-		// reliable; fail clearly if the model split it unexpectedly.
-		return "", "", 0
-	}
-	majority = ranked[0].label
-
-	// Choose a minority label that is a valid criterion key, differs from majority,
-	// and (preferably) one the model did not predict for any pool case, so the
-	// minority class truly has recall 0.
-	order := []string{"billing", "technical", "sales", "other"}
+	// Minority class: a valid criterion key the model did NOT predict (so it has
+	// recall 0 once we assign one expected case to it). Deterministic order.
+	order := []string{"technical", "sales", "other", "billing"}
 	for _, cand := range order {
-		if cand != majority && counts[cand] == 0 {
+		if counts[cand] == 0 {
 			minority = cand
 			break
 		}
 	}
-	if minority == "" { // fallback: any valid key different from majority
-		for _, cand := range order {
-			if cand != majority {
-				minority = cand
-				break
-			}
-		}
+	if minority == "" || len(preds) < 4 {
+		// No unpredicted class to use (all four criteria appeared), or too few cases
+		// to keep accuracy >= 0.75. Neither is expected for the billing pool; the
+		// caller fails with the predictions in the message.
+		return nil, "", 0
 	}
 
-	// The minority index is a case the model predicted as the majority class.
-	for i, p := range preds {
-		if p == majority {
-			minorityIdx = i
-			break
-		}
-	}
-	return majority, minority, minorityIdx
+	// Flip the LAST case deterministically. Its expected label becomes the minority
+	// class while its prediction is whatever the model said (!= minority, since the
+	// minority class is unpredicted), so it is a guaranteed miss for the minority
+	// class. Using a fixed index keeps the construction stable across runs.
+	minorityIdx = len(preds) - 1
+	labels[minorityIdx] = minority
+	return labels, minority, minorityIdx
 }
 
 // poolDatasetJSONL builds a JSONL golden dataset over f1Pool: one choice question
