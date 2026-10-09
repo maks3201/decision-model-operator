@@ -159,6 +159,30 @@ var _ = Describe("runtime version and rollout budget", func() {
 		Expect(dep.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/ollaya-dev/ollaya:0.9.0"))
 	})
 
+	It("rolls a new revision when spec.runtimeVersion changes", func() {
+		r := newR(RuntimeVersionPinned, 0)
+		createDM("rvroll", func(s *decisionmodelv1alpha1.DecisionModelSpec) { s.RuntimeVersion = "0.9.0" })
+		rev := RevisionHash(getDM("rvroll").Spec, defaultDigest, "ghcr.io/ollaya-dev/ollaya:0.9.0")
+		driveReady(r, "rvroll", rev)
+		Expect(getDM("rvroll").Status.StableRevision.Hash).To(Equal(rev))
+
+		// Change the runtimeVersion: it is part of the revision identity (via the
+		// image), so a NEW candidate revision starts blue-green; the stable keeps
+		// serving (not an in-place roll).
+		Expect(updateDM(ctx, namespace, "rvroll", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.RuntimeVersion = "0.10.0"
+		})).To(Succeed())
+		newRev := RevisionHash(getDM("rvroll").Spec, defaultDigest, "ghcr.io/ollaya-dev/ollaya:0.10.0")
+		Expect(newRev).NotTo(Equal(rev), "runtimeVersion feeds the revision image, so it is a new revision")
+		rec(r, "rvroll")
+		dm := getDM("rvroll")
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev), "the stable keeps serving while the candidate rolls")
+		Expect(dm.Status.CandidateRevision).NotTo(BeNil())
+		Expect(dm.Status.CandidateRevision.Hash).To(Equal(newRev))
+		Expect(dm.Status.CandidateRevision.RuntimeVersion).To(Equal("0.10.0"))
+		Expect(dm.Status.CandidateRevision.Image).To(Equal("ghcr.io/ollaya-dev/ollaya:0.10.0"))
+	})
+
 	It("rejects a too-old runtimeVersion as Degraded/InvalidRuntimeVersion", func() {
 		r := newR(RuntimeVersionPinned, 0)
 		createDM("tooold", func(s *decisionmodelv1alpha1.DecisionModelSpec) { s.RuntimeVersion = "0.1.0" })

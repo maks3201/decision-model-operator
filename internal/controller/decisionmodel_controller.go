@@ -118,6 +118,10 @@ const (
 	// because the target revision never became model-ready within the Starting
 	// timeout (measured from status.recreateRollback.startedAt).
 	reasonRecreateRollbackTimeout = "RecreateRollbackTimeout"
+	// reasonStableRestoring marks the stable revision as not-yet-Ready while it is
+	// being scaled back up after a Recreate rollout stopped it (the stopped marker
+	// was cleared but the stable Pods are not model-ready again yet).
+	reasonStableRestoring = "StableRestoring"
 
 	reasonEvaluationUnsupported     = "EvaluationUnsupported"
 	reasonDatasetInvalid            = "DatasetInvalid"
@@ -134,6 +138,11 @@ const (
 	reasonEvaluationRunning = "EvaluationRunning"
 	reasonEvaluationPassed  = "EvaluationPassed"
 	reasonEvaluationSkipped = "EvaluationSkipped"
+	// reasonEvaluatedWithSkippedGates marks an evaluation that passed its absolute
+	// gates while the relative gates were skipped (Recreate stops the stable, so no
+	// baseline exists) — so a reader never mistakes it for "all configured gates
+	// passed". status.evaluation.reason carries the detail.
+	reasonEvaluatedWithSkippedGates = "EvaluatedWithSkippedGates"
 
 	// Ready-condition reason on a rollback: the candidate was rejected and the
 	// stable revision keeps serving.
@@ -1297,6 +1306,16 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	cacheDegraded bool,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	// A stopped-stable marker that survives into the stable path means a Recreate
+	// rollout that had scaled this stable to 0 is over (the spec is the stable
+	// again, or a candidate was abandoned/rejected without going through
+	// promote/rollbackOrFail). Clear it persist-FIRST, before rendering: otherwise
+	// desiredReplicasForRevision would hold the stable at 0 forever. Persisting
+	// before ensureDeployment avoids a flip-flop where the Deployment is scaled up
+	// but a crash leaves the stale marker to scale it back down next reconcile.
+	if stableStopped(dm) {
+		return r.clearStopMarkerThenRequeue(ctx, dm)
+	}
 	// Render the stable revision from its own recorded fields (not the live spec,
 	// which may already describe a pending candidate) and mount its own store
 	// claim (per-revision PVC). Fall back to the live Deployment's
@@ -1429,11 +1448,35 @@ func (r *DecisionModelReconciler) maintainStableWhileCandidatePending(
 		return true, ctrl.Result{}, probeErr
 	}
 	// Post-promotion stabilization: an unhealthy new stable must still be able to
-	// roll back to the previous revision while a fresh candidate sits queued.
+	// roll back to the previous revision while a fresh candidate sits queued. This
+	// outranks the queued candidate and returns its own result.
 	if sr := r.reconcileStabilization(ctx, dm, eng, stable, ready); sr.rolledBack || sr.err != nil {
 		return true, sr.res, sr.err
 	}
-	return false, ctrl.Result{}, nil
+	// Only on the actual RolloutQueued path (phase Pending, set by queueRollout
+	// this reconcile) do we surface the stable's health on Degraded: a broken
+	// production stable must not hide behind "RolloutQueued". The other caller (an
+	// ADMITTED candidate whose own store PVC is still terminating) is not queued —
+	// it keeps its own phase/conditions, so fall through (handled=false) there.
+	if dm.Status.Phase != decisionmodelv1alpha1.PhasePending {
+		return false, ctrl.Result{}, nil
+	}
+	// queueRollout already persisted the Pending phase this reconcile (dm carries
+	// the fresh RV); refresh the patch base to that state, set Degraded from the
+	// stable's health, then persistStatus — which no-op-skips when nothing changed
+	// (so a steady queued state stays write-free) and flushes the buffered Event on
+	// a real change. Returns handled with the queued requeue so the candidate stays
+	// parked.
+	refreshPatchBase(ctx, dm)
+	r.degradeStableWhileQueued(ctx, dm, ready, desiredReplicas(dm))
+	if persisted, conflict, perr := r.persistStatus(ctx, dm); conflict {
+		return true, ctrl.Result{RequeueAfter: time.Second}, nil
+	} else if perr != nil {
+		return true, ctrl.Result{}, perr
+	} else if !persisted {
+		return true, ctrl.Result{}, nil
+	}
+	return true, ctrl.Result{RequeueAfter: rolloutQueuedRequeue}, nil
 }
 
 // maintainStableDuringCandidate keeps the stable revision serving while a
@@ -1556,9 +1599,10 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 
 	// 5. Prefetch Job.
 	// Persist this revision's manifest (owned, revision-labelled ConfigMap) BEFORE
-	// the Job and seed params.Model.Manifest from it, so the Job rebuilds exactly
-	// the recorded digest even if the upstream tag later moves. A missing/moved
-	// manifest leaves the seed empty -> pull-by-tag + verify (today's behaviour).
+	// the Job and seed params.Model.Manifest from it. The Job always verifies the
+	// pulled manifest against the recorded digest; a tag that moved upstream fails
+	// with UpstreamTagMoved (the CLI overwrites the seed, ollaya-dev/ollaya#64). A
+	// missing manifest leaves the seed empty -> pull-by-tag + verify.
 	params = r.seedManifest(ctx, dm, params, rev, digest)
 	jobCreated, jobDone, jobFailed, err := r.ensurePrefetchJob(ctx, dm, eng, params, rev)
 	if err != nil {

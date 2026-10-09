@@ -222,6 +222,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion) || self.promotion == 'Manual'",message="manualPromotion: true conflicts with promotion; use promotion: Manual"
 // +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.promotion) || self.promotion != 'Manual')",message="strategy: Recreate cannot be combined with promotion: Manual (production would be down while the candidate waits for approval)"
 // +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.manualPromotion) || !self.manualPromotion)",message="strategy: Recreate cannot be combined with manualPromotion: true (production would be down while the candidate waits for approval)"
+// +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate' && has(self.evaluation)) || !self.evaluation.minAccuracy.matches('^0(\\\\.0+)?$')",message="strategy: Recreate with evaluation requires a non-zero minAccuracy: relative gates (maxAccuracyDrop/maxECEIncrease/maxMacroF1Drop) are skipped under Recreate because the stopped stable gives no baseline, so a zero minAccuracy would promote with no effective gate"
 type RolloutSpec struct {
 	// Strategy selects how a new revision replaces the running one: BlueGreen
 	// (default) runs both at once and switches traffic only after the candidate

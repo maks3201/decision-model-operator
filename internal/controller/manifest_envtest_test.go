@@ -42,9 +42,12 @@ import (
 )
 
 // Each revision's model manifest is persisted as an owned, revision-labelled
-// ConfigMap before the prefetch Job, so a lost store (or a tag that moved
-// upstream) can be rebuilt to EXACTLY the recorded digest from the recorded
-// bytes rather than re-resolving the (now different) tag.
+// ConfigMap before the prefetch Job, so a lost store can be rebuilt to the
+// recorded digest from the recorded bytes rather than re-resolving the tag. If
+// the upstream tag has MOVED, `ollaya pull <tag>` overwrites the seeded store
+// with the moved bytes (ollaya-dev/ollaya#64), so the rebuild does not reach the
+// recorded digest — it surfaces as UpstreamTagMoved. The persisted manifest is
+// the recorded intent and the seed for engines/registries that honour it.
 var _ = Describe("per-revision manifest persistence", func() {
 	var (
 		ctx       context.Context
@@ -163,7 +166,7 @@ var _ = Describe("per-revision manifest persistence", func() {
 		Expect(seeded).To(Equal(wantDigest), "the prefetch Job carries the seeded manifest")
 	})
 
-	It("seeds store recovery from the recorded manifest even after the tag moved", func() {
+	It("renders the prefetch Job with the recorded manifest seed after the tag moved (runtime outcome is UpstreamTagMoved)", func() {
 		eng := newFakeEngine()
 		eng.manifest = manifestBody
 		r := newR(eng)
@@ -179,6 +182,13 @@ var _ = Describe("per-revision manifest persistence", func() {
 
 		// The store-recovery path seeds the prefetch params from the recorded
 		// manifest (the stable's pinned digest), NOT by re-resolving the moved tag.
+		// NOTE: this asserts only that the Job is RENDERED with the recorded seed.
+		// It does not assert the model is rebuilt to the recorded digest at runtime:
+		// `ollaya pull <tag>` overwrites the seeded store with the moved tag's bytes
+		// (ollaya-dev/ollaya#64), so the real runtime outcome is a digest mismatch
+		// surfaced as UpstreamTagMoved (see prefetch_failure / store_recovery specs).
+		// The seed still matters as the recorded intent and for engines/registries
+		// that honour it.
 		base := r.stableParams(ctx, getDM("lost"), stable, "lost-store-"+rev)
 		seeded := r.seedManifest(ctx, getDM("lost"), base, stable.Hash, stable.Digest)
 		Expect(seeded.Model.Manifest).To(Equal(manifestBody),

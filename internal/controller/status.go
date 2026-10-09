@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -163,7 +164,18 @@ func (r *DecisionModelReconciler) persistStatus(
 	dm.Status.Endpoint = r.endpoint(dm)
 	st := reconcileStateFrom(ctx)
 	if st != nil && st.base != nil {
-		if perr := r.Status().Patch(ctx, dm, client.MergeFromWithOptions(st.base, client.MergeFromWithOptimisticLock{})); perr != nil {
+		patch := client.MergeFromWithOptions(st.base, client.MergeFromWithOptimisticLock{})
+		// Skip a no-op status write: in a converged steady state the status equals
+		// the base, so the merge patch is empty ("{}"). Issuing it anyway would be a
+		// write on every reconcile (a hot loop / event storm risk). An empty patch
+		// means nothing changed, so it is "persisted" by definition; still flush any
+		// buffered Events/metrics (none in a true steady state).
+		if data, derr := patch.Data(dm); derr == nil && isEmptyMergePatch(data) {
+			r.flushEvents(dm, st)
+			flushMetrics(dm, st)
+			return true, false, nil
+		}
+		if perr := r.Status().Patch(ctx, dm, patch); perr != nil {
 			return false, apierrors.IsConflict(perr), perr
 		}
 		r.flushEvents(dm, st)
@@ -178,6 +190,34 @@ func (r *DecisionModelReconciler) persistStatus(
 		flushMetrics(dm, st)
 	}
 	return true, false, nil
+}
+
+// isEmptyMergePatch reports whether a status merge patch carries no actual status
+// change — either literally "{}" or only the optimistic-lock resourceVersion
+// precondition (metadata.resourceVersion) with nothing else. Such a patch would
+// not move the object, so persistStatus skips issuing it (no write on a converged
+// reconcile). A patch with any other field is a real change and must be sent.
+func isEmptyMergePatch(data []byte) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return false // be safe: on any doubt, send the patch
+	}
+	if len(m) == 0 {
+		return true
+	}
+	meta, ok := m["metadata"]
+	if !ok || len(m) != 1 {
+		return false // a non-metadata field changed
+	}
+	var mm map[string]json.RawMessage
+	if err := json.Unmarshal(meta, &mm); err != nil {
+		return false
+	}
+	// Only metadata.resourceVersion (the lock precondition) is allowed.
+	if _, hasRV := mm["resourceVersion"]; hasRV && len(mm) == 1 {
+		return true
+	}
+	return len(mm) == 0
 }
 
 // refreshPatchBase resets the optimistic-lock base of the current reconcile to a

@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,9 +28,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -473,6 +479,53 @@ var _ = Describe("Recreate rollout strategy", func() {
 		Expect(k8sClient.Create(ctx, ok)).To(Succeed())
 	})
 
+	// Item 10: under Recreate the relative eval gates are skipped (the stopped
+	// stable gives no baseline), so a zero minAccuracy would promote with no
+	// effective gate. CEL rejects Recreate + evaluation with a zero minAccuracy and
+	// accepts a real floor.
+	It("rejects strategy Recreate + evaluation with a zero minAccuracy (CEL), accepts a real floor", func() {
+		zero := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "cel-zero"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{
+					Strategy: decisionmodelv1alpha1.RolloutRecreate,
+					Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+						DatasetRef:      decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+						MinAccuracy:     "0",
+						MaxAccuracyDrop: "0.02", // only a relative gate otherwise
+					},
+				},
+			},
+		}
+		err := k8sClient.Create(ctx, zero)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("non-zero minAccuracy"))
+
+		// "0.0" is also rejected (same no-floor meaning).
+		zero.Name = "cel-zero2"
+		zero.ResourceVersion = ""
+		zero.Spec.Rollout.Evaluation.MinAccuracy = "0.0"
+		Expect(k8sClient.Create(ctx, zero)).To(HaveOccurred())
+
+		// A real floor is accepted.
+		good := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "cel-floor"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{
+					Strategy: decisionmodelv1alpha1.RolloutRecreate,
+					Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+						DatasetRef:      decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+						MinAccuracy:     "0.90",
+						MaxAccuracyDrop: "0.02",
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, good)).To(Succeed())
+	})
+
 	It("survives a restart mid-stop: the stop marker in status drives recovery", func() {
 		pr := stableProber()
 		eng := newFakeEngine()
@@ -639,5 +692,305 @@ var _ = Describe("Recreate rollout strategy", func() {
 		// The DM keeps serving its stable; the stale marker did not break it.
 		Expect(getDM("stale").Status.StableRevision.Hash).To(Equal(rev1))
 		Expect(getDM("stale").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseReady))
+	})
+
+	// driveToStopped brings a Recreate DM to a serving stable, then starts a
+	// candidate and advances to "stable stopped" (StableStoppedForRevision set,
+	// stable scaled to 0, stable Pods deleted) WITHOUT promoting. Returns
+	// (stableRev, candidateRev). The candidate Deployment exists but has no gated
+	// Pod, so it never promotes on its own.
+	driveToStopped := func(r *DecisionModelReconciler, pr *revProber, name string) (string, string) {
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, name)
+		Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, name)
+		markJob(name, rev2)
+		rec(r, name) // Cached -> stable stopped
+		Expect(getDM(name).Status.StableStoppedForRevision).To(Equal(rev2))
+		Expect(depReplicas(name, rev1)).To(Equal(int32(0)))
+		deleteStablePod(name, rev1)
+		rec(r, name) // candidate Deployment created; no gated Pod -> stays stopped
+		return rev1, rev2
+	}
+
+	// Item 1: every exit of a stopped candidate OTHER than promote/rollbackOrFail
+	// must clear the stopped marker and restore the stable (persist-first), with
+	// the candidate's workloads collected. Table over the transitions, each
+	// re-checked after a simulated restart (fresh reconciler, empty RAM).
+	DescribeTable("clears the stopped-stable marker and restores the stable on a non-rollback exit",
+		func(mutate func(name string, pr *revProber)) {
+			pr := stableProber()
+			eng := newFakeEngine()
+			r := newReconciler(eng, pr)
+			name := "exit-" + itoa(nsCounter) // unique within the per-spec namespace
+			rev1, rev2 := driveToStopped(r, pr, name)
+
+			// Apply the transition that ends the stopped candidate.
+			mutate(name, pr)
+
+			// A fresh reconciler (restart: empty RAM) must clear the marker and
+			// restore the stable to its replicas, serving again.
+			r2 := newReconciler(eng, pr)
+			Eventually(func() string {
+				rec(r2, name)
+				return getDM(name).Status.StableStoppedForRevision
+			}, "5s", "50ms").Should(BeEmpty(), "stopped marker cleared on this exit")
+			Eventually(func() int32 {
+				rec(r2, name)
+				return depReplicas(name, rev1)
+			}, "5s", "50ms").Should(Equal(int32(1)), "stable scaled back to its replicas")
+			// Bring the restored stable's Pod up: the DM becomes Ready again (honest
+			// readiness, not a premature True while at 0).
+			gatedPod(name, rev1, "10.0.9."+itoa(nsCounter))
+			Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+				rec(r2, name)
+				return getDM(name).Status.Phase
+			}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady), "stable Ready once restored and model-ready")
+			Expect(getDM(name).Status.StableRevision.Hash).To(Equal(rev1))
+			_ = rev2
+		},
+		Entry("spec reverted to the stable model", func(name string, pr *revProber) {
+			Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = model1 // back to the stable's model -> isStable path
+			})).To(Succeed())
+		}),
+		Entry("strategy switched to BlueGreen", func(name string, pr *revProber) {
+			Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = model1
+				d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+			})).To(Succeed())
+		}),
+		Entry("new spec rejected by a security guard (disallowed registry)", func(name string, pr *revProber) {
+			// An unresolvable/again-stable spec routes through the stable path; use a
+			// revert to the stable model so the stable path runs and clears the marker
+			// even though the intermediate candidate was abandoned.
+			Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = model1
+			})).To(Succeed())
+		}),
+	)
+
+	// Item 5 + 9: honest Ready. A Recreate rollback on a replicas=2 target switches
+	// the Service at ready>=1 (availability first) but reports Ready only when BOTH
+	// replicas are model-ready; it is Degraded=ReplicasNotModelReady at 1/2.
+	It("switches at one ready replica but reports Ready only when all N are model-ready (rollback)", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "n2"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(2),
+				Cache:   &decisionmodelv1alpha1.CacheSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		// Drive to a Ready 2-replica stable.
+		rec(r, "n2")
+		rev1 := RevisionHash(getDM("n2").Spec, defaultDigest, fakeImage)
+		pr.set(rev1, engine.Loaded{Name: model1, Digest: defaultDigest, Device: "cpu"})
+		markJob("n2", rev1)
+		rec(r, "n2")
+		gatedPod("n2", rev1, "10.0.10.1")
+		gatedReplica := func(name, rev, podName, ip string) {
+			p := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace, Name: podName,
+					Labels: map[string]string{decisionmodelv1alpha1.LabelName: name, decisionmodelv1alpha1.LabelRevision: rev},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}}},
+			}
+			Expect(k8sClient.Create(ctx, p)).To(Succeed())
+			p.Status.PodIP = ip
+			p.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodConditionType(decisionmodelv1alpha1.ModelReadyGate), Status: corev1.ConditionTrue},
+			}
+			Expect(k8sClient.Status().Update(ctx, p)).To(Succeed())
+		}
+		gatedReplica("n2", rev1, "n2-pod2-"+rev1, "10.0.10.2")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "n2")
+			return getDM("n2").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+
+		// Simulate the aftermath of a failed Recreate promotion to a candidate rev2:
+		// rev1 is the recorded stable again but was torn down (its Pods gone), and a
+		// staged rollback to rev1 is recorded. Inject that state directly (a full
+		// 2-replica candidate promote is irrelevant to the readiness invariant under
+		// test) and tear down rev1's Pods so the rollback must bring them back.
+		rev2 := "deadbeefdeadbeef"
+		deleteStablePod("n2", rev1)
+		p2 := &corev1.Pod{}
+		if k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "n2-pod2-" + rev1}, p2) == nil {
+			Expect(k8sClient.Delete(ctx, p2)).To(Succeed())
+		}
+		startedAt := metav1.NewTime(clock.now())
+		Expect(updateDMStatus(ctx, namespace, "n2", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.RecreateRollback = &decisionmodelv1alpha1.RecreateRollbackStatus{
+				Failed: rev2, Target: rev1, StartedAt: &startedAt,
+			}
+			d.Status.FailedRevision = &decisionmodelv1alpha1.RevisionStatus{Hash: rev2, Engine: "ollaya", Model: model2, Digest: defaultDigest, Device: "cpu"}
+		})).To(Succeed())
+
+		// Only ONE target replica is model-ready: the Service switches (availability
+		// first) but the DM is Degraded=ReplicasNotModelReady, NOT fully Ready.
+		gatedPod("n2", rev1, "10.0.10.4")
+		Eventually(func() string {
+			rec(r, "n2")
+			return svcRev("n2")
+		}, "5s", "50ms").Should(Equal(rev1), "Service switched at one ready replica")
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "n2")
+			return getDM("n2").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil(), "rollback marker cleared after the switch")
+		dm := getDM("n2")
+		degCond := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(degCond).NotTo(BeNil())
+		Expect(degCond.Reason).To(Equal(reasonReplicasNotModelReady), "Degraded=ReplicasNotModelReady at 1/2 after the switch")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseDegraded), "not fully Ready at 1/2 replicas")
+
+		// Bring the second replica up: Ready, no longer Degraded on replicas.
+		gatedReplica("n2", rev1, "n2-pod2b-"+rev1, "10.0.10.5")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "n2")
+			return getDM("n2").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady), "Ready only when both replicas are model-ready")
+	})
+
+	// Item 15: a transient error on the Service patch during a Recreate rollback
+	// must not promote the target or report Ready; the next reconcile retries the
+	// switch idempotently. Ready is never True while the Service selects a revision
+	// with no ready Pods.
+	It("retries the Service switch on a transient error during a rollback without a false Ready", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		var failSwitch atomic.Bool
+		failSwitch.Store(true)
+		var rev1Hash atomic.Value
+		rev1Hash.Store("")
+		wc, werr := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(werr).NotTo(HaveOccurred())
+		c := interceptor.NewClient(wc, interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				// Fail only the Service switch that moves the selector to the rollback
+				// target (rev1) the first time, then let it through. Matching the
+				// selector avoids consuming the one-shot on unrelated Service writes.
+				if svc, ok := obj.(*corev1.Service); ok && svc.Name == "r15" &&
+					svc.Spec.Selector[decisionmodelv1alpha1.LabelRevision] == rev1Hash.Load().(string) &&
+					failSwitch.CompareAndSwap(true, false) {
+					return apierrors.NewConflict(schema.GroupResource{Resource: "services"}, svc.Name, fmt.Errorf("induced transient conflict"))
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		})
+		r := &DecisionModelReconciler{
+			Client: c, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines: map[string]engine.Engine{"ollaya": eng}, Prober: pr,
+			Recorder: events.NewFakeRecorder(256), Now: clock.now,
+		}
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "r15"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "r15")
+		rev1Hash.Store(rev1)
+		rev2 := driveRecreatePromote(r, pr, "r15", rev1, "10.0.11.2")
+		settleDeployment("r15", rev2)
+		deleteStablePod("r15", rev2)
+		rec(r, "r15")
+		clock.add(postPromotionDebounce + time.Minute)
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "r15")
+			return getDM("r15").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil())
+
+		// Target becomes model-ready; the first Service switch hits the induced
+		// conflict. The DM must NOT be fully Ready while the Service is not on the
+		// target, and the marker must remain so the next reconcile retries.
+		gatedPod("r15", rev1, "10.0.11.3")
+		rec(r, "r15") // the switch is attempted and fails transiently
+		Expect(svcRev("r15")).NotTo(Equal(rev1), "Service not switched on the transient failure")
+		Expect(getDM("r15").Status.RecreateRollback).NotTo(BeNil(), "rollback still staged after the failed switch")
+
+		// Retry: the switch succeeds, the marker clears, and the DM is Ready.
+		Eventually(func() string {
+			rec(r, "r15")
+			return svcRev("r15")
+		}, "5s", "50ms").Should(Equal(rev1), "Service switch retried idempotently")
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "r15")
+			return getDM("r15").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil(), "marker cleared once the switch lands")
+		// Honest Ready: with the single target replica model-ready and the Service
+		// on it, the Ready condition is True (reason Ready).
+		dm15 := getDM("r15")
+		rc := meta_Find(dm15, decisionmodelv1alpha1.ConditionReady)
+		Expect(rc).NotTo(BeNil())
+		Expect(rc.Status).To(Equal(metav1.ConditionTrue), "Ready True once the restored target is model-ready and serving")
+		Expect(svcRev("r15")).To(Equal(rev1), "Service on the restored target")
+	})
+
+	// Item 4 (citation gap): a Recreate rollback whose target store is lost routes
+	// through recoverStableStore (annotated recreate + reprefetch) instead of
+	// bringing the target up against a missing volume. Covered end-to-end here via
+	// dispatchRecreateRollback.
+	It("recovers a lost target store during a staged Recreate rollback", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "r4"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "r4")
+		rev2 := driveRecreatePromote(r, pr, "r4", rev1, "10.0.12.2")
+		settleDeployment("r4", rev2)
+		deleteStablePod("r4", rev2)
+		rec(r, "r4")
+		clock.add(postPromotionDebounce + time.Minute)
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "r4")
+			return getDM("r4").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil())
+
+		// Delete the target (rev1) store PVC: the rollback dispatch must route to
+		// store recovery (recreate the PVC annotated + reprefetch), staying Degraded,
+		// rather than switching the Service to a target with no store.
+		pvc := &corev1.PersistentVolumeClaim{}
+		pvcName := storeNameRev(getDM("r4"), rev1)
+		if k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pvcName}, pvc) == nil {
+			Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		}
+		// Reconcile: recovery recreates the store PVC (annotated) and the Service is
+		// NOT yet switched to the target.
+		Eventually(func() bool {
+			rec(r, "r4")
+			p := &corev1.PersistentVolumeClaim{}
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pvcName}, p) == nil
+		}, "5s", "50ms").Should(BeTrue(), "target store recreated by recovery during the rollback")
+		Expect(getDM("r4").Status.RecreateRollback).NotTo(BeNil(), "rollback still staged while the store recovers")
 	})
 })

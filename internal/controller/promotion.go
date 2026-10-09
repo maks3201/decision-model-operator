@@ -400,6 +400,7 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 	// Clear the stopped marker as part of this same (persist-then-act) failure
 	// write, so the stable scales back to its replicas on the next stable-path
 	// reconcile. Emit StableRestored. (No-op under BlueGreen / when not stopped.)
+	wasStopped := stableStopped(dm)
 	if dm.Status.StableRevision != nil {
 		recreateRestoreStable(ctx, r, dm, dm.Status.StableRevision)
 	}
@@ -410,20 +411,37 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 		Message: message,
 	})
 	if dm.Status.StableRevision != nil {
-		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseRolledBack)
-		// Ready stays True on a rollback: the stable revision keeps serving. The
-		// reason tells the story (a candidate was rejected), the Degraded condition
-		// above carries the failure detail.
-		setStatusCondition(dm, metav1.Condition{
-			Type:    decisionmodelv1alpha1.ConditionReady,
-			Status:  metav1.ConditionTrue,
-			Reason:  reasonCandidateRejected,
-			Message: fmt.Sprintf("candidate %s rejected (%s); %s keeps serving", modelRef(failed), reason, modelRef(dm.Status.StableRevision)),
-		})
-		r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
-			"candidate %s (revision %s) rejected (%s): %s; %s keeps serving",
-			modelRef(failed), failed.Hash, reason, message, modelRef(dm.Status.StableRevision))
-		bufferRollout(ctx, rolloutRolledBack)
+		if wasStopped {
+			// Recreate: the stable was at 0 and is only now scaling back up, so it is
+			// NOT serving yet. Report Ready=False/StableRestoring (not Ready=True);
+			// the stable path flips it to Ready once the restored Pods are model-ready.
+			r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseStarting)
+			setStatusCondition(dm, metav1.Condition{
+				Type:    decisionmodelv1alpha1.ConditionReady,
+				Status:  metav1.ConditionFalse,
+				Reason:  reasonStableRestoring,
+				Message: fmt.Sprintf("candidate %s rejected (%s); restoring %s (was stopped for the Recreate rollout)", modelRef(failed), reason, modelRef(dm.Status.StableRevision)),
+			})
+			r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
+				"candidate %s (revision %s) rejected (%s): %s; restoring %s",
+				modelRef(failed), failed.Hash, reason, message, modelRef(dm.Status.StableRevision))
+			bufferRollout(ctx, rolloutRolledBack)
+		} else {
+			r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseRolledBack)
+			// Ready stays True on a BlueGreen rollback: the stable revision kept
+			// serving throughout. The reason tells the story (a candidate was
+			// rejected), the Degraded condition above carries the failure detail.
+			setStatusCondition(dm, metav1.Condition{
+				Type:    decisionmodelv1alpha1.ConditionReady,
+				Status:  metav1.ConditionTrue,
+				Reason:  reasonCandidateRejected,
+				Message: fmt.Sprintf("candidate %s rejected (%s); %s keeps serving", modelRef(failed), reason, modelRef(dm.Status.StableRevision)),
+			})
+			r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBack,
+				"candidate %s (revision %s) rejected (%s): %s; %s keeps serving",
+				modelRef(failed), failed.Hash, reason, message, modelRef(dm.Status.StableRevision))
+			bufferRollout(ctx, rolloutRolledBack)
+		}
 	} else {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseFailed)
 		r.event(ctx, dm, corev1.EventTypeWarning, eventFailed,

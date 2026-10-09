@@ -76,7 +76,7 @@ metadata:
     capabilities: Full Lifecycle
     categories: AI/Machine Learning
     containerImage: ghcr.io/maks3201/decision-model-operator:v0.4.0
-    createdAt: "2026-10-09T15:38:24Z"
+    createdAt: "2026-10-09T18:45:25Z"
     description: 'Run open-source System-1 decision models served by Ollaya on Kubernetes
       and manage their full model lifecycle: pin, prefetch, verify, evaluate, promote
       and roll back.'

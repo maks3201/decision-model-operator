@@ -243,11 +243,19 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		r.event(ctx, dm, corev1.EventTypeNormal, eventEvaluationPassed,
 			"candidate %s passed evaluation: accuracy %.4f", modelRef(candidate), candRes.accuracy)
 	}
+	evaluatedReason := reasonEvaluationPassed
+	evaluatedMsg := fmt.Sprintf("accuracy %.4f", candRes.accuracy)
+	if skipRelativeForRecreate {
+		// Make the skip visible in the condition reason, not only the free-text
+		// status.evaluation.reason, so "passed" is never read as "all gates passed".
+		evaluatedReason = reasonEvaluatedWithSkippedGates
+		evaluatedMsg = fmt.Sprintf("accuracy %.4f; relative gates skipped (Recreate: no baseline)", candRes.accuracy)
+	}
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionEvaluated,
 		Status:  metav1.ConditionTrue,
-		Reason:  reasonEvaluationPassed,
-		Message: fmt.Sprintf("accuracy %.4f", candRes.accuracy),
+		Reason:  evaluatedReason,
+		Message: evaluatedMsg,
 	})
 	return r.promoteOrAwait(ctx, dm, eng, candidate, precision, cacheDegraded, policyChanged)
 }

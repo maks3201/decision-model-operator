@@ -157,6 +157,60 @@ func TestApprovalIDStableAndDistinct(t *testing.T) {
 	}
 }
 
+// Item 46-48: approvalId derives from (revision, policyHash, datasetDigest). Each
+// INDIVIDUAL policy field must shift it (through evalPolicyHash); unrelated spec
+// metadata must not. A changed dataset digest shifts it; the revision alone does.
+func TestApprovalIDSensitivity(t *testing.T) {
+	base := &decisionmodelv1alpha1.EvaluationSpec{
+		DatasetRef:  decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+		MinAccuracy: "0.90",
+	}
+	const rev, ds = "rev-abc", "dsdigest-1"
+	baseID := approvalID(rev, evalPolicyHash(base), ds)
+
+	changers := map[string]func(*decisionmodelv1alpha1.EvaluationSpec){
+		"minAccuracy":     func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MinAccuracy = "0.95" },
+		"maxAccuracyDrop": func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MaxAccuracyDrop = "0.03" },
+		"maxECE":          func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MaxECE = "0.10" },
+		"maxECEIncrease":  func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MaxECEIncrease = "0.02" },
+		"minMacroF1":      func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MinMacroF1 = "0.80" },
+		"maxMacroF1Drop":  func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MaxMacroF1Drop = "0.05" },
+		"maxCases":        func(s *decisionmodelv1alpha1.EvaluationSpec) { s.MaxCases = 1000 },
+		"scoreTolerance":  func(s *decisionmodelv1alpha1.EvaluationSpec) { s.ScoreTolerance = "1.5" },
+		"datasetRef":      func(s *decisionmodelv1alpha1.EvaluationSpec) { s.DatasetRef.ConfigMapRef.Key = "other.jsonl" },
+	}
+	for name, mut := range changers {
+		t.Run(name+" changes approvalId", func(t *testing.T) {
+			s := base.DeepCopy()
+			mut(s)
+			if got := approvalID(rev, evalPolicyHash(s), ds); got == baseID {
+				t.Errorf("approvalId unchanged when %s changed", name)
+			}
+		})
+	}
+
+	// A changed dataset DIGEST (content) shifts it even with the same policy.
+	if approvalID(rev, evalPolicyHash(base), "dsdigest-2") == baseID {
+		t.Error("approvalId unchanged when the dataset digest changed")
+	}
+	// The revision alone shifts it (two revisions, same policy+dataset).
+	if approvalID("rev-xyz", evalPolicyHash(base), ds) == baseID {
+		t.Error("approvalId unchanged across revisions")
+	}
+	// Invariance: re-rendering the identical policy yields the identical id, and
+	// canonicalisation means an equivalent tolerance spelling does not shift it.
+	if approvalID(rev, evalPolicyHash(base.DeepCopy()), ds) != baseID {
+		t.Error("approvalId not stable for an equal policy")
+	}
+	tolA := base.DeepCopy()
+	tolA.ScoreTolerance = "0.5"
+	tolB := base.DeepCopy()
+	tolB.ScoreTolerance = "0.50" // same effective value, different spelling
+	if approvalID(rev, evalPolicyHash(tolA), ds) != approvalID(rev, evalPolicyHash(tolB), ds) {
+		t.Error("approvalId must be invariant to tolerance spelling (canonicalised)")
+	}
+}
+
 func TestScoreToleranceParsing(t *testing.T) {
 	tests := []struct {
 		in   string
