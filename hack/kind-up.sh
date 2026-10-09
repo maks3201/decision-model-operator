@@ -24,6 +24,13 @@ CLUSTER="${KIND_CLUSTER:-dmo}"
 OLLAYA_IMAGE="${OLLAYA_IMAGE:-ghcr.io/ollaya-dev/ollaya:0.12.0}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 KIND_CONFIG="${KIND_CONFIG:-}"
+# Docker Hub rate-limits anonymous pulls from shared CI runners (429). Pull the
+# kind node image from Google's Docker Hub mirror instead; the digest is the same.
+# KIND_IMAGE_MIRROR="" disables the rewrite.
+KIND_IMAGE_MIRROR="${KIND_IMAGE_MIRROR-mirror.gcr.io}"
+if [[ -n "${KIND_IMAGE_MIRROR}" && "${KIND_NODE_IMAGE}" == kindest/* ]]; then
+  KIND_NODE_IMAGE="${KIND_IMAGE_MIRROR}/${KIND_NODE_IMAGE}"
+fi
 
 # Ensure Docker is reachable (OrbStack on this project). Do not auto-start it
 # from here; just fail with a clear hint.
