@@ -37,9 +37,9 @@ Verified against code, docs and local runs on 2026-09-27 (details in `docs/spike
 | `laya-serve`: FastAPI, `/v1/systemone`, `/health`; one inference at a time per Pod | `laya/serve.py` | concurrency 1 → scale out; autoscale on in-flight/queue |
 | Laya does not pin the HF revision (`snapshot_download` without `revision`) | `laya/agent.py` | the operator must resolve and pin versions itself |
 | Laya silently falls back to CPU on OOM / missing CUDA; `/health` does not show it | `laya/agent.py`, `serve.py` | the operator needs its own check of the actual device |
-| **Ollaya** (`ollaya-dev/ollaya`, 0.10.0, Rust): "Ollama for decision models". Laya, Kev, JevK5, decider, NLI, GLiClass behind one API; weights pinned to commit + sha256; `/v1/systemone`, `/api/pull`, `/api/ps`, `/api/decide` (load/unload, `keep_alive`), `503 QUEUE_FULL` | README, `docs/api.md` | **primary runtime**: the multi-model abstraction already exists |
+| **Ollaya** (`ollaya-dev/ollaya`, 0.12.0, Rust): "Ollama for decision models". Laya, Kev, JevK5, decider, NLI, GLiClass behind one API; weights pinned to commit + sha256; `/v1/systemone`, `/api/pull`, `/api/ps`, `/api/decide` (load/unload, `keep_alive`), `503 QUEUE_FULL` | README, `docs/api.md` | **primary runtime**: the multi-model abstraction already exists |
 | Ollaya has no `/metrics`; liveness is `GET /` (200 even with an API key); no implicit pull | `docs/api.md` | readiness and prefetch are the operator's job |
-| Image `ghcr.io/ollaya-dev/ollaya:0.10.0` (native arm64 + amd64; `:0.10.0-cuda` amd64 only): `ollaya serve`, `0.0.0.0:11435`, UID 1000 | spikes 001, 006 | near-default PodSpec |
+| Image `ghcr.io/ollaya-dev/ollaya:0.12.0` (native arm64 + amd64; `:0.12.0-cuda` amd64 only), rendered as `repo:tag@sha256:<index>`: `ollaya serve`, `0.0.0.0:11435`, UID 1000 | spikes 001, 006 | near-default PodSpec |
 | `/api/ps` reports `name`, `digest`, `device`, precision, `expires_at` | spike 001 | `Inspect()` for the readiness gate |
 | `POST /api/decide {"model":…,"keep_alive":-1}` loads and pins a model | spike 001 | `Warmup()` is one request |
 | Serving from a **read-only** store works; `pull` on a RO store fails | spike 001 | serving Pods mount the PVC read-only; only the prefetch Job writes |
@@ -246,8 +246,8 @@ cluster-scoped and is installed by a cluster admin.
 
 ## 8. Resources and scheduling
 
-- `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.10.0-cuda` image. GPU behaviour verified on EKS
-  (g4dn.xlarge, T4, Bottlerocket, 0.7.3-cuda; not yet re-verified on 0.10.0-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
+- `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.12.0-cuda` image. GPU behaviour verified on EKS
+  (g4dn.xlarge, T4, Bottlerocket, 0.7.3-cuda; not yet re-verified on 0.12.0-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
   (only the exact `cuda:<n>` form; anything else fails the gate). A blue-green rollout needs a
   second GPU for the candidate. Models are small (hundreds of MB to a few GB); recommend GPU
   time-slicing / MIG in the docs, the operator does not automate it.
