@@ -114,6 +114,7 @@ func (r *DecisionModelReconciler) recreateStopStable(
 		r.event(ctx, dm, corev1.EventTypeNormal, eventStableStopped,
 			"stopping stable revision %s to free capacity for candidate revision %s (Recreate strategy); "+
 				"serving is paused until the candidate is promoted", stable.Hash, candidate.Hash)
+		bufferRollout(ctx, rolloutStableStopped)
 		persisted, conflict, perr := r.persistStatus(ctx, dm)
 		if conflict {
 			return true, ctrl.Result{RequeueAfter: probeRequeue}, nil
@@ -190,6 +191,7 @@ func recreateRestoreStable(ctx context.Context, r *DecisionModelReconciler,
 	}
 	r.event(ctx, dm, corev1.EventTypeNormal, eventStableRestored,
 		"restoring stable revision %s after the Recreate candidate failed", stable.Hash)
+	bufferRollout(ctx, rolloutStableRestored)
 	dm.Status.StableStoppedForRevision = ""
 }
 
@@ -260,6 +262,7 @@ func (r *DecisionModelReconciler) reconcileRecreateRollback(
 	}
 	r.event(ctx, dm, corev1.EventTypeNormal, eventStableRestored,
 		"Recreate rollback complete: restored revision %s and switched traffic to it", target.Hash)
+	bufferRollout(ctx, rolloutStableRestored)
 	dm.Status.RecreateRollback = nil
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionReady,

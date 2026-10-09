@@ -22,10 +22,11 @@ phase, replica count, or outcome that was not persisted.
 | `decisionmodel_phase` | gauge | `namespace`, `name`, `phase` | `1` for the DecisionModel's current phase and `0` for every other phase (one-hot), so a dashboard never shows a stale phase as active. `phase` is one of `Pending`, `Resolving`, `Caching`, `Starting`, `Evaluating`, `Degraded`, `Promoting`, `Ready`, `Failed`, `RolledBack`. |
 | `decisionmodel_model_ready_replicas` | gauge | `namespace`, `name` | Number of serving replicas that passed the model-ready gate (`status.replicas.modelReady`). |
 | `decisionmodel_desired_replicas` | gauge | `namespace`, `name` | Desired number of serving replicas (`status.replicas.desired`). |
-| `decisionmodel_rollouts_total` | counter | `namespace`, `name`, `result` | Rollout outcomes. `result` is `promoted` (a revision switch was promoted), `rolled_back` (a candidate failed but a stable revision kept serving), or `failed` (a candidate failed with no stable revision to fall back to). |
+| `decisionmodel_rollouts_total` | counter | `namespace`, `name`, `result` | Rollout outcomes. `result` is `promoted` (a revision switch was promoted), `rolled_back` (a candidate failed but a stable revision kept serving), `failed` (a candidate failed with no stable revision to fall back to), `stable_stopped` (the stable revision was scaled to zero to free capacity for a candidate under the `Recreate` strategy — serving is paused), or `stable_restored` (a stopped/previous stable revision was scaled back up after a candidate failed or a `Recreate` rollback). |
 | `decisionmodel_phase_duration_seconds` | histogram | `namespace`, `name`, `phase` | Time spent in a phase, observed when that phase is left. Buckets span 5s to 1h (`5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600`). |
 | `decisionmodel_evaluation_accuracy` | gauge | `namespace`, `name` | Accuracy of the last completed eval-gated evaluation (decimal in `[0,1]`). Only set once an evaluation has completed. |
 | `decisionmodel_evaluation_ece` | gauge | `namespace`, `name` | Expected Calibration Error of the last completed evaluation (decimal in `[0,1]`). |
+| `decisionmodel_evaluation_macro_f1` | gauge | `namespace`, `name` | Macro-averaged F1 of the last completed evaluation over classifiable (choice/bool) questions (decimal in `[0,1]`). Not exported when the dataset had no classifiable question; the series is deleted rather than set to `0`, so an unclassifiable run never reads as perfectly-wrong. |
 | `decisionmodel_probe_results_total` | counter | `namespace`, `name`, `result` | Model-readiness probe outcomes, counted on a gate transition (not re-counted for a steady-state Pod each requeue). `result` is `ready`, `digest_mismatch`, `device_mismatch`, `not_pinned`, or `error`. |
 | `decisionmodel_registry_resolve_duration_seconds` | histogram | _(none)_ | Duration of a model registry tag→digest resolution. No per-DecisionModel labels (bounded by design); default Prometheus buckets. |
 
@@ -89,12 +90,14 @@ Repeated rollbacks or failures indicate a bad candidate or a flaky eval/probe.
     description: "One or more rollbacks/failures in the last 15m."
 ```
 
-Share of rollouts that did not promote, over the last hour:
+Share of rollouts that did not promote, over the last hour (count only terminal
+outcomes in the denominator — `stable_stopped`/`stable_restored` are intermediate
+`Recreate` steps, not rollout results):
 
 ```promql
 sum by (namespace, name) (increase(decisionmodel_rollouts_total{result=~"rolled_back|failed"}[1h]))
   /
-sum by (namespace, name) (increase(decisionmodel_rollouts_total[1h]))
+sum by (namespace, name) (increase(decisionmodel_rollouts_total{result=~"promoted|rolled_back|failed"}[1h]))
 ```
 
 ### Degraded
