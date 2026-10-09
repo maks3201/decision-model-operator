@@ -1,0 +1,26 @@
+# kind cluster config for the multi-node e2e suite (RWO co-location and the
+# Recreate rollout strategy). These specs need more than one node:
+#   - RWO co-location pins all replicas to the one node holding the model-store
+#     volume; a second node proves the operator does the pinning rather than
+#     the single-node layout doing it for free.
+#   - The Recreate specs pin the stable and candidate to the SAME node (a
+#     nodeSelector on spec.scheduling) with a CPU request that fits only once on
+#     that node, so the candidate cannot be scheduled next to the stable. This
+#     shows BlueGreen (both revisions at once) cannot proceed while Recreate
+#     (stop the stable first) can. The second node is where unrelated Pods and
+#     the volume for other DecisionModels can land, so the constraint is a real
+#     scheduling choice and not an artefact of a single node.
+#
+# One control-plane + two nodes. The nodes carry a stable hostname label
+# the suite selects on (kubernetes.io/hostname is the kind node name, which is
+# stable for a named cluster), plus an explicit label the specs can target.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      decisionmodel.io/e2e-node: a
+  - role: worker
+    labels:
+      decisionmodel.io/e2e-node: b

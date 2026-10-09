@@ -128,6 +128,23 @@ jobs:
             mirror: ""
             cluster: dmo-e2e-queue
             free_disk: "true"
+          # Multi-node shard: RWO co-location and the Recreate strategy. These
+          # specs need a cluster with more than one node (hack/kind-recreate.yaml,
+          # one control-plane + two nodes), so they run on their own cluster and
+          # are the only shard that passes a KIND_CONFIG. The specs carry both the
+          # "recreate" and "nightly" labels, so the single-node !nightly shards
+          # never pick them up; this shard selects them by the "recreate" label.
+          # free_disk is on: it loads the model into a stable and a candidate
+          # revision across a larger cluster. Adds one more parallel ~15-20 min
+          # kind job per run (it runs alongside the others, so wall-clock time is
+          # unchanged; it uses one more runner).
+          - name: kind (kustomize recreate, multi-node, CPU, laya:en)
+            install: kustomize
+            label: "recreate"
+            mirror: ""
+            cluster: dmo-e2e-recreate
+            kind_config: hack/kind-recreate.yaml
+            free_disk: "true"
           # helm shard: the Go suite runs only the lifecycle container on helm.
           - name: kind (helm, CPU, laya:en)
             install: helm
@@ -203,6 +220,10 @@ jobs:
           E2E_LABEL_FILTER: ${{ matrix.label }}
           # Per-shard kind cluster so the parallel shards do not collide.
           KIND_CLUSTER: ${{ matrix.cluster }}
+          # Optional kind cluster config, used only when the cluster is created.
+          # The multi-node recreate shard points this at hack/kind-recreate.yaml;
+          # empty elsewhere keeps the default single-node cluster.
+          KIND_CONFIG: ${{ matrix.kind_config }}
         run: make test-e2e
 
   # Always-reporting gate. This is the stable name for branch protection: it
