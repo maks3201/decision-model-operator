@@ -66,8 +66,11 @@ jobs:
   # Gate: upgrade from the previous published release to the release commit must
   # not re-roll a running DecisionModel (RELEASING.md §3). The new Release
   # already exists here (release-please created it), so the previous tag is
-  # resolved explicitly instead of "latest". The very first release has no
-  # previous one: the upgrade gate is then skipped (nothing to upgrade from).
+  # resolved explicitly instead of "latest". It must be the previous FINAL
+  # release: release-candidate tags (vX.Y.Z-rc.N) are prereleases and must be
+  # skipped, otherwise the gate would test an rc -> final upgrade instead of the
+  # previous final -> new final. The very first release has no previous one: the
+  # upgrade gate is then skipped (nothing to upgrade from).
   prev-release:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
@@ -85,9 +88,11 @@ jobs:
           NEW: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          prev=$(gh release list -R "$GITHUB_REPOSITORY" --limit 20 --json tagName,isDraft \
-            | jq -r --arg t "$NEW" '[.[] | select(.tagName != $t and (.isDraft | not))][0].tagName // ""')
-          if [ -z "$prev" ]; then echo "no previous release before $NEW: upgrade gate skipped"; fi
+          # --limit 50 so a long run of RCs between two finals cannot push the
+          # previous final out of the window.
+          prev=$(gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName,isDraft,isPrerelease \
+            | jq -r --arg t "$NEW" '[.[] | select(.tagName != $t and (.isDraft | not) and (.isPrerelease | not))][0].tagName // ""')
+          if [ -z "$prev" ]; then echo "no previous final release before $NEW: upgrade gate skipped"; fi
           echo "previous release: ${prev:-<none>}"
           echo "tag=$prev" >> "$GITHUB_OUTPUT"
 
