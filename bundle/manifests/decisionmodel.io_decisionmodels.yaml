@@ -59,7 +59,8 @@ spec:
 
           metadata.name must be a DNS-1035 label of at most 43 characters (see
           MaxNameLength): the operator derives a Service named after it (no dots) and
-          Job/PVC names that must stay within 63 characters.
+          Job/PVC names that must stay within 63 characters (a new revision's 16-hex hash
+          uses the short <dm>-pf-<hash> Job name so the worst case still fits 63).
         properties:
           apiVersion:
             description: |-
@@ -395,8 +396,9 @@ spec:
                     description: |-
                       ManualPromotion holds a candidate that passed its gate (model-ready, plus
                       evaluation when configured) in phase AwaitingPromotion until a human
-                      approves it by setting the annotation decisionmodel.io/promote to the
-                      candidate's revision hash. The stable revision keeps serving meanwhile.
+                      approves it by setting the annotation decisionmodel.io/promote to
+                      status.evaluation.approvalId (or, without evaluation, the candidate's
+                      revision hash for one release). The stable revision keeps serving meanwhile.
                       There is no progress timeout while waiting. The very first revision of a
                       DecisionModel (no stable revision yet) is promoted without approval, since
                       there is no traffic to protect. The approval annotation is removed once the
@@ -413,7 +415,8 @@ spec:
                         - EvaluationGated: like Automatic but requires rollout.evaluation to be
                           set (rejected by CEL otherwise); the gate decides promotion.
                         - Manual: hold the candidate in AwaitingPromotion until a human sets the
-                          annotation decisionmodel.io/promote to the candidate's revision hash
+                          annotation decisionmodel.io/promote to status.evaluation.approvalId (or,
+                          without evaluation, the candidate's revision hash for one release)
                           (evaluation still runs when configured).
                       When unset the effective policy is EvaluationGated if rollout.evaluation is
                       set, else Automatic. The deprecated manualPromotion:true is an alias for
@@ -1521,6 +1524,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
@@ -1708,6 +1721,14 @@ spec:
                   brier:
                     description: Brier is the candidate's Brier score (decimal string).
                     type: string
+                  calibratedCases:
+                    description: |-
+                      CalibratedCases is the number of scored questions that yielded a usable
+                      probability distribution and therefore contributed to ECE/Brier. A
+                      calibration gate (maxEce / maxEceIncrease) does not pass when this is 0:
+                      ECE over an empty set is 0, which would otherwise look perfectly calibrated.
+                    format: int32
+                    type: integer
                   cases:
                     description: Cases is the number of questions scored.
                     format: int32
@@ -1769,6 +1790,13 @@ spec:
                     description: Revision is the revision hash the evaluation was
                       run against.
                     type: string
+                  scorerVersion:
+                    description: |-
+                      ScorerVersion is the scoring/calibration implementation version this result
+                      was produced by. It is part of policyHash (and so approvalId), so an
+                      operator upgrade that changes scoring re-evaluates a parked candidate.
+                    format: int32
+                    type: integer
                 type: object
               failedRevision:
                 description: |-
@@ -1801,6 +1829,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
@@ -1968,6 +2006,16 @@ spec:
                         description: Image is the resolved serving container image
                           for this revision.
                         type: string
+                      imagePinned:
+                        description: |-
+                          ImagePinned records whether this revision's runtime image is pinned to an
+                          immutable digest. It is set to false only on a revision admitted with a
+                          mutable-tag runtime image because the operator runs with
+                          --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                          refuses an unpinned candidate, so an admitted revision is pinned). A false
+                          value is a durable record that this revision breaks the
+                          one-revision-hash-one-bytes guarantee.
+                        type: boolean
                       message:
                         description: |-
                           Message is a human-readable explanation of a failure. Set only on
@@ -2106,6 +2154,16 @@ spec:
                     description: Image is the resolved serving container image for
                       this revision.
                     type: string
+                  imagePinned:
+                    description: |-
+                      ImagePinned records whether this revision's runtime image is pinned to an
+                      immutable digest. It is set to false only on a revision admitted with a
+                      mutable-tag runtime image because the operator runs with
+                      --allow-unpinned-runtime-images; otherwise it is nil (the default policy
+                      refuses an unpinned candidate, so an admitted revision is pinned). A false
+                      value is a durable record that this revision breaks the
+                      one-revision-hash-one-bytes guarantee.
+                    type: boolean
                   message:
                     description: |-
                       Message is a human-readable explanation of a failure. Set only on
@@ -2201,6 +2259,32 @@ spec:
                       (e.g. "0.10.0"). Empty when the image was user-set (spec.image), because the
                       version is then unknown. Recorded so a stable revision keeps its runtime
                       version across operator upgrades under --runtime-version-policy=Pinned.
+                    type: string
+                type: object
+              storeRecovery:
+                description: |-
+                  StoreRecovery tracks the bounded retries of lost-store recovery for the
+                  stable revision. It is persisted so the attempt bound survives an operator
+                  restart (an in-memory counter would reset and allow more recreations than
+                  the documented limit).
+                properties:
+                  attempts:
+                    description: |-
+                      Attempts is the number of failed recovery prefetch Jobs counted so far
+                      toward the retry bound.
+                    format: int32
+                    type: integer
+                  exhausted:
+                    description: |-
+                      Exhausted is true once Attempts reached the bound: recovery stopped with
+                      Degraded=StorePrefetchFailed and will not recreate the prefetch Job again
+                      until a new revision or a decisionmodel.io/retry token resets it.
+                    type: boolean
+                  lastFailedJob:
+                    description: |-
+                      LastFailedJob is the UID of the last failed prefetch Job already counted, so
+                      a repeated observation of the same Job (e.g. a stale cache read) is not
+                      double-counted.
                     type: string
                 type: object
             type: object
