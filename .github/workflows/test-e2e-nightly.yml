@@ -60,8 +60,11 @@ jobs:
           # E2E_MIRROR unset so it skips for the non-laya nightly models.
           # The HA and chaos containers have their own nightly workflows
           # (test-e2e-ha.yml / test-e2e-chaos.yml, laya:en) and are excluded here so
-          # they do not add to this job's budget.
-          E2E_LABEL_FILTER: "!ha && !chaos"
+          # they do not add to this job's budget. The recreate container needs a
+          # multi-node cluster (its own shard in test-e2e.yml, built from
+          # hack/kind-recreate.yaml) and is excluded here, which runs on a single
+          # node against the non-laya nightly models.
+          E2E_LABEL_FILTER: "!ha && !chaos && !recreate"
         run: make test-e2e
 
   # Run the default per-PR E2E suite (laya:en, kustomize) on each Kubernetes minor

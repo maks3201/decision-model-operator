@@ -82,6 +82,14 @@ jobs:
           make api-docs
           git diff --exit-code -- docs/api-reference.md
 
+      # Fast, cluster-free guard over the generated ClusterRole (test/rbac): fails
+      # on a wildcard verb/resource/group, secrets beyond get, configmaps
+      # list/watch, or any rule not in the committed allow-list. It also runs as
+      # part of `make test` below; this explicit step surfaces an RBAC-widening
+      # regression immediately and independently of envtest.
+      - name: RBAC guard
+        run: go test ./test/rbac/...
+
       - name: Run tests
         run: make test
 
