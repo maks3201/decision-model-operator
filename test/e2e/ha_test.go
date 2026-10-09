@@ -516,6 +516,7 @@ func assertObservedGeneration(ns, name string) {
 // manager replica emitted it), series.count/deprecatedCount, eventTime and note are
 // visible. This is the evidence for whether a leader failover produces one emission
 // (one object, possibly count>1) or two distinct emissions from two replicas.
+//
 //nolint:unparam // reason is kept so callers can dump other terminal Events
 func dumpTerminalEvents(ns, name, reason string) {
 	out, err := utils.Kubectl("get", "events.events.k8s.io", "-n", ns,
