@@ -26,9 +26,15 @@
 #      then `helm upgrade` to the local chart + the source image.
 #   4. Assert for ~2 minutes: the quiet DMs do not roll (no candidate, same stable,
 #      same Pods, Ready) and keep serving /v1/systemone.
-#   4b. Assert the parked DM: it stays in AwaitingPromotion, but the evaluation-identity
-#      change in this release refreshes its approvalId (the OLD approvalId is ignored,
-#      the NEW one promotes it).
+#   4b. Assert the parked DM across the upgrade. The assertion depends on the
+#      from-version, because the evaluation-identity migration (bare revision hash ->
+#      approvalId) only happens on the 0.3.x -> 0.4.0 step:
+#        - from < 0.4.0: the old controller had no approvalId; the new one introduces
+#          it, so the parked candidate's approvalId goes empty -> populated and the OLD
+#          token (the bare revision hash) is ignored while the NEW approvalId promotes.
+#        - from >= 0.4.0: both sides already share the evaluation identity, so the
+#          parked candidate keeps the SAME approvalId across the upgrade and approving
+#          with that pre-upgrade approvalId promotes it (no re-approval needed).
 #   4c. Every existing object round-trips cleanly under the new CRD (get -o yaml +
 #      server-side dry-run apply) — no CRD validation error on existing objects.
 #   5. Assert the CRD upgrade actually applied: the new spec.runtimeVersion field is
@@ -103,7 +109,7 @@ if [[ -z "${from_arg}" ]]; then
   [[ -n "${GITHUB_TOKEN:-}" ]] && auth_header=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   for attempt in 1 2; do
     from_arg="$(curl -sS --proto '=https' --tlsv1.2 \
-      -H "Accept: application/vnd.github+json" "${auth_header[@]}" \
+      -H "Accept: application/vnd.github+json" ${auth_header[@]+"${auth_header[@]}"} \
       "${releases_url}" 2>/dev/null | jq -r '.tag_name // empty')"
     [[ -n "${from_arg}" ]] && break
     [[ "${attempt}" = 1 ]] && { note "release lookup failed, retrying in 5s"; sleep 5; }
@@ -111,6 +117,22 @@ if [[ -z "${from_arg}" ]]; then
   [[ -n "${from_arg}" ]] || fail "could not resolve the latest release tag; pass one explicitly"
 fi
 from_ver="${from_arg#v}"
+
+# ver_lt A B — true (0) iff semver A is strictly less than B. Uses sort -V; equal
+# versions are NOT less-than. Only plain X.Y.Z tags are compared here.
+ver_lt() {
+  [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]]
+}
+
+# The evaluation-identity migration (bare revision hash -> status.evaluation.approvalId)
+# landed in 0.4.0. It is only exercised when upgrading FROM a release older than 0.4.0.
+# From 0.4.0 onwards both the old and new controllers share the identity, so the parked
+# candidate keeps the same approvalId across the upgrade (see step 4b).
+MIGRATION_FROM="no"
+if ver_lt "${from_ver}" "0.4.0"; then
+  MIGRATION_FROM="yes"
+fi
+note "from-version ${from_ver}: evaluation-identity migration expected across the upgrade = ${MIGRATION_FROM}"
 # Pin target for step 6: a VALID engine runtime version that differs from the one the
 # released stable already runs (its image is the then-current default), so pinning it
 # forces exactly one blue-green roll. 0.7.3 is the engine's minimum supported version.
@@ -263,23 +285,31 @@ record_before "${DM_AWAIT}"
 # Park it in AwaitingPromotion: eval-gated + manual promotion, bump cpu to force a new
 # candidate that passes its gate and then waits for approval (no progress timeout while
 # parked). This DM is created and parked by the PREVIOUS released controller, so it uses
-# that release's field name: v0.3.0 has `manualPromotion: true` (the `promotion: Manual`
-# enum is newer). After the upgrade the new controller treats manualPromotion:true as an
-# alias for promotion: Manual, so the candidate stays parked across the upgrade.
+# that release's field name for the manual-promotion policy:
+#   - from < 0.4.0 (v0.3.0): only `manualPromotion: true` exists; the newer controller
+#     treats it as an alias for `promotion: Manual`.
+#   - from >= 0.4.0: the `promotion: Manual` enum is the current field; use it directly.
+# Either way the candidate stays parked across the upgrade.
+if [[ "${MIGRATION_FROM}" = "yes" ]]; then
+  manual_policy='"manualPromotion":true'
+else
+  manual_policy='"promotion":"Manual"'
+fi
 note "parking ${DM_AWAIT} in AwaitingPromotion"
 kc patch decisionmodel "${DM_AWAIT}" -n "${NS}" --type=merge -p "$(cat <<JSON
 {"spec":{"resources":{"requests":{"cpu":"300m","memory":"1Gi"},"limits":{"memory":"4Gi"}},
-"rollout":{"manualPromotion":true,"evaluation":{"datasetRef":{"configMapRef":{"name":"upgrade-golden","key":"cases.jsonl"}},"minAccuracy":"0.0"},"timeouts":{"evaluating":"30m"}}}}
+"rollout":{${manual_policy},"evaluation":{"datasetRef":{"configMapRef":{"name":"upgrade-golden","key":"cases.jsonl"}},"minAccuracy":"0.0"},"timeouts":{"evaluating":"30m"}}}}
 JSON
 )"
 wait_phase "${DM_AWAIT}" "AwaitingPromotion" 180 \
   || fail "${DM_AWAIT} did not reach AwaitingPromotion before the upgrade (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
-# On the previous release the approval token is the candidate's bare revision hash
-# (status.evaluation.approvalId did not exist yet). Record both so we can show the
-# identity change after the upgrade.
+# On the previous release the approval token differs by version. Before 0.4.0 it is the
+# candidate's bare revision hash (status.evaluation.approvalId did not exist yet); from
+# 0.4.0 onwards status.evaluation.approvalId is already populated. Record both so step
+# 4b can assert the version-appropriate behaviour.
 await_cand_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.candidateRevision.hash}')"
 await_approval_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.evaluation.approvalId}')"
-echo "pre-upgrade  ${DM_AWAIT}: parked, candidateHash=${await_cand_before} approvalId='${await_approval_before}' (empty on the old release)"
+echo "pre-upgrade  ${DM_AWAIT}: parked, candidateHash=${await_cand_before} approvalId='${await_approval_before}' (empty before 0.4.0, populated from 0.4.0)"
 
 # --- 3. build the source image + upgrade --------------------------------------
 note "building the operator image from source: ${IMG}"
@@ -331,44 +361,64 @@ answers_ok "${DM_PLAIN}" || fail "${DM_PLAIN} stopped answering /v1/systemone af
 echo "PASS: ${DM_PLAIN} serves after the upgrade."
 
 # --- 4b. the parked DecisionModel across the upgrade --------------------------
-# This release introduces the evaluation identity: status.evaluation.approvalId
-# (sha256 of revision + policyHash + datasetDigest). On the previous release the
-# approval token was the bare revision hash. After the upgrade a parked candidate must
-# therefore be re-approved with the NEW approvalId; the old bare-hash token no longer
-# promotes it. Document + assert exactly that.
-note "AwaitingPromotion: ${DM_AWAIT} must still be parked, now with a populated approvalId"
+# status.evaluation.approvalId = sha256(revision + policyHash + datasetDigest). The
+# assertion is gated on the from-version (set in MIGRATION_FROM above):
+#
+#   from < 0.4.0: the old controller had no approvalId (the approval token was the bare
+#     revision hash). The new controller introduces the identity, so a parked candidate
+#     must be re-approved with the NEW approvalId; the old bare-hash token no longer
+#     promotes it. Assert: approvalId goes empty -> populated AND changes; the old token
+#     is ignored; the new approvalId promotes.
+#
+#   from >= 0.4.0: both controllers share the identity, so the parked candidate keeps
+#     the SAME approvalId across the upgrade. Assert: approvalId is unchanged; approving
+#     with the pre-upgrade approvalId promotes it (no re-approval needed).
+note "AwaitingPromotion: ${DM_AWAIT} must still be parked after the upgrade"
 wait_phase "${DM_AWAIT}" "AwaitingPromotion" 180 \
   || fail "${DM_AWAIT} left AwaitingPromotion unexpectedly after the upgrade (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
-# The new controller re-evaluates the parked candidate under the new evaluation
-# identity and records an approvalId; poll until it is populated (a few reconciles
-# after the manager restarts).
+# Poll until the post-upgrade approvalId is populated (a few reconciles after the
+# manager restarts). From >= 0.4.0 it is populated immediately with the same value.
 await_approval_after=""
 for _ in $(seq 1 120); do
   await_approval_after="$(jp decisionmodel "${DM_AWAIT}" '{.status.evaluation.approvalId}')"
   [[ -n "${await_approval_after}" ]] && break
   sleep 5
 done
-[[ -n "${await_approval_after}" ]] || fail "${DM_AWAIT}: no approvalId populated after the upgrade (the evaluation-identity change was expected to add one)"
-echo "post-upgrade ${DM_AWAIT}: approvalId now '${await_approval_after}' (was '${await_approval_before}' on the old release)"
-[[ "${await_approval_after}" != "${await_approval_before}" ]] || fail \
-  "${DM_AWAIT}: approvalId unchanged across the upgrade; a re-approval was expected"
+[[ -n "${await_approval_after}" ]] || fail "${DM_AWAIT}: no approvalId populated after the upgrade"
+echo "post-upgrade ${DM_AWAIT}: approvalId now '${await_approval_after}' (was '${await_approval_before}' before the upgrade)"
 
-note "approving ${DM_AWAIT} with the OLD token (pre-upgrade candidate hash) must be ignored"
-kc annotate decisionmodel "${DM_AWAIT}" -n "${NS}" \
-  "decisionmodel.io/promote=${await_cand_before}" --overwrite
-# Give the controller a few reconciles; it must stay parked (the old token is stale).
-sleep 20
-stale_phase="$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}')"
-[[ "${stale_phase}" = "AwaitingPromotion" ]] || fail \
-  "${DM_AWAIT}: a stale (pre-upgrade) approval token promoted it (phase=${stale_phase}) — it must be ignored"
-echo "PASS: the stale pre-upgrade token was ignored; ${DM_AWAIT} stays parked."
+if [[ "${MIGRATION_FROM}" = "yes" ]]; then
+  # Migration leg: the identity changed, so the approvalId must differ from the empty
+  # pre-upgrade token, and the stale pre-upgrade token (the bare candidate hash) must
+  # be ignored.
+  [[ "${await_approval_after}" != "${await_approval_before}" ]] || fail \
+    "${DM_AWAIT}: approvalId unchanged across the upgrade from ${from_ver}; a re-approval was expected"
+  echo "PASS: approvalId changed across the 0.3.x -> new upgrade (re-approval required)."
 
-note "approving ${DM_AWAIT} with the NEW approvalId promotes it"
+  note "approving ${DM_AWAIT} with the OLD token (pre-upgrade candidate hash) must be ignored"
+  kc annotate decisionmodel "${DM_AWAIT}" -n "${NS}" \
+    "decisionmodel.io/promote=${await_cand_before}" --overwrite
+  sleep 20
+  stale_phase="$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}')"
+  [[ "${stale_phase}" = "AwaitingPromotion" ]] || fail \
+    "${DM_AWAIT}: a stale (pre-upgrade) approval token promoted it (phase=${stale_phase}) — it must be ignored"
+  echo "PASS: the stale pre-upgrade token was ignored; ${DM_AWAIT} stays parked."
+else
+  # Non-migration leg (from >= 0.4.0): the identity is stable, so the approvalId must be
+  # unchanged across the upgrade and the pre-upgrade approvalId must still promote it.
+  [[ "${await_approval_after}" = "${await_approval_before}" ]] || fail \
+    "${DM_AWAIT}: approvalId changed across the upgrade from ${from_ver} ('${await_approval_before}' -> '${await_approval_after}'); from >= 0.4.0 the evaluation identity is stable and no re-approval was expected"
+  echo "PASS: approvalId unchanged across the upgrade (stable identity, no re-approval)."
+fi
+
+# Approve with the correct post-upgrade token (the new approvalId for the migration leg,
+# the unchanged approvalId otherwise) — it must promote.
+note "approving ${DM_AWAIT} with the current approvalId promotes it"
 kc annotate decisionmodel "${DM_AWAIT}" -n "${NS}" \
   "decisionmodel.io/promote=${await_approval_after}" --overwrite
 wait_phase "${DM_AWAIT}" "Ready" 120 \
-  || fail "${DM_AWAIT} did not promote after approving with the new approvalId (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
-echo "PASS: ${DM_AWAIT} promoted on the new approvalId after the upgrade."
+  || fail "${DM_AWAIT} did not promote after approving with the current approvalId (phase=$(jp decisionmodel "${DM_AWAIT}" '{.status.phase}'))"
+echo "PASS: ${DM_AWAIT} promoted on the current approvalId after the upgrade."
 
 # --- 4c. existing objects round-trip cleanly under the new CRD ----------------
 note "no CRD validation error on existing objects (get -o yaml round-trip with the new CRD)"
@@ -414,10 +464,10 @@ await_stable_before="$(jp decisionmodel "${DM_AWAIT}" '{.status.stableRevision.h
 [[ -n "${await_stable_before}" ]] || fail "no current stable for ${DM_AWAIT} before the opt-in pin"
 { read -r plain_stable_before; read -r _; read -r plain_uids_before; } <"${work}/${DM_PLAIN}.before"
 
-# Clear the manual-promotion policy first (it still carries manualPromotion:true from
-# the parking step); otherwise the runtimeVersion candidate would park in
-# AwaitingPromotion instead of auto-rolling. The new controller honours promotion:
-# Automatic. Done as a separate patch so the policy is cleared before the pin.
+# Clear the manual-promotion policy first (the parking step set either
+# manualPromotion:true (from < 0.4.0) or promotion:Manual (from >= 0.4.0)); otherwise
+# the runtimeVersion candidate would park in AwaitingPromotion instead of auto-rolling.
+# Setting promotion:Automatic and clearing manualPromotion covers both field names.
 kc patch decisionmodel "${DM_AWAIT}" -n "${NS}" --type=merge \
   -p '{"spec":{"rollout":{"promotion":"Automatic","manualPromotion":null}}}'
 
