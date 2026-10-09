@@ -1237,18 +1237,23 @@ func (e *Engine) RuntimeVersionFromImage(image string) string {
 }
 
 const (
-	containerName   = "ollaya"
-	prefetchName    = "prefetch"
-	modelsMount     = "/models"
-	stateMountPath  = "/home/ollaya/.ollaya"
-	modelsVolume    = "models"
-	stateVolume     = "ollaya-state"
-	runtimeUID      = int64(1000)
-	runtimeGID      = int64(1000)
-	terminationSecs = int64(30)
-	prefetchDeadl   = int64(1800)
-	prefetchBackoff = int32(4)
-	gpuResourceName = corev1.ResourceName("nvidia.com/gpu")
+	containerName  = "ollaya"
+	prefetchName   = "prefetch"
+	modelsMount    = "/models"
+	stateMountPath = "/home/ollaya/.ollaya"
+	modelsVolume   = "models"
+	stateVolume    = "ollaya-state"
+	// manifestSeedVolume mounts the ManifestConfigMap read-only so the prefetch
+	// Job can seed a large manifest from a file instead of an env var.
+	manifestSeedVolume = "manifest-seed"
+	manifestSeedMount  = "/manifest-seed"
+	manifestSeedFile   = "manifest"
+	runtimeUID         = int64(1000)
+	runtimeGID         = int64(1000)
+	terminationSecs    = int64(30)
+	prefetchDeadl      = int64(1800)
+	prefetchBackoff    = int32(4)
+	gpuResourceName    = corev1.ResourceName("nvidia.com/gpu")
 
 	// Prefetch container resource defaults. `ollaya pull` is I/O-bound: it
 	// downloads layers and writes them to the store, it does not load the model
@@ -1560,13 +1565,21 @@ fail() {
   [ -n "${3:-}" ] && printf 'detail: %s\n' "$3"
   exit "$2"
 }
-# Seed: if the controller passed the recorded manifest bytes (base64 in
-# MANIFEST_SEED_B64), verify them against EXPECT_DIGEST and write them to the
-# on-disk tag path BEFORE pulling. ollaya pull then trusts the on-disk manifest
-# (spike 009) and fetches exactly the referenced blobs, so the store is rebuilt
-# to the recorded digest even if the tag moved upstream. A seed whose sha256 does
-# not match EXPECT_DIGEST is a permanent DigestMismatch BEFORE anything is written.
-if [ -n "${MANIFEST_SEED_B64:-}" ]; then
+# Seed: if the controller passed the recorded manifest bytes, verify them against
+# EXPECT_DIGEST and write them to the on-disk tag path BEFORE pulling. ollaya pull
+# then trusts the on-disk manifest (spike 009) and fetches exactly the referenced
+# blobs, so the store is rebuilt to the recorded digest even if the tag moved
+# upstream. A seed whose sha256 does not match EXPECT_DIGEST is a permanent
+# DigestMismatch BEFORE anything is written.
+#
+# Two mutually exclusive sources, both carrying raw manifest bytes:
+#   MANIFEST_SEED_FILE - a path to a read-only ConfigMap-mounted file (preferred;
+#                        no size limit beyond the ConfigMap's own 1 MiB cap).
+#   MANIFEST_SEED_B64  - base64 bytes in an env var (fallback for small manifests;
+#                        the whole argv/env block is bounded at 128 KiB on Linux,
+#                        so the controller caps the raw size well under that).
+# The controller sets at most one. The file source wins if both are present.
+if [ -n "${MANIFEST_SEED_FILE:-}" ] || [ -n "${MANIFEST_SEED_B64:-}" ]; then
   if [ -z "${EXPECT_DIGEST:-}" ] || [ -z "${MANIFEST_PATH:-}" ]; then
     fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
   fi
@@ -1585,7 +1598,19 @@ if [ -n "${MANIFEST_SEED_B64:-}" ]; then
   seed_dir="$(dirname "$OLLAYA_MODELS/$MANIFEST_PATH")"
   mkdir -p "$seed_dir"
   seed_tmp="$(mktemp "$seed_tmpdir/seed.XXXXXX")"
-  printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
+  if [ -n "${MANIFEST_SEED_FILE:-}" ]; then
+    # The ConfigMap mount is required (optional: false), so a missing file is a
+    # controller/scheduling bug, not "no seed": refuse rather than pull a possibly
+    # different digest silently.
+    if [ ! -r "$MANIFEST_SEED_FILE" ]; then
+      echo "seed manifest file $MANIFEST_SEED_FILE is not readable" >&2
+      rm -rf "$seed_tmpdir"
+      fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+    fi
+    cat "$MANIFEST_SEED_FILE" > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
+  else
+    printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
+  fi
   seed_digest="$(sha256sum "$seed_tmp" | cut -d' ' -f1)"
   if [ "$seed_digest" != "$EXPECT_DIGEST" ]; then
     echo "seed manifest digest $seed_digest != expected $EXPECT_DIGEST; refusing to write" >&2
@@ -1735,10 +1760,22 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 // to pull-by-tag.
 const maxSeedManifestBytes = 256 << 10 // 256 KiB
 
+// maxEnvSeedManifestBytes caps the raw manifest carried in the MANIFEST_SEED_B64
+// env var. Linux bounds a single argv/env string at 128 KiB (MAX_ARG_STRLEN);
+// base64 inflates by 4/3, so a raw manifest above ~96 KiB would make the
+// container fail to exec even though the bytes verify. 64 KiB raw (~85 KiB
+// base64, plus the var name) stays safely under the limit. A manifest larger
+// than this is seeded via a mounted ConfigMap instead (ManifestConfigMap), which
+// has no argv/env limit; if neither path applies the Job falls back to
+// pull-by-tag.
+const maxEnvSeedManifestBytes = 64 << 10 // 64 KiB
+
 // seedManifestUsable reports whether a ModelRef carries manifest bytes we can
-// seed: present, within the size cap, with a digest to verify against, and
-// sha256(Manifest) actually equals Digest (defence in depth — the Job re-checks,
-// but a mismatched pair here is a controller bug we must not ship into the store).
+// seed at all: present, within the overall size cap, with a digest to verify
+// against, and sha256(Manifest) actually equals Digest (defence in depth — the
+// Job re-checks, but a mismatched pair here is a controller bug we must not ship
+// into the store). The source (mounted file vs env) and its tighter cap are
+// decided by the caller.
 func seedManifestUsable(m engine.ModelRef) bool {
 	if len(m.Manifest) == 0 || len(m.Manifest) > maxSeedManifestBytes || m.Digest == "" {
 		return false
@@ -1792,14 +1829,52 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 
 	// Seed the recorded manifest bytes so the Job can rebuild exactly this digest
 	// even after the tag moved upstream (spike 009: ollaya pull trusts an on-disk
-	// manifest). Only when: the controller supplied the bytes, this is the normal
-	// pull script (not a refuse script), the on-disk path is known, and the digest
-	// matches the bytes. The bytes go in a base64 env var — manifests are a few KB;
-	// a cap keeps a hostile/oversized value out of the Pod spec (the whole env
-	// block is bounded by the kernel's arg/env limit). The script re-verifies the
-	// seed against EXPECT_DIGEST before writing, so a wrong value fails permanently
-	// without touching the store.
-	if script == prefetchScript && manifestPath != "" && seedManifestUsable(p.Model) {
+	// manifest). The script re-verifies the seed against EXPECT_DIGEST before
+	// writing, so a wrong value fails permanently without touching the store.
+	//
+	// Two sources, picked by the controller and never both:
+	//   - ManifestConfigMap set: mount that key read-only and point the script at
+	//     the file (MANIFEST_SEED_FILE). No argv/env size limit — a large manifest
+	//     is seeded this way. The mount is required (optional: false): the
+	//     controller sets the field only after persisting and verifying the
+	//     ConfigMap, so the key provably exists; a genuinely missing ConfigMap is
+	//     a controller bug that must surface (ContainerCreating, then the Job's
+	//     ActiveDeadlineSeconds) rather than silently skip the seed and pull a
+	//     possibly different digest.
+	//   - else Model.Manifest present and small enough: carry the bytes base64 in
+	//     MANIFEST_SEED_B64. Capped at maxEnvSeedManifestBytes raw so base64 + the
+	//     var name stay under Linux's 128 KiB argv/env limit. A larger manifest
+	//     with no ConfigMap skips seeding and falls back to pull-by-tag.
+	var seedVolumes []corev1.Volume
+	var seedVolumeMounts []corev1.VolumeMount
+	switch {
+	case script != prefetchScript || manifestPath == "" || !seedManifestUsable(p.Model):
+		// no seed (refuse script, unknown path, or unusable bytes)
+	case p.ManifestConfigMap != nil:
+		env = append(env, corev1.EnvVar{
+			Name:  "MANIFEST_SEED_FILE",
+			Value: manifestSeedMount + "/" + manifestSeedFile,
+		})
+		seedVolumeMounts = append(seedVolumeMounts, corev1.VolumeMount{
+			Name:      manifestSeedVolume,
+			MountPath: manifestSeedMount,
+			ReadOnly:  true,
+		})
+		seedVolumes = append(seedVolumes, corev1.Volume{
+			Name: manifestSeedVolume,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: p.ManifestConfigMap.Name},
+					// Project only the one key to a fixed filename, world-readable
+					// (0444) so UID 1000 can read it under readOnlyRootFilesystem.
+					Items:       []corev1.KeyToPath{{Key: p.ManifestConfigMap.Key, Path: manifestSeedFile}},
+					DefaultMode: ptr(int32(0o444)),
+					// Required: a missing ConfigMap/key must not be silently skipped.
+					Optional: ptr(false),
+				},
+			},
+		})
+	case len(p.Model.Manifest) <= maxEnvSeedManifestBytes:
 		env = append(env, corev1.EnvVar{
 			Name:  "MANIFEST_SEED_B64",
 			Value: base64.StdEncoding.EncodeToString(p.Model.Manifest),
@@ -1852,6 +1927,25 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		// Second mount of the PVC root (no subPath) so the script can prune siblings.
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: modelsVolume, MountPath: storeRootMount})
 	}
+	// Read-only ConfigMap mount carrying the manifest to seed (empty otherwise).
+	volumeMounts = append(volumeMounts, seedVolumeMounts...)
+
+	volumes := make([]corev1.Volume, 0, 2+len(seedVolumes))
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: modelsVolume,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: p.CacheClaimName,
+				},
+			},
+		},
+		corev1.Volume{
+			Name:         stateVolume,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	)
+	volumes = append(volumes, seedVolumes...)
 
 	return batchv1.JobSpec{
 		BackoffLimit:          ptr(prefetchBackoff),
@@ -1886,20 +1980,7 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 						VolumeMounts: volumeMounts,
 					},
 				},
-				Volumes: []corev1.Volume{
-					{
-						Name: modelsVolume,
-						VolumeSource: corev1.VolumeSource{
-							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-								ClaimName: p.CacheClaimName,
-							},
-						},
-					},
-					{
-						Name:         stateVolume,
-						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-					},
-				},
+				Volumes: volumes,
 			},
 		},
 	}
