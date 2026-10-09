@@ -49,9 +49,10 @@ type DecisionModelSpec struct {
 	Digest string `json:"digest,omitempty"`
 
 	// Replicas is the number of serving Pods for the stable revision (default 1).
-	// With replicas > 1 spread across nodes the model store must be shareable —
-	// see cache.accessModes; otherwise the operator reports Degraded
-	// (CacheNotShareable).
+	// With replicas > 1 on a ReadWriteOnce store the operator co-locates all
+	// replicas on the node holding the store (a node failure then takes all
+	// replicas down); set cache.accessModes to ReadWriteMany to spread them across
+	// nodes.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Replicas",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:podCount"}

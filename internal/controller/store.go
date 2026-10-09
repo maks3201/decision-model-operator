@@ -793,17 +793,6 @@ func (r *DecisionModelReconciler) guardCacheSharing(
 		}
 	}
 
-	if desiredReplicas(dm) > 1 && !accessModesShareable(pvc.Spec.AccessModes) {
-		setStatusCondition(dm, metav1.Condition{
-			Type:   decisionmodelv1alpha1.ConditionDegraded,
-			Status: metav1.ConditionTrue,
-			Reason: reasonCacheNotShareable,
-			Message: "replicas>1 but the model-store PVC is not ReadWriteMany/ReadOnlyMany; " +
-				"Pods on different nodes will be stuck in ContainerCreating (Multi-Attach). " +
-				"Set spec.cache.accessModes to a shared mode with RWX-capable storage.",
-		})
-		return true, nil
-	}
 	return false, nil
 }
 

@@ -1158,27 +1158,37 @@ var _ = Describe("DecisionModel Controller", func() {
 			"ProbeMismatch must fire only on gate transition")
 	})
 
-	// Cache guard: replicas>1 with a default RWO PVC -> Degraded CacheNotShareable.
-	It("flags CacheNotShareable for replicas>1 on an RWO store", func() {
+	// replicas>1 with a default RWO PVC: no longer Degraded. The serving
+	// Deployment co-locates all replicas on the node holding the store.
+	It("co-locates replicas>1 on an RWO store instead of flagging Degraded", func() {
 		eng := newFakeEngine()
 		r := newReconciler(eng, &fakeProber{})
 		createDM("c1", func(dm *decisionmodelv1alpha1.DecisionModel) { dm.Spec.Replicas = int32Ptr(2) })
 
 		reconcileOnce(r, "c1")
+		rev := revOf(getDM("c1"))
+		markJob("c1", rev, batchv1.JobComplete)
+		reconcileOnce(r, "c1")
 
 		dm := getDM("c1")
 		cond := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
-		Expect(cond).NotTo(BeNil())
-		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-		Expect(cond.Reason).To(Equal(reasonCacheNotShareable))
+		if cond != nil {
+			Expect(cond.Status).NotTo(Equal(metav1.ConditionTrue),
+				"replicas>1 on RWO is co-located, not Degraded")
+		}
 
 		pvc := &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c1-store-" + revOf(dm)}, pvc)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c1-store-" + rev}, pvc)).To(Succeed())
 		Expect(pvc.Spec.AccessModes).To(Equal([]corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}))
+
+		// The serving Deployment carries the required host co-location affinity.
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c1-" + rev}, dep)).To(Succeed())
+		Expect(hasColocationTerm(dep.Spec.Template.Spec.Affinity, revisionLabels(dm, rev))).To(BeTrue())
 	})
 
-	// Cache guard: replicas>1 with an RWX store -> no Degraded from the cache guard.
-	It("does not flag CacheNotShareable when the store is ReadWriteMany", func() {
+	// replicas>1 with an RWX store: shareable, so no co-location affinity is added.
+	It("does not co-locate when the store is ReadWriteMany", func() {
 		eng := newFakeEngine()
 		r := newReconciler(eng, &fakeProber{})
 		createDM("c2", func(dm *decisionmodelv1alpha1.DecisionModel) {
@@ -1189,17 +1199,18 @@ var _ = Describe("DecisionModel Controller", func() {
 		})
 
 		reconcileOnce(r, "c2")
+		rev := revOf(getDM("c2"))
+		markJob("c2", rev, batchv1.JobComplete)
+		reconcileOnce(r, "c2")
 
 		pvc := &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c2-store-" + revOf(getDM("c2"))}, pvc)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c2-store-" + rev}, pvc)).To(Succeed())
 		Expect(pvc.Spec.AccessModes).To(ContainElement(corev1.ReadWriteMany))
 
 		dm := getDM("c2")
-		cond := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
-		// Either no Degraded condition yet, or it is not the cache-not-shareable reason.
-		if cond != nil {
-			Expect(cond.Reason).NotTo(Equal(reasonCacheNotShareable))
-		}
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "c2-" + rev}, dep)).To(Succeed())
+		Expect(hasColocationTerm(dep.Spec.Template.Spec.Affinity, revisionLabels(dm, rev))).To(BeFalse())
 	})
 
 	// Cache guard: changing accessModes on an existing PVC -> CacheSpecImmutable, PVC unchanged.

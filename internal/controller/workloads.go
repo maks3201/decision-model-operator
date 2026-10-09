@@ -374,9 +374,23 @@ func (r *DecisionModelReconciler) ensureDeployment(
 		freezeFromLive(&podSpec, &dep.Spec.Template.Spec)
 	}
 
+	// Co-locate replicas on a non-shareable (RWO) store so they share the one
+	// node that holds the volume instead of hanging on Multi-Attach. Derived from
+	// the current (replicas, access modes); applied after freezeFromLive so a
+	// frozen stable gets it re-derived rather than inherited from the live
+	// template, and merged with any user affinity. accessModes is reused for the
+	// Deployment strategy below. announceColocated emits the one-shot Event when
+	// co-location newly applies.
+	accessModes := r.storeAccessModes(ctx, dm, params.CacheClaimName)
+	var liveAffinity *corev1.Affinity
+	if getErr == nil {
+		liveAffinity = dep.Spec.Template.Spec.Affinity
+	}
+	announceColocated := r.applyServingColocation(ctx, dm, &podSpec, liveAffinity, labels, rev, desired, accessModes)
+
 	// The strategy keeps any in-place template change from deadlocking on the
 	// store or on GPUs.
-	strategy := deploymentStrategy(r.storeAccessModes(ctx, dm, params.CacheClaimName), params.Device)
+	strategy := deploymentStrategy(accessModes, params.Device)
 
 	// A hash of the desired template + replicas + strategy lets us skip no-op Updates.
 	desiredHash := deploymentSpecHash(desired, podSpec, strategy, tmplAnnotations)
@@ -406,7 +420,11 @@ func (r *DecisionModelReconciler) ensureDeployment(
 		if err := controllerutil.SetControllerReference(dm, dep, r.Scheme); err != nil {
 			return err
 		}
-		return r.createOrAdopt(ctx, dm, dep, "Deployment")
+		if err := r.createOrAdopt(ctx, dm, dep, "Deployment"); err != nil {
+			return err
+		}
+		announceColocated()
+		return nil
 	}
 
 	// While the stable store PVC is Terminating, do not touch the Pod template:
@@ -453,7 +471,43 @@ func (r *DecisionModelReconciler) ensureDeployment(
 	// (kubectl.kubernetes.io/restartedAt) so drift repair does not undo it.
 	dep.Spec.Template.Annotations = mergeTemplateAnnotations(tmplAnnotations, dep.Spec.Template.Annotations)
 	dep.Spec.Template.Spec = podSpec
-	return r.Update(ctx, dep)
+	if err := r.Update(ctx, dep); err != nil {
+		return err
+	}
+	announceColocated()
+	return nil
+}
+
+// applyServingColocation applies the RWO co-location affinity to the serving Pod
+// template (see applyColocation) and returns a callback the caller invokes after
+// a successful Deployment write to emit the one-shot ReplicasCoLocated Event. The
+// Event fires only on the transition into co-location (co-location now applies and
+// the live template did not already carry the term), so it is not repeated on
+// every reconcile and survives a restart (the signal is the live template, not
+// in-memory state). liveAffinity is the existing Deployment's template affinity
+// (nil when the Deployment does not exist yet), inspected to detect the
+// transition.
+func (r *DecisionModelReconciler) applyServingColocation(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	podSpec *corev1.PodSpec,
+	liveAffinity *corev1.Affinity,
+	labels map[string]string,
+	rev string,
+	desired int32,
+	accessModes []corev1.PersistentVolumeAccessMode,
+) func() {
+	colocating := desired > 1 && !accessModesShareable(accessModes)
+	hadColocation := hasColocationTerm(liveAffinity, labels)
+	applyColocation(podSpec, labels, desired, accessModes)
+	return func() {
+		if colocating && !hadColocation {
+			r.event(ctx, dm, corev1.EventTypeNormal, eventReplicasCoLocated,
+				"revision %s: all %d replicas are co-located on the node holding the ReadWriteOnce "+
+					"model store; a node failure takes all replicas down. Use a ReadWriteMany store "+
+					"(spec.cache.accessModes) to spread replicas across nodes.", rev, desired)
+		}
+	}
 }
 
 // ensurePDB reconciles the PodDisruptionBudget for a revision's serving Pods.

@@ -299,15 +299,17 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 	})
 
 	It("keeps a stable-side Degraded reason visible when both a stable problem and a bad candidate exist", func() {
-		// replicas 2 on an RWO store -> CacheNotShareable (a stable-side Degraded).
+		// A stable at replicas 1 that is fully Ready, then scaled to 2 with only one
+		// model-ready Pod -> a stable-side Degraded (ReplicasNotModelReady),
+		// independent of the candidate. (RWX avoids co-location noise.)
 		fake := newFakeEngine()
 		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
 		r := newR(fake, pr, nil)
 		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "both"},
 			Spec: decisionmodelv1alpha1.DecisionModelSpec{
-				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(2),
-				Cache: &decisionmodelv1alpha1.CacheSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+				Cache: &decisionmodelv1alpha1.CacheSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
 			},
 		})).To(Succeed())
 		reconcile1(r, "both")
@@ -316,14 +318,24 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		markJobComplete("both", revA)
 		reconcile1(r, "both")
 		mkGatedPod("both", revA, "both-a")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			reconcile1(r, "both")
+			return getDM("both").Status.Phase
+		}, "5s", "20ms").Should(Equal(decisionmodelv1alpha1.PhaseReady), "stable Ready at replicas 1")
+
+		// Scale to 2 with still only one model-ready Pod -> stable-side Degraded.
+		Expect(updateDM(ctx, namespace, "both", func(dm *decisionmodelv1alpha1.DecisionModel) {
+			two := int32(2)
+			dm.Spec.Replicas = &two
+		})).To(Succeed())
 		Eventually(func() string {
 			reconcile1(r, "both")
 			d := cond("both", decisionmodelv1alpha1.ConditionDegraded)
-			if d == nil {
+			if d == nil || d.Status != metav1.ConditionTrue {
 				return ""
 			}
 			return d.Reason
-		}, "5s", "20ms").Should(Equal(reasonCacheNotShareable), "stable-side Degraded set")
+		}, "5s", "20ms").Should(Equal(reasonReplicasNotModelReady), "stable-side Degraded set")
 
 		// Now also break the candidate spec: the stable-side Degraded must stay.
 		fake.mu.Lock()
@@ -334,7 +346,7 @@ var _ = Describe("a bad candidate never stops stable maintenance", func() {
 		})).To(Succeed())
 		reconcile1(r, "both")
 		Expect(cond("both", decisionmodelv1alpha1.ConditionDegraded).Reason).
-			To(Equal(reasonCacheNotShareable), "stable-side Degraded is not overwritten by the candidate reason")
+			To(Equal(reasonReplicasNotModelReady), "stable-side Degraded is not overwritten by the candidate reason")
 		Expect(cond("both", decisionmodelv1alpha1.ConditionResolved).Reason).
 			To(Equal(reasonModelNotFound), "the candidate failure is on Resolved")
 	})
