@@ -17,7 +17,6 @@ limitations under the License.
 package eval
 
 import (
-	"fmt"
 	"math"
 	"testing"
 )
@@ -255,56 +254,5 @@ func TestScoreEmpty(t *testing.T) {
 	overall, per := Score(nil)
 	if overall != 0 || per != nil {
 		t.Errorf("Score(nil) = %v,%v want 0,nil", overall, per)
-	}
-}
-
-func TestSummarizeTruncation(t *testing.T) {
-	// 25 questions, each one perfect single-class case -> each macroF1 1.0.
-	var records []Record
-	for i := 0; i < 25; i++ {
-		q := fmt.Sprintf("q%02d", i)
-		records = append(records, rec(q, "x", "x"))
-	}
-	s := Summarize(records)
-	if !approx(s.MacroF1, 1.0) {
-		t.Errorf("overall macroF1 = %v, want 1.0", s.MacroF1)
-	}
-	if s.Cases != 25 {
-		t.Errorf("cases = %d, want 25", s.Cases)
-	}
-	if !s.Truncated {
-		t.Errorf("Truncated = false, want true for 25 questions")
-	}
-	if len(s.Questions) != maxSummaryQuestions {
-		t.Fatalf("summary questions = %d, want %d", len(s.Questions), maxSummaryQuestions)
-	}
-	// Deterministic truncation keeps the lowest ids: q00..q19.
-	if s.Questions[0].ID != "q00" || s.Questions[maxSummaryQuestions-1].ID != "q19" {
-		t.Errorf("truncation kept %q..%q, want q00..q19",
-			s.Questions[0].ID, s.Questions[maxSummaryQuestions-1].ID)
-	}
-}
-
-func TestSummarizeNoTruncation(t *testing.T) {
-	records := []Record{
-		rec("a", "x", "x"),
-		rec("b", "y", "z"),
-	}
-	s := Summarize(records)
-	if s.Truncated {
-		t.Errorf("Truncated = true, want false for 2 questions")
-	}
-	if len(s.Questions) != 2 {
-		t.Errorf("summary questions = %d, want 2", len(s.Questions))
-	}
-	if s.Cases != 2 {
-		t.Errorf("cases = %d, want 2", s.Cases)
-	}
-}
-
-func TestSummarizeEmpty(t *testing.T) {
-	s := Summarize(nil)
-	if s.MacroF1 != 0 || s.Cases != 0 || s.Truncated || len(s.Questions) != 0 {
-		t.Errorf("Summarize(nil) = %+v, want zero value", s)
 	}
 }

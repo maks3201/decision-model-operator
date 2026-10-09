@@ -68,21 +68,8 @@ type QuestionMetrics struct {
 	Classes []ClassMetrics
 }
 
-// maxSummaryQuestions caps the per-question list carried in status.
-const maxSummaryQuestions = 20
-
-// Summary is a bounded result for status: the overall macro-F1 (mean over
-// questions), the total number of scored records, and a per-question list capped
-// at maxSummaryQuestions. When more questions exist, the list is truncated
-// (lowest question ids kept, for determinism) and Truncated is true.
-type Summary struct {
-	MacroF1   float64
-	Cases     int
-	Questions []QuestionSummary
-	Truncated bool
-}
-
-// QuestionSummary is the bounded per-question entry in a Summary.
+// QuestionSummary is a bounded per-question entry: a question id with its scored
+// accuracy, macro-F1 and record count.
 type QuestionSummary struct {
 	ID       string
 	Accuracy float64
@@ -174,7 +161,7 @@ func ScoreQuestion(questionID string, records []Record) QuestionMetrics {
 // Score computes per-question metrics for all records plus the overall macro-F1
 // (the unweighted mean of the per-question macro-F1 values). The returned
 // per-question slice is sorted by question id. Empty input returns a zero-value
-// result. Use Summarize to get a bounded form for status.
+// result.
 func Score(records []Record) (overallMacroF1 float64, perQuestion []QuestionMetrics) {
 	if len(records) == 0 {
 		return 0, nil
@@ -199,27 +186,4 @@ func Score(records []Record) (overallMacroF1 float64, perQuestion []QuestionMetr
 	}
 	overallMacroF1 = safeDiv(sumMacro, float64(len(order)))
 	return overallMacroF1, perQuestion
-}
-
-// Summarize scores records and returns a bounded Summary for status: the overall
-// macro-F1, the total record count, and a per-question list capped at 20 entries
-// (the lowest question ids, for a deterministic truncation) with Truncated set
-// when more exist.
-func Summarize(records []Record) Summary {
-	overall, perQuestion := Score(records)
-	s := Summary{MacroF1: overall, Cases: len(records)}
-	if len(perQuestion) > maxSummaryQuestions {
-		s.Truncated = true
-		perQuestion = perQuestion[:maxSummaryQuestions]
-	}
-	s.Questions = make([]QuestionSummary, 0, len(perQuestion))
-	for _, qm := range perQuestion {
-		s.Questions = append(s.Questions, QuestionSummary{
-			ID:       qm.QuestionID,
-			Accuracy: qm.Accuracy,
-			MacroF1:  qm.MacroF1,
-			Cases:    qm.Cases,
-		})
-	}
-	return s
 }
