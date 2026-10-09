@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +120,13 @@ type scoreOutcome struct {
 	correct        bool                   // accuracy contribution
 	pred           calibration.Prediction // calibration contribution (only when hasCalibration)
 	hasCalibration bool                   // whether pred feeds ECE/Brier
+	// classifiable is true for choice/bool (noul) answers that are scored: they
+	// contribute to macro-F1. expectedClass/predictedClass are the class labels
+	// (a choice label, or "true"/"false" for noul). Score answers are never
+	// classifiable (there is no class to average).
+	classifiable   bool
+	expectedClass  string
+	predictedClass string
 }
 
 // scorePrediction evaluates one answer against the expected golden value. tol is
@@ -135,22 +143,33 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 		if err := json.Unmarshal(expected, &want); err != nil {
 			return scoreOutcome{scored: false}
 		}
+		cls := scoreOutcome{classifiable: true, expectedClass: want, predictedClass: a.Choice}
 		if p, ok := calibration.FromChoice(a.Probabilities, a.Choice, want); ok {
-			return scoreOutcome{scored: true, correct: p.Correct, pred: p, hasCalibration: true}
+			cls.scored, cls.correct, cls.pred, cls.hasCalibration = true, p.Correct, p, true
+			return cls
 		}
-		return scoreOutcome{scored: true, correct: a.Choice == want,
-			pred: calibration.Prediction{Confidence: 0, Correct: a.Choice == want}, hasCalibration: true}
+		cls.scored, cls.correct = true, a.Choice == want
+		cls.pred, cls.hasCalibration = calibration.Prediction{Confidence: 0, Correct: a.Choice == want}, true
+		return cls
 	case "noul":
 		var want bool
 		if err := json.Unmarshal(expected, &want); err != nil {
 			return scoreOutcome{scored: false}
 		}
+		cls := scoreOutcome{classifiable: true, expectedClass: boolClass(want)}
 		if a.Noul == nil {
-			return scoreOutcome{scored: true, correct: false,
-				pred: calibration.Prediction{Confidence: 0, Correct: false}, hasCalibration: true}
+			// No predicted side: scored, wrong, and counted as the opposite class
+			// so it is a miss for macro-F1 (never silently dropped).
+			cls.scored, cls.correct = true, false
+			cls.predictedClass = boolClass(!want)
+			cls.pred, cls.hasCalibration = calibration.Prediction{Confidence: 0, Correct: false}, true
+			return cls
 		}
 		p := calibration.FromNoul(*a.Noul, want)
-		return scoreOutcome{scored: true, correct: p.Correct, pred: p, hasCalibration: true}
+		cls.scored, cls.correct = true, p.Correct
+		cls.predictedClass = boolClass(*a.Noul >= 0.5)
+		cls.pred, cls.hasCalibration = p, true
+		return cls
 	case "score":
 		want, err := eval.ParseScoreExpected(expected)
 		if err != nil {
@@ -172,18 +191,35 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 	}
 }
 
+// boolClass maps a bool to its class label for macro-F1 over noul questions.
+func boolClass(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
 // evalResult is the outcome of an evaluation run.
 type evalResult struct {
 	accuracy        float64
 	ece             float64
 	brier           float64
+	macroF1         float64
 	total           int
 	failedCases     int
 	calibratedCases int // scored questions that fed ECE/Brier (len(preds))
-	transport       int // number of per-case transport errors (not scored as answers)
-	done            bool
-	err             error // non-nil on dataset/timeout/transport/rejected failure
-	timedOut        bool
+	// classifiableCases is the number of scored choice/bool records that fed
+	// macro-F1. 0 when the dataset has no choice/bool question: a macro-F1 gate
+	// then fails rather than passing on a macro-F1 of 0.
+	classifiableCases int
+	// questions is the bounded per-question summary (choice/bool only), worst
+	// macro-F1 first, capped by eval.Summarize.
+	questions          []eval.QuestionSummary
+	questionsTruncated bool
+	transport          int // number of per-case transport errors (not scored as answers)
+	done               bool
+	err                error // non-nil on dataset/timeout/transport/rejected failure
+	timedOut           bool
 	// rejected is set when the runtime rejected a case as invalid
 	// (engine.ErrRequestRejected): the golden dataset itself is broken. The run
 	// stops at once (no retry); rejectedLine/rejectedDetail name the offending
@@ -207,6 +243,7 @@ func runEvaluation(
 	deadline := now().Add(timeout)
 	var total, correct, failed, transport int
 	var preds []calibration.Prediction
+	var records []eval.Record
 	for _, c := range cases {
 		if now().After(deadline) {
 			return evalResult{done: true, timedOut: true, err: fmt.Errorf("evaluation deadline exceeded")}
@@ -269,6 +306,13 @@ func runEvaluation(
 			if out.hasCalibration {
 				preds = append(preds, out.pred)
 			}
+			if out.classifiable {
+				records = append(records, eval.Record{
+					QuestionID: qid,
+					Expected:   out.expectedClass,
+					Predicted:  out.predictedClass,
+				})
+			}
 			if out.correct {
 				correct++
 			} else {
@@ -280,15 +324,20 @@ func runEvaluation(
 	if total > 0 {
 		acc = float64(correct) / float64(total)
 	}
+	macroF1, questions, truncated := macroF1Summary(records)
 	res := evalResult{
-		accuracy:        acc,
-		ece:             calibration.ECE(preds, 0),
-		brier:           calibration.Brier(preds),
-		total:           total,
-		failedCases:     failed,
-		calibratedCases: len(preds),
-		transport:       transport,
-		done:            true,
+		accuracy:           acc,
+		ece:                calibration.ECE(preds, 0),
+		brier:              calibration.Brier(preds),
+		macroF1:            macroF1,
+		total:              total,
+		failedCases:        failed,
+		calibratedCases:    len(preds),
+		classifiableCases:  len(records),
+		questions:          questions,
+		questionsTruncated: truncated,
+		transport:          transport,
+		done:               true,
 	}
 	// Any transport error invalidates the whole run: a partial/blip score must
 	// never promote a candidate or stand in as a baseline.
@@ -296,6 +345,41 @@ func runEvaluation(
 		res.err = fmt.Errorf("%d case(s) failed with a transport error; evaluation result is not valid", transport)
 	}
 	return res
+}
+
+// macroF1SummaryLimit caps the per-question list carried in evalResult/status.
+const macroF1SummaryLimit = 20
+
+// macroF1Summary computes the overall macro-F1 over the classifiable records and
+// a bounded per-question list ordered worst macro-F1 first (ties by question id).
+// The list is capped at macroF1SummaryLimit; truncated is true when more
+// questions existed than are returned. Empty input returns 0, nil, false.
+func macroF1Summary(records []eval.Record) (overall float64, questions []eval.QuestionSummary, truncated bool) {
+	if len(records) == 0 {
+		return 0, nil, false
+	}
+	overallF1, perQuestion := eval.Score(records)
+	all := make([]eval.QuestionSummary, 0, len(perQuestion))
+	for _, qm := range perQuestion {
+		all = append(all, eval.QuestionSummary{
+			ID:       qm.QuestionID,
+			Accuracy: qm.Accuracy,
+			MacroF1:  qm.MacroF1,
+			Cases:    qm.Cases,
+		})
+	}
+	// Worst macro-F1 first; ties broken by question id for determinism.
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].MacroF1 != all[j].MacroF1 {
+			return all[i].MacroF1 < all[j].MacroF1
+		}
+		return all[i].ID < all[j].ID
+	})
+	if len(all) > macroF1SummaryLimit {
+		all = all[:macroF1SummaryLimit]
+		truncated = true
+	}
+	return overallF1, all, truncated
 }
 
 // evalKey identifies a running/finished evaluation.

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -184,7 +185,9 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 	maxDrop, hasDrop := parseDecimal(evalSpec.MaxAccuracyDrop)
 	maxECE, hasMaxECE := parseDecimal(evalSpec.MaxECE)
 	maxECEInc, hasMaxECEInc := parseDecimal(evalSpec.MaxECEIncrease)
-	needsBaseline := hasDrop || hasMaxECEInc
+	minMacroF1, hasMinF1 := parseDecimal(evalSpec.MinMacroF1)
+	maxF1Drop, hasF1Drop := parseDecimal(evalSpec.MaxMacroF1Drop)
+	needsBaseline := hasDrop || hasMaxECEInc || hasF1Drop
 
 	// Only compute / await the stable baseline when a relative gate needs it.
 	// Without a relative gate the absolute gates decide; the baseline
@@ -225,33 +228,13 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 
 	// Record the result in status.
 	policyHash := evalPolicyHash(evalSpec)
-	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{
-		Revision:        candidate.Hash,
-		Accuracy:        formatDecimal(candRes.accuracy),
-		ECE:             formatDecimal(candRes.ece),
-		Brier:           formatDecimal(candRes.brier),
-		Cases:           int32(candRes.total),
-		FailedCases:     int32(candRes.failedCases),
-		CalibratedCases: int32(candRes.calibratedCases),
-		PolicyHash:      policyHash,
-		ScorerVersion:   int32(scorerVersion),
-		DatasetDigest:   dsDigest,
-		ApprovalID:      approvalID(candidate.Hash, policyHash, dsDigest),
-		CompletedAt:     ptrTime(metav1.NewTime(r.now())),
-		MinAccuracy:     evalSpec.MinAccuracy,
-		MaxAccuracyDrop: evalSpec.MaxAccuracyDrop,
-		MaxECE:          evalSpec.MaxECE,
-		MaxECEIncrease:  evalSpec.MaxECEIncrease,
-	}
-	if baseline != nil {
-		dm.Status.Evaluation.BaselineAccuracy = formatDecimal(baseline.accuracy)
-		dm.Status.Evaluation.BaselineECE = formatDecimal(baseline.ece)
-	}
+	dm.Status.Evaluation = buildEvaluationStatus(evalSpec, candidate, candRes, baseline, policyHash, dsDigest, r.now())
 
-	// Gate evaluation: accuracy floor, accuracy drop, and calibration (ECE).
+	// Gate evaluation: accuracy floor, accuracy drop, calibration (ECE) and macro-F1.
 	if failReason, failMsg, failed := evalGateFailure(candRes, baseline, evalGates{
 		minAcc: minAcc, maxDrop: maxDrop, hasDrop: hasDrop,
 		maxECE: maxECE, hasMaxECE: hasMaxECE, maxECEInc: maxECEInc, hasMaxECEInc: hasMaxECEInc,
+		minMacroF1: minMacroF1, hasMinF1: hasMinF1, maxF1Drop: maxF1Drop, hasF1Drop: hasF1Drop,
 	}); failed {
 		dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationFailed
 		dm.Status.Evaluation.Reason = failMsg
@@ -318,6 +301,10 @@ type evalGates struct {
 	hasMaxECE    bool
 	maxECEInc    float64
 	hasMaxECEInc bool
+	minMacroF1   float64
+	hasMinF1     bool
+	maxF1Drop    float64
+	hasF1Drop    bool
 }
 
 // evalGateFailure applies the accuracy floor, accuracy-drop, and calibration
@@ -350,6 +337,21 @@ func evalGateFailure(candRes evalResult, baseline *evalResult, g evalGates) (rea
 		return reasonEvaluationFailed,
 			fmt.Sprintf("ECE increased %.4f (baseline %.4f) > maxECEIncrease %.4f",
 				candRes.ece-baseline.ece, baseline.ece, g.maxECEInc), true
+	case g.hasMinF1 && candRes.classifiableCases == 0:
+		return reasonClassificationUnavailable,
+			"minMacroF1 is set but the dataset has no choice or bool question (0 classifiable cases); " +
+				"macro-F1 cannot be evaluated", true
+	case baseline != nil && g.hasF1Drop && (candRes.classifiableCases == 0 || baseline.classifiableCases == 0):
+		return reasonClassificationUnavailable,
+			"maxMacroF1Drop is set but the candidate or baseline has no classifiable question (0 classifiable cases); " +
+				"the macro-F1 drop cannot be evaluated", true
+	case g.hasMinF1 && candRes.macroF1 < g.minMacroF1:
+		return reasonEvaluationFailed,
+			fmt.Sprintf("macroF1 %.4f < minMacroF1 %.4f", candRes.macroF1, g.minMacroF1), true
+	case baseline != nil && g.hasF1Drop && (baseline.macroF1-candRes.macroF1) > g.maxF1Drop:
+		return reasonEvaluationFailed,
+			fmt.Sprintf("macroF1 dropped %.4f (baseline %.4f) > maxMacroF1Drop %.4f",
+				baseline.macroF1-candRes.macroF1, baseline.macroF1, g.maxF1Drop), true
 	}
 	return "", "", false
 }
@@ -587,10 +589,23 @@ func evalPolicyHash(evalSpec *decisionmodelv1alpha1.EvaluationSpec) string {
 	// scorerVersion covers HOW we score (not just the inputs): a change to the
 	// scoring/calibration/parsing/aggregation code bumps it, so a parked result
 	// computed by an older build is re-evaluated after an upgrade.
-	payload := strings.Join([]string{
+	fields := []string{
 		evalSpec.MinAccuracy, evalSpec.MaxAccuracyDrop, evalSpec.MaxECE, evalSpec.MaxECEIncrease,
 		ref, strconv.Itoa(int(evalSpec.MaxCases)), tol, strconv.Itoa(scorerVersion),
-	}, "\x1f")
+	}
+	// The macro-F1 thresholds join the policy identity ONLY when set, so a
+	// DecisionModel that configures neither keeps exactly the same policyHash (and
+	// therefore approvalId) as before this field existed: an operator upgrade does
+	// not re-evaluate a parked candidate that never used a macro-F1 gate. Each
+	// present threshold is tagged so an empty value and an absent value never
+	// collide with an unrelated field.
+	if evalSpec.MinMacroF1 != "" {
+		fields = append(fields, "minMacroF1="+evalSpec.MinMacroF1)
+	}
+	if evalSpec.MaxMacroF1Drop != "" {
+		fields = append(fields, "maxMacroF1Drop="+evalSpec.MaxMacroF1Drop)
+	}
+	payload := strings.Join(fields, "\x1f")
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])[:16]
 }
@@ -610,6 +625,73 @@ func parseDecimal(s string) (float64, bool) {
 // formatDecimal renders an accuracy as a fixed 4-dp decimal string.
 func formatDecimal(v float64) string {
 	return strconv.FormatFloat(v, 'f', 4, 64)
+}
+
+// questionEvaluations maps the bounded per-question eval summary to the status
+// type, formatting the decimals. Returns nil for an empty summary.
+func questionEvaluations(qs []eval.QuestionSummary) []decisionmodelv1alpha1.QuestionEvaluation {
+	if len(qs) == 0 {
+		return nil
+	}
+	out := make([]decisionmodelv1alpha1.QuestionEvaluation, 0, len(qs))
+	for _, q := range qs {
+		out = append(out, decisionmodelv1alpha1.QuestionEvaluation{
+			ID:       q.ID,
+			Cases:    int32(q.Cases),
+			Accuracy: formatDecimal(q.Accuracy),
+			MacroF1:  formatDecimal(q.MacroF1),
+		})
+	}
+	return out
+}
+
+// buildEvaluationStatus assembles the EvaluationStatus for a finished candidate
+// run: the measured metrics, the echoed thresholds, the bounded per-question
+// summary, and (when a baseline was computed) the baseline metrics. macroF1 /
+// baselineMacroF1 are left empty when there was no classifiable question, so
+// status never shows a spurious 0.0000 for a metric that could not be computed.
+func buildEvaluationStatus(
+	evalSpec *decisionmodelv1alpha1.EvaluationSpec,
+	candidate *decisionmodelv1alpha1.RevisionStatus,
+	candRes evalResult,
+	baseline *evalResult,
+	policyHash, dsDigest string,
+	now time.Time,
+) *decisionmodelv1alpha1.EvaluationStatus {
+	es := &decisionmodelv1alpha1.EvaluationStatus{
+		Revision:          candidate.Hash,
+		Accuracy:          formatDecimal(candRes.accuracy),
+		ECE:               formatDecimal(candRes.ece),
+		Brier:             formatDecimal(candRes.brier),
+		Cases:             int32(candRes.total),
+		FailedCases:       int32(candRes.failedCases),
+		CalibratedCases:   int32(candRes.calibratedCases),
+		ClassifiableCases: int32(candRes.classifiableCases),
+		PolicyHash:        policyHash,
+		ScorerVersion:     int32(scorerVersion),
+		DatasetDigest:     dsDigest,
+		ApprovalID:        approvalID(candidate.Hash, policyHash, dsDigest),
+		CompletedAt:       ptrTime(metav1.NewTime(now)),
+		MinAccuracy:       evalSpec.MinAccuracy,
+		MaxAccuracyDrop:   evalSpec.MaxAccuracyDrop,
+		MaxECE:            evalSpec.MaxECE,
+		MaxECEIncrease:    evalSpec.MaxECEIncrease,
+		MinMacroF1:        evalSpec.MinMacroF1,
+		MaxMacroF1Drop:    evalSpec.MaxMacroF1Drop,
+		Questions:         questionEvaluations(candRes.questions),
+		Truncated:         candRes.questionsTruncated,
+	}
+	if candRes.classifiableCases > 0 {
+		es.MacroF1 = formatDecimal(candRes.macroF1)
+	}
+	if baseline != nil {
+		es.BaselineAccuracy = formatDecimal(baseline.accuracy)
+		es.BaselineECE = formatDecimal(baseline.ece)
+		if baseline.classifiableCases > 0 {
+			es.BaselineMacroF1 = formatDecimal(baseline.macroF1)
+		}
+	}
+	return es
 }
 
 func ptrTime(t metav1.Time) *metav1.Time { return &t }

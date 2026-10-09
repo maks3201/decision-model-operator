@@ -222,6 +222,8 @@ _Appears in:_
 | `datasetRef` _[DatasetRef](#datasetref)_ | DatasetRef points at the golden dataset (JSONL). |  |  |
 | `minAccuracy` _string_ | MinAccuracy is the minimum accuracy (decimal string in [0,1], e.g. "0.90")<br />the candidate must reach to be promoted. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br /> |
 | `maxAccuracyDrop` _string_ | MaxAccuracyDrop is the maximum tolerated accuracy drop vs the stable<br />baseline (decimal string, e.g. "0.02"). Only enforced when a stable<br />revision exists to provide a baseline; empty means no drop constraint. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
+| `minMacroF1` _string_ | MinMacroF1 is the minimum macro-averaged F1 (decimal string in [0,1], e.g.<br />"0.80") the candidate must reach to be promoted. Macro-F1 weights every<br />class equally, so unlike accuracy it does not hide a class the model never<br />predicts. It is computed over choice and bool (noul) questions only; score<br />questions are excluded (there is no class to average). If the dataset has no<br />choice or bool question, a configured macro-F1 gate fails with a clear<br />reason rather than passing silently. Empty disables the absolute macro-F1<br />gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
+| `maxMacroF1Drop` _string_ | MaxMacroF1Drop is the maximum tolerated macro-F1 drop vs the stable baseline<br />(decimal string, e.g. "0.05"). Like maxAccuracyDrop it is only enforced when<br />a stable revision exists to provide a baseline; empty means no drop<br />constraint. Macro-F1 is computed over choice and bool (noul) questions only;<br />if the dataset has no such question a configured gate fails with a clear<br />reason. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
 | `maxCases` _integer_ | MaxCases caps how many dataset cases are used (first N). | 500 | Maximum: 5000 <br />Minimum: 1 <br />Optional: \{\} <br /> |
 | `maxECE` _string_ | MaxECE is the maximum tolerated Expected Calibration Error (decimal string<br />in [0,1], e.g. "0.10"). Empty disables the absolute ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
 | `maxECEIncrease` _string_ | MaxECEIncrease is the maximum tolerated ECE increase vs the stable baseline<br />(decimal string). Only enforced when a stable revision exists to provide a<br />baseline; empty disables the relative ECE gate. |  | Pattern: `^(0(\.[0-9]+)?\|1(\.0+)?)$` <br />Optional: \{\} <br /> |
@@ -250,10 +252,17 @@ _Appears in:_
 | `ece` _string_ | ECE is the candidate's expected calibration error (decimal string). |  |  |
 | `brier` _string_ | Brier is the candidate's Brier score (decimal string). |  |  |
 | `baselineEce` _string_ | BaselineECE is the stable revision's ECE for this dataset, if known. |  |  |
+| `macroF1` _string_ | MacroF1 is the candidate's macro-averaged F1 over choice and bool questions<br />(decimal string). Empty when the dataset has no classifiable question. |  | Optional: \{\} <br /> |
+| `baselineMacroF1` _string_ | BaselineMacroF1 is the stable revision's macro-F1 for this dataset, if known. |  | Optional: \{\} <br /> |
+| `classifiableCases` _integer_ | ClassifiableCases is the number of scored choice/bool records that fed<br />macro-F1. A macro-F1 gate (minMacroF1 / maxMacroF1Drop) does not pass when<br />this is 0: macro-F1 over no class is 0, which would otherwise either fail an<br />absolute floor spuriously or look like a perfect no-drop. |  | Optional: \{\} <br /> |
 | `minAccuracy` _string_ | MinAccuracy echoes the accuracy floor the gate applied, if any. |  | Optional: \{\} <br /> |
 | `maxAccuracyDrop` _string_ | MaxAccuracyDrop echoes the accuracy-drop limit the gate applied, if any. |  | Optional: \{\} <br /> |
 | `maxEce` _string_ | MaxECE echoes the absolute ECE limit the gate applied, if any. |  | Optional: \{\} <br /> |
 | `maxEceIncrease` _string_ | MaxECEIncrease echoes the relative ECE-increase limit the gate applied, if any. |  | Optional: \{\} <br /> |
+| `minMacroF1` _string_ | MinMacroF1 echoes the macro-F1 floor the gate applied, if any. |  | Optional: \{\} <br /> |
+| `maxMacroF1Drop` _string_ | MaxMacroF1Drop echoes the macro-F1-drop limit the gate applied, if any. |  | Optional: \{\} <br /> |
+| `questions` _[QuestionEvaluation](#questionevaluation) array_ | Questions is a bounded per-question breakdown (at most 20 entries, worst<br />macro-F1 first) carried for visibility. It covers the choice/bool questions<br />that fed macro-F1; score questions are not listed. Truncated is true when<br />more questions existed than are listed. |  | Optional: \{\} <br /> |
+| `truncated` _boolean_ | Truncated is true when the Questions list was capped and does not show every<br />classifiable question. |  | Optional: \{\} <br /> |
 | `result` _[EvaluationResult](#evaluationresult)_ | Result is the gate outcome: Passed or Failed. |  | Enum: [Passed Failed] <br />Optional: \{\} <br /> |
 | `reason` _string_ | Reason is the gate message (e.g. the failing comparison), human-readable. |  | Optional: \{\} <br /> |
 | `policyHash` _string_ | PolicyHash is a hash of the effective evaluation policy (thresholds,<br />datasetRef, maxCases) this result was produced under. A parked candidate in<br />AwaitingPromotion whose current policy hash differs is re-evaluated rather<br />than promoted on the stale result. |  | Optional: \{\} <br /> |
@@ -299,6 +308,27 @@ _Appears in:_
 | `Automatic` | PromotionAutomatic promotes a candidate as soon as it is model-ready (and,<br />when evaluation is configured, has passed the gate).<br /> |
 | `EvaluationGated` | PromotionEvaluationGated requires rollout.evaluation and lets the gate<br />decide promotion. Rejected by CEL when evaluation is unset.<br /> |
 | `Manual` | PromotionManual holds a passed candidate in AwaitingPromotion until a human<br />approves it via the decisionmodel.io/promote annotation.<br /> |
+
+
+#### QuestionEvaluation
+
+
+
+QuestionEvaluation is a bounded per-question entry in an EvaluationStatus: the
+question id, how many records it had, its accuracy and its macro-F1. Only
+choice/bool questions appear (the ones that feed macro-F1).
+
+
+
+_Appears in:_
+- [EvaluationStatus](#evaluationstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `id` _string_ | ID is the question id. |  |  |
+| `cases` _integer_ | Cases is the number of scored records for this question. |  | Optional: \{\} <br /> |
+| `accuracy` _string_ | Accuracy is the per-question accuracy (decimal string). |  | Optional: \{\} <br /> |
+| `macroF1` _string_ | MacroF1 is the per-question macro-F1 (decimal string). |  | Optional: \{\} <br /> |
 
 
 #### ReplicaStatus
