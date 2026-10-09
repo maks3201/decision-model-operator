@@ -1,10 +1,16 @@
 # Spike 009 — exact-digest prefetch and moved-tag recovery
 
-> **Correction (2026-10-09).** The Ollaya maintainers state that `ollaya pull <tag>` always fetches the tag's
-> manifest, downloads its blobs and writes it over the on-disk one (`pull_one` in
-> `crates/ollaya-registry/src/pull.rs`; ollaya-dev/ollaya#64), and that they will not support the seeded-manifest
-> behaviour. Q4 below most likely observed a store whose blobs were already present, so nothing was fetched. Do
-> not rely on Q4: a lost store with a moved tag fails with `UpstreamTagMoved` and is not rebuilt.
+> **Correction (2026-10-09).** The Q4 claim below — that `ollaya pull <tag>` trusts an
+> on-disk manifest and does **not** overwrite it, so a seed enables moved-tag recovery — is
+> **wrong**. A clean reproduction on `ollaya:0.12.0` (see "Correction note" at the end of this
+> file) shows `ollaya pull <tag>` **always re-resolves the tag and overwrites the on-disk
+> manifest** with the tag's current bytes, both with an empty blobs dir and with the blobs
+> already present. This matches upstream (ollaya-dev/ollaya#64). Consequently a manifest seed
+> does **not** restore a moved tag: after the pull the store holds whatever the tag points to
+> now, and the operator's post-pull digest check fails such a case with `UpstreamTagMoved`.
+> Read the Q4 rows, the "moved-tag simulation" evidence, and the "moved-tag recovery WORKS"
+> conclusion below as **superseded**; the manifest seed remains useful only as defence in depth
+> (fail-fast on a bad recorded value before pulling), not as recovery.
 
 Tested 2026-10-07 on macOS arm64 (OrbStack) against `ghcr.io/ollaya-dev/ollaya:0.10.0`
 (the current default runtime) and `:0.12.0`, CPU path only. The question: prefetch
@@ -164,3 +170,84 @@ deadline, then the revision fails. This is correct: the content genuinely no lon
 and no local action can recover it; the operator cannot invent the weights. (A dedicated
 "blobs gone" permanent reason would need the CLI to distinguish a 404-on-blob from a
 transient network error, which it does not expose today — noted for a future upstream ask.)
+
+## Correction note (2026-10-09) — Q4 re-check on 0.12.0
+
+Re-tested on macOS arm64 (OrbStack) against `ghcr.io/ollaya-dev/ollaya:0.12.0`
+(`client version is 0.12.0`), CPU path, no running daemon (`ollaya pull`/`ollaya list`
+run standalone). The question Q4 got wrong: when a manifest is already on disk at the tag
+path, does `ollaya pull <tag>` keep it, or overwrite it by re-resolving the tag?
+
+Setup: a host store mounted at `/home/ollaya/.ollaya/models` (the default; `/models` is not
+writable by the image's UID 1000). The two manifests, fetched by tag from the live registry:
+
+```
+laya:en          sha256 = c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d  (3089 bytes)
+laya:multilingual sha256 = 2840506e1f978aeb696a6f84af43ecc7fca95754cb63a67bafe6132532d384eb  (3115 bytes)
+```
+
+### Experiment 1 — EMPTY blobs dir
+
+Seed `laya:multilingual`'s manifest at the `laya/en` tag path, blobs/ empty, then
+`ollaya pull laya:en`:
+
+```
+# seed
+cp multilingual.json  <store>/manifests/ollaya.dev/library/laya/en
+ls <store>/blobs      # empty
+
+BEFORE pull: on-disk laya/en manifest = 2840506e1f97…  (multilingual)
+$ ollaya pull laya:en           # exit 0
+AFTER  pull: on-disk laya/en manifest = c305a9276531…  (laya:en)   <-- OVERWRITTEN
+blobs now present: 9            # laya:en's blobs, incl. the 842,609,210-byte weights
+                                # sha256-891102d3… (model.safetensors)
+```
+
+Result: the seeded multilingual manifest was **overwritten** with the live `laya:en`
+manifest, and `laya:en`'s 9 blobs were downloaded. The on-disk file is byte-identical to
+the live `laya:en` manifest.
+
+### Experiment 2 — blobs PRESENT
+
+Re-seed the multilingual manifest at the same `laya/en` path, this time with `laya:en`'s 9
+blobs from Experiment 1 still in blobs/, then `ollaya pull laya:en`:
+
+```
+BEFORE pull: on-disk laya/en manifest = 2840506e1f97…  (multilingual), blob count = 9
+$ ollaya pull laya:en           # exit 0
+AFTER  pull: on-disk laya/en manifest = c305a9276531…  (laya:en)   <-- OVERWRITTEN
+blob count after = 9            # nothing new to fetch; all laya:en blobs already present
+$ ollaya list
+NAME      ID             SIZE     MODIFIED
+laya:en   c305a9276531   853 MB   10 seconds ago
+```
+
+Result: the manifest was **overwritten again**. The presence of the blobs does not change
+the outcome — `pull <tag>` re-resolves the tag and rewrites the manifest regardless.
+
+### Corrected conclusion
+
+- `ollaya pull <tag>` **always re-resolves the tag from the registry and overwrites the
+  on-disk manifest** with the tag's current bytes, in both the empty-blobs and
+  blobs-present cases on 0.12.0. The original Q4 finding ("pull trusts the on-disk manifest;
+  moved-tag recovery WORKS") does **not** reproduce and is withdrawn. The likely cause of the
+  earlier result: the laya:en blobs were already present and the on-disk manifest observed
+  "after" was in fact already the laya:en manifest (not the seeded one), so no change was
+  seen. This re-check controls for that by diffing the exact on-disk sha256 before and after.
+- A persisted manifest seed therefore **cannot** rebuild a moved tag: after the pull the
+  store holds whatever `<tag>` points at now, so a tag that moved to D' leaves D' on disk,
+  which the operator's post-pull digest check catches as `UpstreamTagMoved` (exit 5,
+  permanent). The seed's only remaining value is defence in depth: it is verified against the
+  recorded digest **before** the pull, so a bad recorded value fails fast (`DigestMismatch`)
+  without a network round-trip. It is not a recovery mechanism.
+- Exact-digest recovery still requires upstream pull-by-digest
+  (`<name>:<tag>@sha256:<hex>` plus retained manifests), which no runtime in our supported
+  range (0.7.3 … 0.12.0) provides (ollaya-dev/ollaya#64, still open). Until then the operator
+  pins via tag-pull + post-pull sha256 verification, which fails loudly rather than drifting
+  when a tag moves.
+
+The "Implemented now (engine)", "Implementation results — rebuild from a seeded manifest",
+and "Follow-up" sections above describe the seed as enabling moved-tag recovery; that
+specific capability does not hold. The engine's moved-vs-corrupt classification
+(`UpstreamTagMoved` vs `DigestMismatch`) and the fail-fast seed verification are correct and
+unaffected.
