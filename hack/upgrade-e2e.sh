@@ -121,7 +121,55 @@ assert_not_rerolled() {
     kc describe decisionmodel "${dm}" -n "${NS}" | tail -40
     return 1
   fi
-  echo "PASS ${dm}: Ready, same stable (${stable_before}), no candidate, pod template + resources unchanged."
+
+  # New status field populated by the upgrade without a roll: the source records
+  # status.stableRevision.runtimeVersion (resolved engine runtime). An older "from"
+  # release left it empty; after the upgrade it must be populated for the SAME stable
+  # hash — the controller enriches status in place, it does not roll to do it.
+  local rtver
+  rtver="$(jp decisionmodel "${dm}" '{.status.stableRevision.runtimeVersion}')"
+  if [[ -z "${rtver}" ]]; then
+    echo "FAIL ${dm}: status.stableRevision.runtimeVersion not populated after the upgrade (new status field should be filled in place)"
+    kc get decisionmodel "${dm}" -n "${NS}" -o yaml | grep -A20 'stableRevision:' | head -25
+    return 1
+  fi
+  echo "PASS ${dm}: Ready, same stable (${stable_before}), no candidate, pod template + resources unchanged, runtimeVersion=${rtver} populated."
+}
+
+# assert_store_recovery <dm> — after the upgrade, delete the stable revision's model-
+# store PVC and prove the operator rebuilds the store (from the owned manifest ConfigMap)
+# without rolling the stable: the DM returns to Ready on the SAME stable hash and a store
+# PVC for that revision exists again. This exercises the post-upgrade store-recovery path
+# the new controller owns, on a stable created by the OLD release.
+assert_store_recovery() {
+  local dm="$1" stable dep pvc stable_now
+  stable="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
+  pvc="${dm}-store-${stable}"
+  # Some older stables use the shared (non-per-revision) store name; skip gracefully
+  # if the per-revision PVC is not the one in use (recovery for the shared store is a
+  # separate migration path, not this check).
+  if ! kc get pvc "${pvc}" -n "${NS}" >/dev/null 2>&1; then
+    echo "SKIP ${dm}: no per-revision store PVC ${pvc} (shared-store migration path); store recovery not asserted here"
+    return 0
+  fi
+  echo "deleting store PVC ${pvc} to exercise post-upgrade store recovery"
+  kc delete pvc "${pvc}" -n "${NS}" --wait=false >/dev/null 2>&1 || true
+  local ok=""
+  for _ in $(seq 1 96); do
+    stable_now="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
+    local phase; phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
+    if [[ "${phase}" = "Ready" ]] && [[ "${stable_now}" = "${stable}" ]] && \
+       kc get pvc "${pvc}" -n "${NS}" >/dev/null 2>&1; then
+      ok="yes"; break
+    fi
+    sleep 5
+  done
+  if [[ "${ok}" != "yes" ]]; then
+    echo "FAIL ${dm}: store not recovered after the upgrade (phase=$(jp decisionmodel "${dm}" '{.status.phase}'), stable ${stable} -> ${stable_now:-}, PVC ${pvc})"
+    kc describe decisionmodel "${dm}" -n "${NS}" | tail -40
+    return 1
+  fi
+  echo "PASS ${dm}: store PVC ${pvc} rebuilt, same stable (${stable}), Ready — post-upgrade store recovery works."
 }
 
 # --- bring up the cluster + runtime image (reuses hack/kind-up.sh) ------------
@@ -201,5 +249,10 @@ rc=0
 assert_not_rerolled "${DM_RES}" || rc=1
 assert_not_rerolled "${DM_NORES}" || rc=1
 [[ "${rc}" -eq 0 ]] || { echo "FAIL: upgrade ${from_tag} -> source re-rolled at least one DecisionModel"; exit 1; }
+
+# --- post-upgrade store recovery (new controller owns it; stable made by old release) ---
+note "asserting post-upgrade store recovery (delete the stable's store PVC, expect a rebuild with no roll)"
+assert_store_recovery "${DM_RES}" || rc=1
+[[ "${rc}" -eq 0 ]] || { echo "FAIL: upgrade ${from_tag} -> source: store recovery failed"; exit 1; }
 
 echo "PASS: upgrade ${from_tag} -> source kept both DecisionModels Ready and un-rerolled."

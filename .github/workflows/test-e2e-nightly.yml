@@ -60,11 +60,12 @@ jobs:
           # E2E_MIRROR unset so it skips for the non-laya nightly models.
           # The HA and chaos containers have their own nightly workflows
           # (test-e2e-ha.yml / test-e2e-chaos.yml, laya:en) and are excluded here so
-          # they do not add to this job's budget. The recreate container needs a
-          # multi-node cluster (its own shard in test-e2e.yml, built from
-          # hack/kind-recreate.yaml) and is excluded here, which runs on a single
-          # node against the non-laya nightly models.
-          E2E_LABEL_FILTER: "!ha && !chaos && !recreate && !scheduler-edge && !registry-outage"
+          # they do not add to this job's budget. recreate, scheduler-edge and
+          # registry-outage need their own clusters (shards below / in test-e2e.yml);
+          # scheduler, fleet and ha-switch run once on laya:en in their own jobs --
+          # all excluded from the per-model matrix, which runs on a single node
+          # against non-laya models.
+          E2E_LABEL_FILTER: "!ha && !ha-switch && !chaos && !recreate && !scheduler && !fleet && !scheduler-edge && !registry-outage"
         run: make test-e2e
 
   # Scheduler/storage edge cases (capacity-1 resource with a terminating Pod,
@@ -237,4 +238,36 @@ jobs:
           # Own cluster per leg so parallel legs do not collide (lowercase name
           # from the resolve step; kind requires lowercase).
           KIND_CLUSTER: ${{ steps.k8s.outputs.cluster }}
+        run: make test-e2e
+
+  # Model-agnostic stress containers that are not worth a per-PR slot: the
+  # single-scarce-resource rollout (scheduler) and the large-fleet reconcile cost
+  # (fleet). Both run on a single node on laya:en. They are labelled "nightly" so
+  # the per-PR and k8s-version (!nightly) runs never pick them up, and excluded
+  # from the per-model matrix above (model-agnostic). One cluster, run serially.
+  stress:
+    name: kind (kustomize, CPU, laya:en, scheduler + fleet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Run e2e
+        env:
+          E2E_INSTALL: kustomize
+          # scheduler advertises a fake extended resource and rolls out; fleet creates
+          # a few hundred DecisionModels pinned to unresolvable tags (no model loads).
+          E2E_LABEL_FILTER: "scheduler || fleet"
+          KIND_CLUSTER: dmo-e2e-stress
         run: make test-e2e

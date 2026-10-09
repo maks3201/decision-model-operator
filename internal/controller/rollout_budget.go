@@ -77,11 +77,11 @@ func (r *DecisionModelReconciler) gateRolloutBudget(
 // Instead the decision is first made from the CACHED List; if it would QUEUE, that
 // is returned directly (a stale cache can only make a DM wait one extra cycle,
 // never over-admit, so queuing needs no uncached confirmation). Only when the
-// cached decision would ADMIT do we re-confirm against the UNCACHED List — an
-// uncached read cannot miss a slot a just-admitted DM already took, including an
-// admission by a different leader or this leader's own not-yet-cached write — so
-// the hard cross-leader limit still holds, now paid only at the moment of
-// admission rather than on every queued tick.
+// cached decision would ADMIT do we re-confirm against the UNCACHED List — read
+// under budgetMu together with the count+decide+reserve so an admission a
+// just-admitted DM already took (a different leader, or this leader's own
+// not-yet-cached write) is always counted — so the hard cross-leader limit still
+// holds, now paid only at the moment of admission rather than on every queued tick.
 func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -108,15 +108,24 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 
 	// Phase 2: the cached view would admit — re-confirm against an UNCACHED List so
 	// a slot a just-admitted DM already took (another leader, or this leader's
-	// own write the cache has not caught up to) is counted. Reserve under the same
-	// lock so the count+decide+reserve is atomic for this process.
+	// own write the cache has not caught up to) is counted.
+	//
+	// The authoritative List MUST be read while holding budgetMu, together with the
+	// count+decide+reserve. releaseReservation also takes budgetMu and runs only
+	// after a candidate's admission is durable, so holding the lock across the List
+	// read serializes it against every release: once we hold the lock no release is
+	// in flight, and an uncached (strongly consistent) List taken under the lock
+	// observes every durable candidateRevision whose reservation has already been
+	// dropped. Reading the List before the lock (as an earlier version did) left a
+	// window where a List snapshot could predate another DM's durable write *and*
+	// its reservation-release, counting that in-flight rollout as neither active nor
+	// reserved — admitting a slot over the budget under heavy parallel reconciles.
+	r.budgetMu.Lock()
+	defer r.budgetMu.Unlock()
 	list := &decisionmodelv1alpha1.DecisionModelList{}
 	if err := r.listInScopeUncached(ctx, list); err != nil {
 		return false, ctrl.Result{}, err
 	}
-
-	r.budgetMu.Lock()
-	defer r.budgetMu.Unlock()
 	return r.decideRolloutBudgetLocked(ctx, list, dm, rev)
 }
 
