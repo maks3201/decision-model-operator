@@ -183,6 +183,7 @@ _Appears in:_
 | `failedRevision` _[RevisionStatus](#revisionstatus)_ | FailedRevision is a revision that failed to roll out. The controller does<br />not automatically retry it; a spec change (new revision) is required, or<br />setting the decisionmodel.io/retry annotation to a new token re-attempts<br />the same revision. |  | Optional: \{\} <br /> |
 | `previousRevision` _[PreviousRevisionStatus](#previousrevisionstatus)_ | PreviousRevision is the revision that was stable immediately before the<br />most recent promotion. It may linger for a short grace period after<br />promotedAt so the new revision's endpoints populate before it is removed. |  | Optional: \{\} <br /> |
 | `stableStoppedForRevision` _string_ | StableStoppedForRevision records that, under rollout.strategy Recreate, the<br />stable revision's Deployment has been scaled to 0 to free capacity for the<br />candidate revision named here (its hash). It is the durable signal that the<br />stable is intentionally down (not failed): the stable is rendered at 0<br />replicas while it is set, and scaled back to its replicas if the candidate<br />fails. Cleared on promotion (the candidate becomes the stable) or rollback<br />(the stable is restored). Empty under BlueGreen. |  | Optional: \{\} <br /> |
+| `recreateRollback` _[RecreateRollbackStatus](#recreaterollbackstatus)_ | RecreateRollback drives the capacity-safe rollback of a Recreate rollout<br />when the newly promoted stable turns unhealthy inside its stabilization<br />window. On one GPU the unhealthy new stable and the recovery target cannot<br />run at once, so the rollback is staged (scale the unhealthy stable to 0,<br />wait, scale the target up, wait until model-ready, then switch the Service)<br />and this durable record lets each step resume after a restart. Empty when no<br />Recreate rollback is in progress. |  | Optional: \{\} <br /> |
 | `lastRetryToken` _string_ | LastRetryToken is the value of the decisionmodel.io/retry annotation the<br />controller last consumed to clear a failed revision. |  | Optional: \{\} <br /> |
 | `storeRecovery` _[StoreRecoveryStatus](#storerecoverystatus)_ | StoreRecovery tracks the bounded retries of lost-store recovery for the<br />stable revision. It is persisted so the attempt bound survives an operator<br />restart (an in-memory counter would reset and allow more recreations than<br />the documented limit). |  | Optional: \{\} <br /> |
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
@@ -330,6 +331,26 @@ _Appears in:_
 | `cases` _integer_ | Cases is the number of scored records for this question. |  | Optional: \{\} <br /> |
 | `accuracy` _string_ | Accuracy is the per-question accuracy (decimal string). |  | Optional: \{\} <br /> |
 | `macroF1` _string_ | MacroF1 is the per-question macro-F1 (decimal string). |  | Optional: \{\} <br /> |
+
+
+#### RecreateRollbackStatus
+
+
+
+RecreateRollbackStatus is the durable state of a staged Recreate rollback: the
+unhealthy revision being torn down and the target revision being brought back
+up, so the operator resumes the correct step after a restart.
+
+
+
+_Appears in:_
+- [DecisionModelStatus](#decisionmodelstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `failed` _string_ | Failed is the hash of the unhealthy new stable being scaled to 0 and removed. |  | Optional: \{\} <br /> |
+| `target` _string_ | Target is the hash of the revision being restored (the previous revision).<br />Once it is model-ready the Service is switched to it and the rollback ends. |  | Optional: \{\} <br /> |
+| `startedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | StartedAt is when the staged rollback began (for diagnostics / a bounded<br />wait if the target never comes up). |  | Optional: \{\} <br /> |
 
 
 #### ReplicaStatus

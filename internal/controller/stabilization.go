@@ -407,6 +407,43 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	r.event(ctx, dm, corev1.EventTypeWarning, eventRolledBackPromo, "%s", msg)
 	bufferRollout(ctx, rolloutRolledBackAfterPromotion)
 
+	// Recreate: the previous revision was scaled to 0 for the rollout, so it is
+	// NOT up to receive traffic. Stage the rollback (scale the unhealthy stable to
+	// 0, free the GPU, bring the target up, switch the Service only when it is
+	// model-ready) via a durable marker; the stable path drives the remaining
+	// steps restart-safely. Do NOT switch the Service here.
+	if rolloutStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate {
+		startedAt := metav1.NewTime(r.now())
+		dm.Status.RecreateRollback = &decisionmodelv1alpha1.RecreateRollbackStatus{
+			Failed: failed.Hash, Target: prev.Hash, StartedAt: &startedAt,
+		}
+		// The target is still down, so report not-Ready while the staged rollback
+		// brings it up (overriding the Ready=True set just above).
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  reasonPostPromotionUnhealthy,
+			Message: fmt.Sprintf("rolling back to %s (Recreate): stopping %s, then starting %s", prev.Hash, failed.Hash, prev.Hash),
+		})
+		persisted, conflict, err := r.persistStatus(ctx, dm)
+		if conflict {
+			return stabilizationResult{rolledBack: true, res: ctrl.Result{RequeueAfter: time.Second}}
+		}
+		if err != nil {
+			return stabilizationResult{rolledBack: true, err: err}
+		}
+		if !persisted {
+			return stabilizationResult{rolledBack: true, res: ctrl.Result{}}
+		}
+		// Delete the unhealthy stable's workloads to free the GPU for the target.
+		// Idempotent; the stable path brings the target up and switches the Service
+		// once it is model-ready (driveRecreateRollback).
+		if err := r.deleteRevisionWorkloads(ctx, dm, failed.Hash); err != nil {
+			return stabilizationResult{rolledBack: true, err: err}
+		}
+		return stabilizationResult{rolledBack: true, res: ctrl.Result{RequeueAfter: probeRequeue}}
+	}
+
 	// Persist first. On conflict nothing was stored and no Event/metric was
 	// emitted; requeue and redo the decision from fresh state next reconcile.
 	persisted, conflict, err := r.persistStatus(ctx, dm)

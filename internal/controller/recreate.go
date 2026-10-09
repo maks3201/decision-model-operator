@@ -18,8 +18,11 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -47,9 +50,24 @@ func stableStopped(dm *decisionmodelv1alpha1.DecisionModel) bool {
 // (status.stableStoppedForRevision set and rev is the stable). This is the single
 // place the scaled-down stable's replica count is decided, so ensureDeployment's
 // drift repair holds it at 0 instead of reverting it to spec.replicas.
+// desiredReplicasForRevision is desiredReplicas, except a revision is rendered at
+// 0 while a Recreate rollout intentionally holds it down:
+//   - the stable while it is stopped for a candidate (status.stableStoppedForRevision), and
+//   - the previous revision during a Recreate stabilization window — it was scaled
+//     to 0 for the rollout and must stay at 0 for the whole window so that, on one
+//     GPU, it never schedules a Pod that would sit Pending or steal the GPU from the
+//     new stable. (Nothing re-renders the previous revision today; this makes the
+//     "stays at 0" guarantee explicit and survives a future change that does.)
+//
+// This is the single place a Recreate-held revision's replica count is decided, so
+// ensureDeployment's drift repair holds it at 0 instead of reverting to spec.replicas.
 func desiredReplicasForRevision(dm *decisionmodelv1alpha1.DecisionModel, rev string) int32 {
 	if stableStopped(dm) &&
 		dm.Status.StableRevision != nil && dm.Status.StableRevision.Hash == rev {
+		return 0
+	}
+	if rolloutStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate &&
+		dm.Status.PreviousRevision != nil && dm.Status.PreviousRevision.Hash == rev {
 		return 0
 	}
 	return desiredReplicas(dm)
@@ -181,6 +199,75 @@ func recreateRestoreStable(ctx context.Context, r *DecisionModelReconciler,
 // true while the stable is intentionally stopped for this candidate.
 func recreateBaselineUnavailable(dm *decisionmodelv1alpha1.DecisionModel) bool {
 	return stableStopped(dm)
+}
+
+// reconcileRecreateRollback finishes a staged Recreate rollback. The new stable
+// turned unhealthy inside its stabilization window; rollbackToPrevious recorded
+// the decision (status.stableRevision = the target/previous revision,
+// status.failedRevision = the unhealthy one, status.recreateRollback set) and
+// deleted the unhealthy revision's workloads. This path brings the target back on
+// the single GPU in a capacity-safe order and is restart-safe (all state from
+// status + cluster):
+//  1. render the target Deployment at its replicas (it was scaled to 0 for the rollout);
+//  2. wait until the unhealthy revision's Pods are gone (GPU freed);
+//  3. wait until the target is model-ready;
+//  4. switch the Service to the target and clear the marker.
+func (r *DecisionModelReconciler) reconcileRecreateRollback(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	target *decisionmodelv1alpha1.RevisionStatus,
+	apiKey string,
+) (ctrl.Result, error) {
+	rb := dm.Status.RecreateRollback
+	// 1. Render the target Deployment from its recorded identity (now at its
+	// replicas, since desiredReplicasForRevision no longer holds it at 0 — it is
+	// the stable again and the stop marker is cleared).
+	claim, _ := r.storeClaimForStable(ctx, dm, target)
+	params := r.stableParams(ctx, dm, target, claim)
+	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
+	if err := r.ensureDeployment(ctx, dm, eng, params, target.Hash, true, keyChecksum, legacyChecksum, false); err != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	if err := r.ensurePDB(ctx, dm, target.Hash); err != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	// 2. Wait until the unhealthy revision's Pods are gone (free the GPU).
+	gone, err := r.stableReplicasGone(ctx, dm, rb.Failed)
+	if err != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, err)
+	}
+	// 3. Probe the target for model-readiness.
+	ready, precision, probeErr := r.probePods(ctx, dm, eng, target, apiKey)
+	if errors.Is(probeErr, errPodListFailed) {
+		return r.finish(ctx, dm, ctrl.Result{}, probeErr)
+	}
+	if precision != "" {
+		target.Precision = precision
+	}
+	r.setReplicaStatus(dm, ready)
+	if !gone || ready < 1 {
+		// Still stopping the unhealthy revision or waiting for the target to load
+		// the model: keep the Service off the target (documented downtime) and wait.
+		return r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
+	}
+	// 4. Target is up: switch the Service to it, clear the marker, announce.
+	if serr := r.ensureService(ctx, dm, eng, target.Hash); serr != nil {
+		if errors.Is(serr, errResourceConflict) {
+			return r.finish(ctx, dm, ctrl.Result{RequeueAfter: resourceConflictRequeue}, nil)
+		}
+		return r.finish(ctx, dm, ctrl.Result{}, serr)
+	}
+	r.event(ctx, dm, corev1.EventTypeNormal, eventStableRestored,
+		"Recreate rollback complete: restored revision %s and switched traffic to it", target.Hash)
+	dm.Status.RecreateRollback = nil
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionReady,
+		Status:  metav1.ConditionTrue,
+		Reason:  reasonCandidateRejected,
+		Message: fmt.Sprintf("rolled back to %s; it is serving again", target.Hash),
+	})
+	return r.finish(ctx, dm, r.regateRequeue(), nil)
 }
 
 // announceRecreateRelativeSkip emits the Warning that the relative eval gates are

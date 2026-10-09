@@ -86,8 +86,16 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 		return false, ctrl.Result{}, nil // unlimited
 	}
 
+	// Count from an UNCACHED read of DecisionModels in the watched scope. Admission
+	// is persisted (status.candidateRevision) before any allocation, so an uncached
+	// List cannot miss a slot a just-admitted DM already took — including an
+	// admission by a different leader, or this leader's own write that the manager
+	// cache has not caught up to yet. This is the only budget read that must be
+	// uncached; it runs only when a brand-new candidate is deciding admission (not
+	// on steady-state reconciles). The cost is one List of DecisionModels in the
+	// watched namespaces per admission decision.
 	list := &decisionmodelv1alpha1.DecisionModelList{}
-	if err := r.listInScope(ctx, list); err != nil {
+	if err := r.listInScopeUncached(ctx, list); err != nil {
 		return false, ctrl.Result{}, err
 	}
 
@@ -124,8 +132,11 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 			active++
 			continue
 		}
-		// An admitted-but-not-yet-visible candidate (its status write has not
-		// reached the cache) still occupies a slot via its reservation.
+		// A same-process reservation (admitted-but-not-yet-persisted candidate)
+		// still occupies a slot. With persist-first admission the uncached List
+		// above already sees any durable candidateRevision, so this only covers the
+		// in-reconcile window before the persist; it is a single-process
+		// optimisation, not the cross-leader guarantee (that is the uncached read).
 		if _, reserved := r.budgetReservations[key]; reserved {
 			active++
 			continue
@@ -246,12 +257,40 @@ func (r *DecisionModelReconciler) listInScope(
 	ctx context.Context,
 	list *decisionmodelv1alpha1.DecisionModelList,
 ) error {
+	return r.listInScopeWith(ctx, r.Client, list)
+}
+
+// listInScopeUncached is listInScope through the uncached APIReader, so a
+// just-persisted admission (status.candidateRevision) is never missed by a lagging
+// manager cache — the cross-leader correctness read for the rollout budget. It
+// requires no new RBAC (the operator already lists/watches DecisionModels) and
+// runs only on an admission decision, not every reconcile.
+func (r *DecisionModelReconciler) listInScopeUncached(
+	ctx context.Context,
+	list *decisionmodelv1alpha1.DecisionModelList,
+) error {
+	if r.APIReader == nil {
+		// Fall back to the cached client rather than fail; the manager always
+		// injects APIReader in production (SetupWithManager), so this only matters
+		// in a unit test that did not set it.
+		return r.listInScope(ctx, list)
+	}
+	return r.listInScopeWith(ctx, r.APIReader, list)
+}
+
+// listInScopeWith lists DecisionModels across the watched scope using the given
+// reader (the cached client or the uncached APIReader).
+func (r *DecisionModelReconciler) listInScopeWith(
+	ctx context.Context,
+	reader client.Reader,
+	list *decisionmodelv1alpha1.DecisionModelList,
+) error {
 	if len(r.WatchNamespaces) == 0 {
-		return r.List(ctx, list)
+		return reader.List(ctx, list)
 	}
 	for _, ns := range r.WatchNamespaces {
 		part := &decisionmodelv1alpha1.DecisionModelList{}
-		if err := r.List(ctx, part, client.InNamespace(ns)); err != nil {
+		if err := reader.List(ctx, part, client.InNamespace(ns)); err != nil {
 			return err
 		}
 		list.Items = append(list.Items, part.Items...)

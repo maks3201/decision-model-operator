@@ -523,6 +523,23 @@ type PreviousRevisionStatus struct {
 	Revision *RevisionStatus `json:"revision,omitempty"`
 }
 
+// RecreateRollbackStatus is the durable state of a staged Recreate rollback: the
+// unhealthy revision being torn down and the target revision being brought back
+// up, so the operator resumes the correct step after a restart.
+type RecreateRollbackStatus struct {
+	// Failed is the hash of the unhealthy new stable being scaled to 0 and removed.
+	// +optional
+	Failed string `json:"failed,omitempty"`
+	// Target is the hash of the revision being restored (the previous revision).
+	// Once it is model-ready the Service is switched to it and the rollback ends.
+	// +optional
+	Target string `json:"target,omitempty"`
+	// StartedAt is when the staged rollback began (for diagnostics / a bounded
+	// wait if the target never comes up).
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+}
+
 // ReplicaStatus reports desired and model-ready replica counts.
 type ReplicaStatus struct {
 	// Desired is the desired number of serving replicas.
@@ -747,6 +764,16 @@ type DecisionModelStatus struct {
 	// (the stable is restored). Empty under BlueGreen.
 	// +optional
 	StableStoppedForRevision string `json:"stableStoppedForRevision,omitempty"`
+
+	// RecreateRollback drives the capacity-safe rollback of a Recreate rollout
+	// when the newly promoted stable turns unhealthy inside its stabilization
+	// window. On one GPU the unhealthy new stable and the recovery target cannot
+	// run at once, so the rollback is staged (scale the unhealthy stable to 0,
+	// wait, scale the target up, wait until model-ready, then switch the Service)
+	// and this durable record lets each step resume after a restart. Empty when no
+	// Recreate rollback is in progress.
+	// +optional
+	RecreateRollback *RecreateRollbackStatus `json:"recreateRollback,omitempty"`
 
 	// LastRetryToken is the value of the decisionmodel.io/retry annotation the
 	// controller last consumed to clear a failed revision.

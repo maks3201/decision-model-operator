@@ -147,6 +147,30 @@ Revision hash = hash of engine, model, digest, device, resources, engine image a
 (`scheduling`; omitted when empty so older hashes are unchanged). A scheduling change is a
 blue-green candidate. `replicas`, `cache` and `auth` are in-place updates of the stable Deployment.
 
+Rollout strategy (`rollout.strategy`, default `BlueGreen`):
+- **BlueGreen** (default): the candidate runs alongside the stable and traffic switches only after
+  it passes its gate. Needs capacity for both revisions at once (e.g. a second GPU).
+- **Recreate**: for clusters without spare capacity (a single GPU). The candidate is resolved and
+  prefetched **while the stable still serves** (the prefetch Job needs no GPU); only once the model
+  is `Cached` is the stable scaled to 0 (recorded in `status.stableStoppedForRevision`, persisted
+  first) and, once its Pods are gone, the candidate started. There is a traffic gap (documented
+  downtime) until promotion. A candidate failure scales the stable back up (`StableRestored`).
+  Relative eval gates (`maxAccuracyDrop`, `maxECEIncrease`, `maxMacroF1Drop`) are skipped under
+  Recreate — the stopped stable cannot be measured as a baseline — with a note in
+  `status.evaluation.reason` and a Warning; the absolute gates still apply. Recreate cannot be
+  combined with `promotion: Manual` (rejected by CEL: production would be down while a human
+  approves). Changing the strategy is not a revision-hash change.
+  - **Recreate rollback downtime.** After a Recreate promotion the old stable becomes the
+    `previousRevision` and stays scaled to 0 for the whole stabilization window (it was stopped
+    for the rollout and must not take the single GPU back). If the new stable turns unhealthy in
+    the window, the rollback is staged on one GPU — record the decision, scale the unhealthy
+    stable to 0, wait until its Pods are gone, scale the previous revision back up, wait until it
+    is model-ready, then switch the Service to it (durable `status.recreateRollback`, restart-safe
+    at every step). Serving is therefore **down from the moment the new stable is declared
+    unhealthy until the restored revision is model-ready** — the price of a single-GPU rollback.
+    With BlueGreen the previous revision keeps running through the window, so its rollback is
+    instant (just a Service switch).
+
 In-place rules:
 - A running stable is rendered from its recorded identity; its placement and resources are frozen
   from the live Deployment, so an operator upgrade (new default resources, GPU toleration, arch
@@ -251,7 +275,9 @@ cluster-scoped and is installed by a cluster admin.
 - `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.12.0-cuda` image. GPU behaviour verified on EKS
   (g4dn.xlarge, T4, Bottlerocket, 0.7.3-cuda; not yet re-verified on 0.12.0-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
   (only the exact `cuda:<n>` form; anything else fails the gate). A blue-green rollout needs a
-  second GPU for the candidate. Models are small (hundreds of MB to a few GB); recommend GPU
+  second GPU for the candidate; on a single GPU set `rollout.strategy: Recreate` so the stable is
+  stopped before the candidate starts (documented downtime, no second GPU — see §5). Models are
+  small (hundreds of MB to a few GB); recommend GPU
   time-slicing / MIG in the docs, the operator does not automate it.
 - `device: cpu` → CPU image; requests from the sizing table in spike 002.
 - `scheduling` is a passthrough.

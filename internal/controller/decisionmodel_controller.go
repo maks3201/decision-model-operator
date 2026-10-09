@@ -204,6 +204,8 @@ const (
 	eventReplicasCoLocated     = "ReplicasCoLocated"
 	eventStableStopped         = "StableStopped"
 	eventStableRestored        = "StableRestored"
+	eventManifestRepaired      = "ManifestRepaired"
+	eventManifestInvalid       = "ManifestInvalid"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -401,14 +403,6 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if !isStable {
 		r.recordRuntimeImagePinned(ctx, &dm, eng, candidate, effVer)
 		r.announceServingImageApplied(ctx, &dm, stable, image, rev)
-		// Persist this candidate's manifest NOW — same reconcile as Resolve, before
-		// the digest is recorded in status — so the bytes can never be lost (a
-		// queued candidate, a later-reconcile prefetch, or a crash after Resolve
-		// still has a durable manifest). On a write error, abort without a status
-		// write so the next reconcile resolves again and retries.
-		if err := r.persistCandidateManifest(ctx, &dm, rev, digest); err != nil {
-			return r.finish(ctx, &dm, ctrl.Result{}, err)
-		}
 	}
 
 	// Surface whether a newer engine runtime default exists than the version this
@@ -487,6 +481,17 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// token clears failedRevision only when the spec returned to the stable revision.
 	r.applyRetryToken(ctx, &dm, isStable)
 
+	// A staged Recreate rollback in progress (the new stable turned unhealthy in
+	// its stabilization window and was torn down to free the GPU for the previous
+	// revision) is authoritative: finish it before any other dispatch. It renders
+	// the target (recorded stable) and switches the Service to it only once it is
+	// model-ready, then clears the marker. Driven here so it works regardless of
+	// whether the current spec also recorded a FailedRevision.
+	if dm.Status.RecreateRollback != nil && stable != nil &&
+		dm.Status.RecreateRollback.Target == stable.Hash {
+		return r.reconcileRecreateRollback(ctx, &dm, eng, stable, apiKey)
+	}
+
 	// Do not automatically retry a revision that already failed. A spec change
 	// produces a new revision hash, which clears this guard. This path is
 	// authoritative for phase/conditions so a stray/stale write cannot leave the
@@ -554,6 +559,48 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	if dm.Status.PreviousRevision != nil && stabilizationFor(dm) > 0 {
 		dm.Status.PreviousRevision = nil
 		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionStabilizing)
+	}
+
+	// Persist admission + the manifest BEFORE allocating the PVC/Job. The manifest
+	// is written FIRST, while this reconcile's resolved bytes are fresh, and only
+	// then is status.candidateRevision recorded: if the manifest write fails the
+	// digest is NOT recorded, so the next reconcile re-resolves (no recorded digest
+	// to reuse) and retries with fresh bytes — the recorded digest can never
+	// outlive its durable manifest. Both run only on the admitted path, so a
+	// candidate repeatedly re-specced while queued writes neither (no leak). The
+	// manifest persist is a no-op when there is nothing verified to write (hard pin
+	// / reused digest / moved tag): the prefetch then falls back to pull-by-tag.
+	// The candidateRevision write is the durable admission record (A-079), counted
+	// through an uncached List, so recording it before the PVC/Job makes
+	// --max-concurrent-rollouts a hard limit across leaders.
+	if dm.Status.CandidateRevision == nil || dm.Status.CandidateRevision.Hash != rev {
+		if err := r.persistCandidateManifest(ctx, dm, rev, candidate.Digest); err != nil {
+			return r.finish(ctx, dm, ctrl.Result{}, err)
+		}
+		dm.Status.CandidateRevision = candidate
+		persisted, conflict, perr := r.persistStatus(ctx, dm)
+		if conflict {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if perr != nil {
+			return r.finish(ctx, dm, ctrl.Result{}, perr)
+		}
+		if !persisted {
+			return ctrl.Result{}, nil
+		}
+		// The admission write advanced the live resourceVersion; refresh the
+		// optimistic-lock base so the candidate flow's own finish() later in this
+		// reconcile patches from the just-written state instead of conflicting.
+		refreshPatchBase(ctx, dm)
+		// Admission is now durable; the same-process reservation is redundant.
+		r.releaseReservation(dm.Namespace, dm.Name)
+	} else {
+		// Already admitted (resumed candidate): the manifest may still need
+		// repairing from this reconcile's verified bytes (corrupt ConfigMap), or a
+		// legitimate no-op.
+		if err := r.persistCandidateManifest(ctx, dm, rev, candidate.Digest); err != nil {
+			return r.finish(ctx, dm, ctrl.Result{}, err)
+		}
 	}
 
 	// Create the candidate's per-revision store PVC and run the cache-sharing
