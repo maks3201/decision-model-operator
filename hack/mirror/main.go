@@ -47,13 +47,21 @@ import (
 func main() {
 	store := envOr("MIRROR_STORE", "/store/models")
 	addr := envOr("MIRROR_ADDR", ":8080")
-	// MIRROR_FAULT, when set to an HTTP status (e.g. "500" or "429"), makes every
-	// /v2/ request return that status instead of serving. It is read once at
-	// startup; the e2e chaos spec injects a fault by `kubectl set env` + a rollout,
-	// so the fault persists for the whole time the env is set (longer than the
-	// engine's in-request retries and a reconcile), which is what makes the
-	// transient-registry behaviour observable. Unset (default) serves normally.
-	fault := faultStatus(os.Getenv("MIRROR_FAULT"))
+	// MIRROR_FAULT selects a fault injected on every /v2/ request, read once at
+	// startup; the e2e specs inject a fault by `kubectl set env` + a rollout, so the
+	// fault persists for the whole time the env is set (longer than the engine's
+	// in-request retries and a reconcile), which is what makes the transient-registry
+	// behaviour observable. Values:
+	//   "429"/"500"/"502"/"503" - force that HTTP status (retryable/transient).
+	//   "reset"                  - accept the connection then abruptly close it so the
+	//                              client sees a TCP reset / EOF (a transport error, not
+	//                              an HTTP status): exercises the resolver/pull transport
+	//                              path rather than a status classification.
+	// Unset (default) serves normally. A DNS failure is NOT a mirror mode: it is
+	// driven by pointing the operator's registry at a name that does not resolve.
+	faultEnv := os.Getenv("MIRROR_FAULT")
+	fault := faultStatus(faultEnv)
+	faultReset := faultEnv == "reset"
 
 	// The store keeps manifests under a single <registry-host> directory (the host
 	// the model was pulled from at bake time). Discover it so the served repo path
@@ -63,7 +71,7 @@ func main() {
 		log.Fatalf("mirror: no manifests found under %s/manifests/*", store)
 	}
 	host := filepath.Base(hostDirs[0])
-	log.Printf("mirror: store=%s manifestHost=%s addr=%s fault=%d", store, host, addr, fault)
+	log.Printf("mirror: store=%s manifestHost=%s addr=%s fault=%d reset=%v", store, host, addr, fault, faultReset)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +81,23 @@ func main() {
 		// the Pod to report Ready for `kubectl rollout status`).
 		if p == "/healthz" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if faultReset && strings.HasPrefix(p, "/v2") {
+			// Abruptly close the underlying connection so the client sees a TCP
+			// reset / EOF (a transport error, not an HTTP response). http.Hijacker
+			// gives us the raw conn; closing it without a response is the reset.
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					log.Printf("mirror: reset (injected fault) %s", p)
+					return
+				}
+			}
+			// Fallback if hijack is unavailable: drop with a 502 so the client still
+			// sees a transient failure rather than a served manifest.
+			w.WriteHeader(http.StatusBadGateway)
+			log.Printf("mirror: reset-fallback 502 %s", p)
 			return
 		}
 		if fault != 0 && strings.HasPrefix(p, "/v2") {

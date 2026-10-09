@@ -64,7 +64,7 @@ jobs:
           # multi-node cluster (its own shard in test-e2e.yml, built from
           # hack/kind-recreate.yaml) and is excluded here, which runs on a single
           # node against the non-laya nightly models.
-          E2E_LABEL_FILTER: "!ha && !chaos && !recreate && !scheduler-edge"
+          E2E_LABEL_FILTER: "!ha && !chaos && !recreate && !scheduler-edge && !registry-outage"
         run: make test-e2e
 
   # Scheduler/storage edge cases (capacity-1 resource with a terminating Pod,
@@ -103,6 +103,49 @@ jobs:
           KIND_CLUSTER: dmo-e2e-scheduler-edge
           KIND_CONFIG: hack/kind-recreate.yaml
         run: make test-e2e
+
+  # Registry-outage container (registry_outage_test.go): a DNS failure, a TCP reset,
+  # an outage after Resolve but during prefetch, and an outage during stable store
+  # recovery, all through the in-cluster mirror (so the registry can be broken). It
+  # is laya-specific (the mirror image bakes in laya:en) and needs E2E_MIRROR to
+  # build the mirror image; single-node is enough. free_disk is on (mirror image +
+  # model). Selected by the "registry-outage" label; nightly only.
+  registry-outage:
+    name: kind (kustomize registry-outage, CPU, laya:en)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Free disk space
+        run: |
+          echo "disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+          echo "disk after:"; df -h /
+
+      - name: Run e2e
+        env:
+          E2E_INSTALL: kustomize
+          # Select only the registry-outage container (laya:en, the default model).
+          E2E_LABEL_FILTER: "registry-outage"
+          # Build+load the mirror image so the registry can be broken offline.
+          E2E_MIRROR: "1"
+          KIND_CLUSTER: dmo-e2e-registry-outage
+        run: make test-e2e
+
 
   # Run the default per-PR E2E suite (laya:en, kustomize) on each Kubernetes minor
   # the project claims to support. The per-PR workflow only exercises the newest
