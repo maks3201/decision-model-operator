@@ -182,6 +182,7 @@ _Appears in:_
 | `candidateRevision` _[RevisionStatus](#revisionstatus)_ | CandidateRevision is the revision being rolled out, if any. |  | Optional: \{\} <br /> |
 | `failedRevision` _[RevisionStatus](#revisionstatus)_ | FailedRevision is a revision that failed to roll out. The controller does<br />not automatically retry it; a spec change (new revision) is required, or<br />setting the decisionmodel.io/retry annotation to a new token re-attempts<br />the same revision. |  | Optional: \{\} <br /> |
 | `previousRevision` _[PreviousRevisionStatus](#previousrevisionstatus)_ | PreviousRevision is the revision that was stable immediately before the<br />most recent promotion. It may linger for a short grace period after<br />promotedAt so the new revision's endpoints populate before it is removed. |  | Optional: \{\} <br /> |
+| `stableStoppedForRevision` _string_ | StableStoppedForRevision records that, under rollout.strategy Recreate, the<br />stable revision's Deployment has been scaled to 0 to free capacity for the<br />candidate revision named here (its hash). It is the durable signal that the<br />stable is intentionally down (not failed): the stable is rendered at 0<br />replicas while it is set, and scaled back to its replicas if the candidate<br />fails. Cleared on promotion (the candidate becomes the stable) or rollback<br />(the stable is restored). Empty under BlueGreen. |  | Optional: \{\} <br /> |
 | `lastRetryToken` _string_ | LastRetryToken is the value of the decisionmodel.io/retry annotation the<br />controller last consumed to clear a failed revision. |  | Optional: \{\} <br /> |
 | `storeRecovery` _[StoreRecoveryStatus](#storerecoverystatus)_ | StoreRecovery tracks the bounded retries of lost-store recovery for the<br />stable revision. It is persisted so the attempt bound survives an operator<br />restart (an in-memory counter would reset and allow more recreations than<br />the documented limit). |  | Optional: \{\} <br /> |
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
@@ -396,11 +397,29 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
+| `strategy` _[RolloutStrategy](#rolloutstrategy)_ | Strategy selects how a new revision replaces the running one: BlueGreen<br />(default) runs both at once and switches traffic only after the candidate<br />passes its gate; Recreate stops the stable before starting the candidate,<br />for clusters without capacity for two revisions (e.g. a single GPU). Under<br />Recreate there is a traffic gap until the candidate is promoted. Recreate<br />cannot be combined with Manual promotion (production would be down while a<br />human approves). Unset means BlueGreen; changing it is not a revision-hash<br />change. |  | Enum: [BlueGreen Recreate] <br />Optional: \{\} <br /> |
 | `evaluation` _[EvaluationSpec](#evaluationspec)_ | Evaluation gates promotion on a golden-dataset accuracy check. When unset,<br />a candidate is promoted as soon as all its Pods are model-ready. |  | Optional: \{\} <br /> |
 | `stabilization` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#duration-v1-meta)_ | Stabilization keeps the previous revision's Deployment running (scaled to<br />its replicas, out of the Service) for this long after a promotion, so the<br />operator can switch traffic back instantly if the new stable turns out<br />unhealthy during the window. Default 5m when unset; "0" disables it (the<br />previous revision is removed after a short endpoint-gap grace, as before).<br />Must be between 1m and 24h when set to a non-zero value. |  | MaxLength: 32 <br />Pattern: `^([0-9]+(\.[0-9]+)?(ns\|us\|ms\|s\|m\|h))+$` <br />Type: string <br />Optional: \{\} <br /> |
 | `promotion` _[PromotionPolicy](#promotionpolicy)_ | Promotion selects how a candidate that passed ModelReady is promoted:<br />  - Automatic: promote as soon as the candidate is model-ready (and, when<br />    evaluation is configured, has passed the gate).<br />  - EvaluationGated: like Automatic but requires rollout.evaluation to be<br />    set (rejected by CEL otherwise); the gate decides promotion.<br />  - Manual: hold the candidate in AwaitingPromotion until a human sets the<br />    annotation decisionmodel.io/promote to status.evaluation.approvalId (or,<br />    without evaluation, the candidate's revision hash for one release)<br />    (evaluation still runs when configured).<br />When unset the effective policy is EvaluationGated if rollout.evaluation is<br />set, else Automatic. The deprecated manualPromotion:true is an alias for<br />Manual; setting both promotion and manualPromotion:true to disagreeing<br />values is rejected by CEL. |  | Enum: [Automatic EvaluationGated Manual] <br />Optional: \{\} <br /> |
 | `manualPromotion` _boolean_ | ManualPromotion holds a candidate that passed its gate (model-ready, plus<br />evaluation when configured) in phase AwaitingPromotion until a human<br />approves it by setting the annotation decisionmodel.io/promote to<br />status.evaluation.approvalId (or, without evaluation, the candidate's<br />revision hash for one release). The stable revision keeps serving meanwhile.<br />There is no progress timeout while waiting. The very first revision of a<br />DecisionModel (no stable revision yet) is promoted without approval, since<br />there is no traffic to protect. The approval annotation is removed once the<br />promotion has been persisted.<br />Deprecated: use promotion: Manual. manualPromotion:true keeps working as an<br />alias for promotion: Manual. | false | Optional: \{\} <br /> |
 | `timeouts` _[RolloutTimeouts](#rollouttimeouts)_ | Timeouts overrides the progress timeouts of a rollout. Unset fields keep<br />the built-in defaults. Large models (tens of GB) need more than the<br />defaults on a cold node. Not part of the revision hash; a change applies to<br />the phase timeouts immediately, but a prefetch Job that already exists keeps<br />the deadline it was created with. |  | Optional: \{\} <br /> |
+
+
+#### RolloutStrategy
+
+_Underlying type:_ _string_
+
+RolloutStrategy selects how a new revision replaces the running one.
+
+
+
+_Appears in:_
+- [RolloutSpec](#rolloutspec)
+
+| Field | Description |
+| --- | --- |
+| `BlueGreen` | RolloutBlueGreen runs the candidate alongside the stable and switches<br />traffic only after the candidate passes its gate (the default). It needs<br />capacity for both revisions at once (e.g. a second GPU).<br /> |
+| `Recreate` | RolloutRecreate stops the stable before starting the candidate, for<br />clusters without spare capacity for two revisions (e.g. a single GPU). The<br />candidate is resolved and prefetched while the stable still serves; only<br />once the model is cached is the stable scaled to 0 and the candidate<br />started. There is a traffic gap (documented downtime) until the candidate<br />is promoted; a candidate failure scales the stable back up.<br /> |
 
 
 #### RolloutTimeouts

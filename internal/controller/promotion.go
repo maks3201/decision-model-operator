@@ -291,6 +291,9 @@ func (r *DecisionModelReconciler) promote(
 	dm.Status.StableRevision = candidate
 	dm.Status.CandidateRevision = nil
 	dm.Status.FailedRevision = nil // successful rollout clears any prior failure
+	// Recreate: the candidate is now the stable, so the stop is over — clear the
+	// marker so neither revision is held at 0. (No-op under BlueGreen.)
+	dm.Status.StableStoppedForRevision = ""
 	// A newly promoted stable has a fresh, populated store, so any lost-store
 	// recovery bookkeeping from a previous stable no longer applies: reset the
 	// bounded-retry count (also the "reset on a new revision" rule).
@@ -389,6 +392,13 @@ func (r *DecisionModelReconciler) rollbackOrFail(
 	failed.Message = message
 	failed.FailedAt = &failedAt
 	dm.Status.FailedRevision = failed
+	// Recreate: the stable was scaled to 0 to free capacity for this candidate.
+	// Clear the stopped marker as part of this same (persist-then-act) failure
+	// write, so the stable scales back to its replicas on the next stable-path
+	// reconcile. Emit StableRestored. (No-op under BlueGreen / when not stopped.)
+	if dm.Status.StableRevision != nil {
+		recreateRestoreStable(ctx, r, dm, dm.Status.StableRevision)
+	}
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionDegraded,
 		Status:  metav1.ConditionTrue,

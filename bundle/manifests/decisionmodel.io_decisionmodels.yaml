@@ -465,6 +465,20 @@ spec:
                     - message: must be 0 or between 1m and 24h
                       rule: duration(self) == duration('0s') || (duration(self) >=
                         duration('1m') && duration(self) <= duration('24h'))
+                  strategy:
+                    description: |-
+                      Strategy selects how a new revision replaces the running one: BlueGreen
+                      (default) runs both at once and switches traffic only after the candidate
+                      passes its gate; Recreate stops the stable before starting the candidate,
+                      for clusters without capacity for two revisions (e.g. a single GPU). Under
+                      Recreate there is a traffic gap until the candidate is promoted. Recreate
+                      cannot be combined with Manual promotion (production would be down while a
+                      human approves). Unset means BlueGreen; changing it is not a revision-hash
+                      change.
+                    enum:
+                    - BlueGreen
+                    - Recreate
+                    type: string
                   timeouts:
                     description: |-
                       Timeouts overrides the progress timeouts of a rollout. Unset fields keep
@@ -518,6 +532,15 @@ spec:
                     Manual'
                   rule: '!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion)
                     || self.promotion == ''Manual'''
+                - message: 'strategy: Recreate cannot be combined with promotion:
+                    Manual (production would be down while the candidate waits for
+                    approval)'
+                  rule: '!(has(self.strategy) && self.strategy == ''Recreate'') ||
+                    (!has(self.promotion) || self.promotion != ''Manual'')'
+                - message: 'strategy: Recreate cannot be combined with manualPromotion:
+                    true (production would be down while the candidate waits for approval)'
+                  rule: '!(has(self.strategy) && self.strategy == ''Recreate'') ||
+                    (!has(self.manualPromotion) || !self.manualPromotion)'
               runtimeVersion:
                 description: |-
                   RuntimeVersion pins the engine runtime release (e.g. "0.10.0", plain
@@ -2349,6 +2372,16 @@ spec:
                       version across operator upgrades under --runtime-version-policy=Pinned.
                     type: string
                 type: object
+              stableStoppedForRevision:
+                description: |-
+                  StableStoppedForRevision records that, under rollout.strategy Recreate, the
+                  stable revision's Deployment has been scaled to 0 to free capacity for the
+                  candidate revision named here (its hash). It is the durable signal that the
+                  stable is intentionally down (not failed): the stable is rendered at 0
+                  replicas while it is set, and scaled back to its replicas if the candidate
+                  fails. Cleared on promotion (the candidate becomes the stable) or rollback
+                  (the stable is restored). Empty under BlueGreen.
+                type: string
               storeRecovery:
                 description: |-
                   StoreRecovery tracks the bounded retries of lost-store recovery for the

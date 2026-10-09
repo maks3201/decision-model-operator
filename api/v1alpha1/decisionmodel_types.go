@@ -200,10 +200,41 @@ const (
 	PromotionManual PromotionPolicy = "Manual"
 )
 
+// RolloutStrategy selects how a new revision replaces the running one.
+type RolloutStrategy string
+
+const (
+	// RolloutBlueGreen runs the candidate alongside the stable and switches
+	// traffic only after the candidate passes its gate (the default). It needs
+	// capacity for both revisions at once (e.g. a second GPU).
+	RolloutBlueGreen RolloutStrategy = "BlueGreen"
+	// RolloutRecreate stops the stable before starting the candidate, for
+	// clusters without spare capacity for two revisions (e.g. a single GPU). The
+	// candidate is resolved and prefetched while the stable still serves; only
+	// once the model is cached is the stable scaled to 0 and the candidate
+	// started. There is a traffic gap (documented downtime) until the candidate
+	// is promoted; a candidate failure scales the stable back up.
+	RolloutRecreate RolloutStrategy = "Recreate"
+)
+
 // RolloutSpec configures rollout behaviour.
 // +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && self.promotion == 'EvaluationGated') || has(self.evaluation)",message="promotion: EvaluationGated requires rollout.evaluation to be set"
 // +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion) || self.promotion == 'Manual'",message="manualPromotion: true conflicts with promotion; use promotion: Manual"
+// +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.promotion) || self.promotion != 'Manual')",message="strategy: Recreate cannot be combined with promotion: Manual (production would be down while the candidate waits for approval)"
+// +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.manualPromotion) || !self.manualPromotion)",message="strategy: Recreate cannot be combined with manualPromotion: true (production would be down while the candidate waits for approval)"
 type RolloutSpec struct {
+	// Strategy selects how a new revision replaces the running one: BlueGreen
+	// (default) runs both at once and switches traffic only after the candidate
+	// passes its gate; Recreate stops the stable before starting the candidate,
+	// for clusters without capacity for two revisions (e.g. a single GPU). Under
+	// Recreate there is a traffic gap until the candidate is promoted. Recreate
+	// cannot be combined with Manual promotion (production would be down while a
+	// human approves). Unset means BlueGreen; changing it is not a revision-hash
+	// change.
+	// +kubebuilder:validation:Enum=BlueGreen;Recreate
+	// +optional
+	Strategy RolloutStrategy `json:"strategy,omitempty"`
+
 	// Evaluation gates promotion on a golden-dataset accuracy check. When unset,
 	// a candidate is promoted as soon as all its Pods are model-ready.
 	// +operator-sdk:csv:customresourcedefinitions:type=spec,displayName="Evaluation",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:advanced"}
@@ -706,6 +737,16 @@ type DecisionModelStatus struct {
 	// promotedAt so the new revision's endpoints populate before it is removed.
 	// +optional
 	PreviousRevision *PreviousRevisionStatus `json:"previousRevision,omitempty"`
+
+	// StableStoppedForRevision records that, under rollout.strategy Recreate, the
+	// stable revision's Deployment has been scaled to 0 to free capacity for the
+	// candidate revision named here (its hash). It is the durable signal that the
+	// stable is intentionally down (not failed): the stable is rendered at 0
+	// replicas while it is set, and scaled back to its replicas if the candidate
+	// fails. Cleared on promotion (the candidate becomes the stable) or rollback
+	// (the stable is restored). Empty under BlueGreen.
+	// +optional
+	StableStoppedForRevision string `json:"stableStoppedForRevision,omitempty"`
 
 	// LastRetryToken is the value of the decisionmodel.io/retry annotation the
 	// controller last consumed to clear a failed revision.

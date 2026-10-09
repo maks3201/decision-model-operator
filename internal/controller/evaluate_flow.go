@@ -178,17 +178,11 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		return r.rollbackOrFail(ctx, dm, candidate, reasonEvaluationFailed, candRes.err.Error())
 	}
 
-	// Optionally establish the stable baseline for this dataset. When the stable
-	// baseline is required by a relative gate (maxAccuracyDrop / maxECEIncrease)
-	// but cannot be computed, do not promote: hold in Evaluating with
-	// Evaluated=False/BaselineUnavailable until the evaluation timeout, which then
-	// takes the normal rollback path (fail-closed).
-	maxDrop, hasDrop := parseDecimal(evalSpec.MaxAccuracyDrop)
-	maxECE, hasMaxECE := parseDecimal(evalSpec.MaxECE)
-	maxECEInc, hasMaxECEInc := parseDecimal(evalSpec.MaxECEIncrease)
-	minMacroF1, hasMinF1 := parseDecimal(evalSpec.MinMacroF1)
-	maxF1Drop, hasF1Drop := parseDecimal(evalSpec.MaxMacroF1Drop)
-	needsBaseline := hasDrop || hasMaxECEInc || hasF1Drop
+	// Resolve the gate thresholds. When the Recreate strategy has the stable
+	// stopped, the relative gates are dropped (no live baseline) and a Warning is
+	// emitted; the absolute gates still apply.
+	gates, needsBaseline := r.resolveEvalGates(ctx, dm, evalSpec, candidate)
+	skipRelativeForRecreate := gates.recreateSkipped
 
 	// Only compute / await the stable baseline when a relative gate needs it.
 	// Without a relative gate the absolute gates decide; the baseline
@@ -225,18 +219,12 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		baseline = b
 	}
 
-	minAcc, _ := parseDecimal(evalSpec.MinAccuracy)
-
 	// Record the result in status.
 	policyHash := evalPolicyHash(evalSpec)
 	dm.Status.Evaluation = buildEvaluationStatus(evalSpec, candidate, candRes, baseline, policyHash, dsDigest, r.now())
 
 	// Gate evaluation: accuracy floor, accuracy drop, calibration (ECE) and macro-F1.
-	if failReason, failMsg, failed := evalGateFailure(candRes, baseline, evalGates{
-		minAcc: minAcc, maxDrop: maxDrop, hasDrop: hasDrop,
-		maxECE: maxECE, hasMaxECE: hasMaxECE, maxECEInc: maxECEInc, hasMaxECEInc: hasMaxECEInc,
-		minMacroF1: minMacroF1, hasMinF1: hasMinF1, maxF1Drop: maxF1Drop, hasF1Drop: hasF1Drop,
-	}); failed {
+	if failReason, failMsg, failed := evalGateFailure(candRes, baseline, gates); failed {
 		dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationFailed
 		dm.Status.Evaluation.Reason = failMsg
 		r.event(ctx, dm, corev1.EventTypeWarning, eventEvaluationFailed,
@@ -245,6 +233,10 @@ func (r *DecisionModelReconciler) evaluateOrPromote(
 		return r.rollbackOrFail(ctx, dm, candidate, failReason, failMsg)
 	}
 	dm.Status.Evaluation.Result = decisionmodelv1alpha1.EvaluationPassed
+	if skipRelativeForRecreate {
+		dm.Status.Evaluation.Reason = "relative eval gates skipped under the Recreate strategy " +
+			"(the stable is stopped, so no baseline could be measured)"
+	}
 
 	// Emit EvaluationPassed once, on the Evaluated condition transition to True.
 	if !meta.IsStatusConditionTrue(dm.Status.Conditions, decisionmodelv1alpha1.ConditionEvaluated) {
@@ -306,6 +298,11 @@ type evalGates struct {
 	hasMinF1     bool
 	maxF1Drop    float64
 	hasF1Drop    bool
+	// recreateSkipped is true when the relative gates were dropped because the
+	// Recreate strategy has the stable stopped (no baseline). It is not read by
+	// evalGateFailure (the has* flags are already cleared); it only records the
+	// skip in status.
+	recreateSkipped bool
 }
 
 // evalGateFailure applies the accuracy floor, accuracy-drop, and calibration

@@ -137,41 +137,86 @@ const hostnameTopologyKey = "kubernetes.io/hostname"
 // applyColocation pins a revision's serving Pods to the node already running the
 // revision's own Pods, so that with a non-shareable (ReadWriteOnce) store and
 // replicas > 1 every replica lands on the single node that holds the volume
-// instead of hanging on a Multi-Attach error on another node. It adds a REQUIRED
-// pod-affinity term (topologyKey kubernetes.io/hostname, labelSelector =
-// revisionLabels) and is a no-op when the store is shareable (RWX/ROX) or
-// replicas <= 1.
+// instead of hanging on a Multi-Attach error on another node. When co-location is
+// needed it ADDS a REQUIRED pod-affinity term (topologyKey kubernetes.io/hostname,
+// labelSelector = revisionLabels); when it is NOT needed (shareable store, or
+// replicas <= 1) it REMOVES our own term if a previous reconcile added it, so a
+// scale 2 -> 1 or a switch to ReadWriteMany lets replicas spread again. User terms
+// are never touched.
 //
-// The term is merged into any affinity already on the PodSpec (the user's
-// spec.scheduling.affinity, applied earlier) — user terms are never replaced. It
-// is a pure function of (access modes, replicas) and is applied on every reconcile
+// It is a pure function of (access modes, replicas) applied on every reconcile
 // after freezeFromLive, so a frozen stable gets it re-derived from its current
-// replicas/cache rather than from the live Deployment. Because it is derived from
-// in-place fields (replicas, cache), it is deliberately NOT part of the revision
-// hash: scaling 1 -> 2 is an in-place update, not a new revision.
+// replicas/cache rather than inherited from the live Deployment. It is NOT part of
+// the revision hash (replicas and cache are in-place fields).
+//
+// spec.Affinity may alias the DecisionModel's own spec (applyScheduling assigns
+// dm.Spec.Scheduling.Affinity) or the informer cache (freezeFromLive copies the
+// live Deployment's affinity pointer), so this deep-copies before mutating and
+// never writes through the shared pointer.
 func applyColocation(spec *corev1.PodSpec, labels map[string]string, replicas int32, modes []corev1.PersistentVolumeAccessMode) {
-	if replicas <= 1 || accessModesShareable(modes) {
-		return
+	want := replicas > 1 && !accessModesShareable(modes)
+	has := hasColocationTerm(spec.Affinity, labels)
+	if want == has {
+		return // already in the desired state; no mutation, no aliasing write
 	}
 	term := corev1.PodAffinityTerm{
 		TopologyKey:   hostnameTopologyKey,
 		LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
 	}
-	if spec.Affinity == nil {
-		spec.Affinity = &corev1.Affinity{}
+	// Deep-copy before changing anything: the affinity may be a pointer into
+	// dm.Spec or the informer cache.
+	aff := spec.Affinity.DeepCopy()
+	if want {
+		if aff == nil {
+			aff = &corev1.Affinity{}
+		}
+		if aff.PodAffinity == nil {
+			aff.PodAffinity = &corev1.PodAffinity{}
+		}
+		aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+			aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, term)
+		spec.Affinity = aff
+		return
 	}
-	if spec.Affinity.PodAffinity == nil {
-		spec.Affinity.PodAffinity = &corev1.PodAffinity{}
+	// want == false, has == true: strip our own term, keeping user terms.
+	removeColocationTerm(aff, labels)
+	spec.Affinity = normalizeAffinity(aff)
+}
+
+// removeColocationTerm drops our co-location term (exact match via
+// colocationTermEqual) from a pod-affinity list, leaving every user term in place.
+func removeColocationTerm(aff *corev1.Affinity, labels map[string]string) {
+	if aff == nil || aff.PodAffinity == nil {
+		return
 	}
-	// Idempotent: do not append a duplicate of our own term if it is already there
-	// (e.g. a frozen stable whose live template already carried it).
-	for _, t := range spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-		if colocationTermEqual(t, term) {
-			return
+	want := corev1.PodAffinityTerm{TopologyKey: hostnameTopologyKey, LabelSelector: &metav1.LabelSelector{MatchLabels: labels}}
+	kept := aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[:0]
+	for _, t := range aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		if !colocationTermEqual(t, want) {
+			kept = append(kept, t)
 		}
 	}
-	spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
-		spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, term)
+	aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = kept
+}
+
+// normalizeAffinity collapses an affinity we may have emptied by removing our
+// term back to nil, so a DecisionModel without any user affinity renders
+// affinity: nil (no needless Deployment update loop) rather than an empty struct.
+// A PodAffinity that still carries user terms (either kind) or any NodeAffinity /
+// PodAntiAffinity is preserved.
+func normalizeAffinity(aff *corev1.Affinity) *corev1.Affinity {
+	if aff == nil {
+		return nil
+	}
+	if pa := aff.PodAffinity; pa != nil &&
+		len(pa.RequiredDuringSchedulingIgnoredDuringExecution) == 0 &&
+		len(pa.PreferredDuringSchedulingIgnoredDuringExecution) == 0 {
+		aff.PodAffinity = nil
+	}
+	if aff.NodeAffinity == nil && aff.PodAffinity == nil && aff.PodAntiAffinity == nil {
+		return nil
+	}
+	return aff
 }
 
 // colocationTermEqual reports whether an existing pod-affinity term is our
