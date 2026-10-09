@@ -335,6 +335,48 @@ var _ = Describe("per-revision manifest persistence", func() {
 		Expect(getDM("retry").Status.CandidateRevision).NotTo(BeNil())
 	})
 
+	It("releases the rollout-budget reservation when the admission manifest write fails", func() {
+		// A reservation is taken when a candidate is admitted (budget slot). If the
+		// manifest write then fails before the admission is durable, the reservation
+		// must be released: otherwise a persistent manifest-write failure would pin a
+		// rollout slot forever (syncReservations only drops it once a durable
+		// candidate is visible, which never happens on this failure).
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+
+		wc, werr := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(werr).NotTo(HaveOccurred())
+		failing := interceptor.NewClient(wc, interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if cm, ok := obj.(*corev1.ConfigMap); ok &&
+					cm.Name == "resv-manifest-"+RevisionHash(getDM("resv").Spec, wantDigest, fakeImage) {
+					return fmt.Errorf("induced manifest ConfigMap write failure")
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+		})
+		r := &DecisionModelReconciler{
+			Client: failing, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:  map[string]engine.Engine{"ollaya": eng},
+			Prober:   &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: wantDigest, Device: "cpu"}},
+			Recorder: events.NewFakeRecorder(128),
+			// A single slot, free: this DM is admitted (so it takes a reservation)
+			// and then hits the failing manifest write.
+			MaxConcurrentRollouts: 1,
+			WatchNamespaces:       []string{namespace},
+		}
+		createDM("resv")
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "resv"}})
+		Expect(err).To(HaveOccurred(), "the failed manifest write fails the reconcile")
+
+		// The reservation for this DM must have been released on the error return.
+		r.budgetMu.Lock()
+		_, held := r.budgetReservations[namespace+"/resv"]
+		r.budgetMu.Unlock()
+		Expect(held).To(BeFalse(), "reservation released after the failed admission manifest write")
+	})
+
 	It("persists no manifest ConfigMap while the candidate is queued, so repeated spec changes do not leak", func() {
 		// The manifest is persisted only AFTER admission, so a candidate queued
 		// behind the fleet budget writes no manifest ConfigMap. Changing spec.model

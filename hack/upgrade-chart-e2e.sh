@@ -512,10 +512,14 @@ echo "PASS: ${DM_PLAIN} unchanged — the opt-in roll was scoped to ${DM_AWAIT} 
 # write. We assert the no-roll invariant for the quiet DM only.)
 note "downgrade: helm upgrade back to the released chart ${from_ver} on the quiet ${DM_PLAIN}"
 { read -r dn_stable_before; read -r _; read -r dn_uids_before; } <"${work}/${DM_PLAIN}.before"
+# --reset-values, not --reuse-values: reusing would carry the source image override
+# (so the controller would not actually be downgraded) and any value the newer
+# chart added, which the older chart's values schema rejects. Same flags as the
+# original install of the released chart.
 hc upgrade "${RELEASE}" "${CHART_REF}" --version "${from_ver}" \
   --namespace "${OPERATOR_NS}" \
   --set image.pullPolicy=IfNotPresent \
-  --reuse-values \
+  --reset-values \
   --wait --timeout 5m
 kc wait deployment.apps -l control-plane=controller-manager \
   --for=condition=Available -n "${OPERATOR_NS}" --timeout=3m

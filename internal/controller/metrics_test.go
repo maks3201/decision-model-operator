@@ -39,6 +39,7 @@ func resetMetrics() {
 	phaseDurationSeconds.Reset()
 	evaluationAccuracyGauge.Reset()
 	evaluationECEGauge.Reset()
+	evaluationMacroF1Gauge.Reset()
 	probeResultsTotal.Reset()
 	revisionInfoGauge.Reset()
 	// registryResolveDuration is a plain Histogram (no labels) and cannot be
@@ -90,6 +91,7 @@ func TestRecordStatusMetricsReplicasAndEvaluation(t *testing.T) {
 	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{
 		Accuracy: "0.9200",
 		ECE:      "0.0500",
+		MacroF1:  "0.8800",
 	}
 	recordStatusMetrics(dm)
 
@@ -105,6 +107,37 @@ func TestRecordStatusMetricsReplicasAndEvaluation(t *testing.T) {
 	if got := testutil.ToFloat64(evaluationECEGauge.WithLabelValues("ns", "dm")); got != 0.05 {
 		t.Errorf("evaluation ece = %v, want 0.05", got)
 	}
+	if got := testutil.ToFloat64(evaluationMacroF1Gauge.WithLabelValues("ns", "dm")); got != 0.88 {
+		t.Errorf("evaluation macro-f1 = %v, want 0.88", got)
+	}
+}
+
+// TestRecordStatusMetricsMacroF1AbsentDeletesSeries covers the fail-closed rule:
+// a completed evaluation with no classifiable question leaves MacroF1 empty, and
+// the gauge must have no series (not a stale 0, which would read as perfectly
+// wrong on a dashboard). A later run that does classify sets it again.
+func TestRecordStatusMetricsMacroF1AbsentDeletesSeries(t *testing.T) {
+	resetMetrics()
+	dm := newDM("dm")
+	dm.Status.Phase = decisionmodelv1alpha1.PhaseReady
+
+	// First: a run with a macro-F1 value.
+	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{Accuracy: "0.9000", MacroF1: "0.7500"}
+	recordStatusMetrics(dm)
+	if got := testutil.ToFloat64(evaluationMacroF1Gauge.WithLabelValues("ns", "dm")); got != 0.75 {
+		t.Fatalf("macro-f1 after classifiable run = %v, want 0.75", got)
+	}
+
+	// Then: an evaluation that produced no classifiable question (MacroF1 empty).
+	dm.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{Accuracy: "0.9100", MacroF1: ""}
+	recordStatusMetrics(dm)
+	if n := testutil.CollectAndCount(evaluationMacroF1Gauge); n != 0 {
+		t.Errorf("macro-f1 series after unclassifiable run = %d, want 0 (deleted, not stale 0)", n)
+	}
+	// accuracy still tracks the latest run.
+	if got := testutil.ToFloat64(evaluationAccuracyGauge.WithLabelValues("ns", "dm")); got != 0.91 {
+		t.Errorf("accuracy = %v, want 0.91", got)
+	}
 }
 
 func TestRecordStatusMetricsNoEvaluationLeavesGaugesUnset(t *testing.T) {
@@ -119,6 +152,9 @@ func TestRecordStatusMetricsNoEvaluationLeavesGaugesUnset(t *testing.T) {
 	}
 	if n := testutil.CollectAndCount(evaluationECEGauge); n != 0 {
 		t.Errorf("evaluation ece series = %d, want 0", n)
+	}
+	if n := testutil.CollectAndCount(evaluationMacroF1Gauge); n != 0 {
+		t.Errorf("evaluation macro-f1 series = %d, want 0", n)
 	}
 }
 
@@ -180,6 +216,39 @@ func TestBufferHelpersNoStateAreNoops(t *testing.T) {
 	}
 }
 
+// TestFlushMetricsRecreateRolloutResults covers the Recreate-strategy rollout
+// outcomes: stopping the stable to free capacity and restoring it after a failed
+// candidate / rollback are counted on decisionmodel_rollouts_total with their own
+// result labels, flushed only after the status write (same path as promoted).
+func TestFlushMetricsRecreateRolloutResults(t *testing.T) {
+	resetMetrics()
+	dm := newDM("dm")
+	dm.Status.Phase = decisionmodelv1alpha1.PhasePending
+
+	st := &reconcileState{base: dm.DeepCopy()}
+	ctx := context.WithValue(context.Background(), reconcileStateKey{}, st)
+
+	bufferRollout(ctx, rolloutStableStopped)
+	bufferRollout(ctx, rolloutStableRestored)
+
+	// Buffered, not yet applied.
+	if got := testutil.ToFloat64(rolloutsTotal.WithLabelValues("ns", "dm", rolloutStableStopped)); got != 0 {
+		t.Fatalf("stable_stopped applied before flush: %v", got)
+	}
+
+	flushMetrics(dm, st)
+
+	if got := testutil.ToFloat64(rolloutsTotal.WithLabelValues("ns", "dm", rolloutStableStopped)); got != 1 {
+		t.Errorf("stable_stopped rollouts = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(rolloutsTotal.WithLabelValues("ns", "dm", rolloutStableRestored)); got != 1 {
+		t.Errorf("stable_restored rollouts = %v, want 1", got)
+	}
+	if len(st.metrics) != 0 {
+		t.Errorf("metrics buffer not cleared: %d entries", len(st.metrics))
+	}
+}
+
 func TestBufferProbeResultZeroIsNoop(t *testing.T) {
 	resetMetrics()
 	st := &reconcileState{}
@@ -201,7 +270,7 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 	gone := newDM("gone")
 	gone.Status.Phase = decisionmodelv1alpha1.PhaseReady
 	gone.Status.Replicas = decisionmodelv1alpha1.ReplicaStatus{Desired: 1, ModelReady: 1}
-	gone.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{Accuracy: "0.5000", ECE: "0.1000"}
+	gone.Status.Evaluation = &decisionmodelv1alpha1.EvaluationStatus{Accuracy: "0.5000", ECE: "0.1000", MacroF1: "0.4000"}
 	recordStatusMetrics(gone)
 
 	st := &reconcileState{base: gone.DeepCopy()}
@@ -222,6 +291,7 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 	// gone's replica/eval/counter series are gone.
 	for _, c := range []int{
 		testutil.CollectAndCount(evaluationAccuracyGauge),
+		testutil.CollectAndCount(evaluationMacroF1Gauge),
 		testutil.CollectAndCount(rolloutsTotal),
 		testutil.CollectAndCount(probeResultsTotal),
 	} {
