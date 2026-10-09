@@ -227,7 +227,7 @@ The OCI chart is signed with [cosign](https://github.com/sigstore/cosign) (verif
 ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
 ISSUER=https://token.actions.githubusercontent.com
 
-cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.3.0 \
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.4.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 ```
 
