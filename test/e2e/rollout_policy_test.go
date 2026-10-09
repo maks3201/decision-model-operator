@@ -341,17 +341,26 @@ type rolloutPatch struct {
 	cpu          string
 	datasetCM    string
 	minAccuracy  string
+	minMacroF1   string
 	evaluatingTO string
 	promotion    string
 }
 
 // patchRollout applies rolloutPatch as a merge patch to the DecisionModel.
 func patchRollout(name, ns string, p rolloutPatch) {
+	evaluation := map[string]any{
+		"datasetRef":  map[string]any{"configMapRef": map[string]any{"name": p.datasetCM, "key": "cases.jsonl"}},
+		"minAccuracy": p.minAccuracy,
+		// Always send minMacroF1 so a merge patch clears a previously-set gate when the
+		// caller leaves it empty (merge patches do not drop omitted fields). nil marshals
+		// to JSON null, which removes the field; a value sets the gate.
+		"minMacroF1": nil,
+	}
+	if p.minMacroF1 != "" {
+		evaluation["minMacroF1"] = p.minMacroF1
+	}
 	rollout := map[string]any{
-		"evaluation": map[string]any{
-			"datasetRef":  map[string]any{"configMapRef": map[string]any{"name": p.datasetCM, "key": "cases.jsonl"}},
-			"minAccuracy": p.minAccuracy,
-		},
+		"evaluation": evaluation,
 	}
 	if p.evaluatingTO != "" {
 		rollout["timeouts"] = map[string]any{"evaluating": p.evaluatingTO}

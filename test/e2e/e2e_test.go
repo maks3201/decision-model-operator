@@ -358,10 +358,11 @@ var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() 
 			"expected 2 model-ready replicas")
 	})
 
-	It("keeps phase=Ready but flags Degraded/CacheNotShareable on an RWO store at replicas 2", func() {
-		// Warning-only contract: an RWO model-store PVC with replicas>1 is
-		// supported on a single node; the operator surfaces a Degraded=CacheNotShareable
-		// warning without leaving the DecisionModel not-Ready.
+	It("co-locates both replicas on one node (no CacheNotShareable) on an RWO store at replicas 2", func() {
+		// Co-location contract: with replicas>1 on a ReadWriteOnce model store the
+		// operator does NOT report Degraded/CacheNotShareable; instead it pins every
+		// replica to the single node holding the volume (required host pod-affinity) and
+		// emits a Normal ReplicasCoLocated Event. All replicas stay model-ready.
 		By("checking phase is still Ready with 2 model-ready replicas")
 		phase, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName, "{.status.phase}")
 		Expect(err).NotTo(HaveOccurred())
@@ -371,15 +372,46 @@ var _ = Describe("DecisionModel lifecycle", Label("lifecycle"), Ordered, func() 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ready).To(Equal("2"))
 
-		By("checking the Degraded condition is present with reason CacheNotShareable")
-		status, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+		By("the Degraded condition is NOT True with reason CacheNotShareable")
+		// Co-location replaces the old warning. Degraded may be absent entirely; if it
+		// exists it must not be a True/CacheNotShareable.
+		status, _ := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
 			"{.status.conditions[?(@.type=='Degraded')].status}")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(status).To(Equal("True"), "expected Degraded=True at replicas 2 on RWO store")
-		reason, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+		reason, _ := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
 			"{.status.conditions[?(@.type=='Degraded')].reason}")
+		Expect(reason).NotTo(Equal("CacheNotShareable"),
+			"CacheNotShareable must be gone now that replicas are co-located (Degraded status=%q)", status)
+
+		By("the serving Deployment template carries the required host pod-affinity")
+		rev, err := utils.KubectlJSONPath(testNamespace, "decisionmodel", dmName,
+			"{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(reason).To(Equal("CacheNotShareable"))
+		Expect(rev).NotTo(BeEmpty(), "stable revision hash not set")
+		dep := dmName + "-" + rev
+		topoKey, err := utils.KubectlJSONPath(testNamespace, "deploy", dep,
+			"{.spec.template.spec.affinity.podAffinity."+
+				"requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(topoKey).To(Equal("kubernetes.io/hostname"),
+			"serving Deployment should carry a required host pod-affinity for co-location")
+
+		By("both serving Pods are scheduled on the same node")
+		nodesOut, err := utils.Kubectl("get", "pods", "-l", servingPodSelector(dmName),
+			"-n", testNamespace, "--field-selector=status.phase=Running",
+			"-o", "jsonpath={.items[*].spec.nodeName}")
+		Expect(err).NotTo(HaveOccurred())
+		nodes := strings.Fields(nodesOut)
+		Expect(nodes).To(HaveLen(2), "expected 2 running serving Pods, got %q", nodesOut)
+		Expect(nodes[0]).To(Equal(nodes[1]),
+			"both replicas should be co-located on one node (got %q)", nodesOut)
+
+		By("a Normal ReplicasCoLocated Event was emitted")
+		Eventually(func() (string, error) {
+			return utils.Kubectl("get", "events", "-n", testNamespace,
+				"--field-selector", "reason=ReplicasCoLocated",
+				"-o", "jsonpath={.items[*].reason}")
+		}, 2*time.Minute, 5*time.Second).Should(ContainSubstring("ReplicasCoLocated"),
+			"expected a ReplicasCoLocated Event at replicas 2 on an RWO store")
 	})
 })
 
