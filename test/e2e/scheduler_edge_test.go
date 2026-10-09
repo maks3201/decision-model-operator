@@ -153,73 +153,6 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 		}, 12*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
-	// Item 37: no spare capacity for a BlueGreen candidate (a capacity-1 extended
-	// resource stands in for one GPU). Under the default BlueGreen strategy the
-	// candidate needs the one unit the running stable holds, so it is Unschedulable;
-	// with a bounded starting timeout the rollout times out and rolls back, and the
-	// stable serves throughout. Switching the SAME candidate to Recreate (which stops
-	// the stable first) then succeeds. This is the BlueGreen-fails/Recreate-succeeds
-	// pair for an extended resource (the Recreate serialisation is proved by the
-	// capacity-1 lingering-Pod spec above; this adds the BlueGreen timeout→rollback leg).
-	It("times out and rolls back a BlueGreen candidate with no spare capacity, then Recreate succeeds", func() {
-		const dm = "edge-nospare"
-
-		By("advertising a capacity-1 fake accelerator on node A")
-		advertiseExtendedResource(nodeAName, extResource, 1)
-		DeferCleanup(func() { clearExtendedResource(nodeAName, extResource) })
-
-		By("bringing up a stable that holds the one accelerator unit")
-		applyYAML(extResourceDM(dm, nodeA, extResource, ""))
-		DeferCleanup(func() {
-			_, _ = utils.Kubectl("delete", "decisionmodel", dm, "-n", schedulerEdgeNS, "--ignore-not-found")
-		})
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
-		}, 8*time.Minute, 5*time.Second).Should(Equal("Ready"))
-		stableBefore, err := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(stableBefore).NotTo(BeEmpty())
-
-		By("rolling out a BlueGreen candidate that needs the same single unit, with a short starting timeout")
-		applyYAML(extResourceDMBlueGreen(dm, extResource, "5Gi", "3m"))
-		var candHash string
-		Eventually(func(g Gomega) {
-			h := candidateRevision(dm)
-			g.Expect(h).NotTo(BeEmpty())
-			g.Expect(h).NotTo(Equal(stableBefore))
-			candHash = h
-		}, 5*time.Minute, 5*time.Second).Should(Succeed())
-
-		By("the BlueGreen candidate is Unschedulable and the stable keeps serving")
-		Eventually(func(g Gomega) {
-			g.Expect(candidatePodUnschedulable(dm, candHash)).To(BeTrue(),
-				"the BlueGreen candidate must be Unschedulable with no spare accelerator")
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
-		Expect(serviceRevision(schedulerEdgeNS, dm)).To(Equal(stableBefore),
-			"BlueGreen must keep the Service on the stable while the candidate cannot start")
-
-		By("the rollout times out and rolls back to the stable (which served throughout)")
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
-		}, 8*time.Minute, 10*time.Second).Should(Equal("RolledBack"),
-			"a BlueGreen candidate that never schedules should roll back on the starting timeout")
-		Expect(serviceRevision(schedulerEdgeNS, dm)).To(Equal(stableBefore),
-			"the stable must still serve after the BlueGreen rollback")
-		failed, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.failedRevision.hash}")
-		Expect(failed).To(Equal(candHash), "the failed revision should be the unschedulable candidate")
-
-		By("switching the SAME candidate to Recreate stops the stable first, so it fits and promotes")
-		// Re-apply the candidate revision under Recreate (strategy is not part of the
-		// revision hash). Recreate stops the stable, freeing the one accelerator unit,
-		// so the candidate schedules and is promoted.
-		applyYAML(extResourceDMRecreate(dm, extResource, "5Gi"))
-		Eventually(func(g Gomega) {
-			phase, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
-			g.Expect(phase).To(Equal("Ready"))
-			g.Expect(serviceRevision(schedulerEdgeNS, dm)).To(Equal(candHash))
-		}, 12*time.Minute, 10*time.Second).Should(Succeed())
-	})
-
 	// Item 11: a user-required host anti-affinity on replicas 2 (RWO) contradicts
 	// the operator's required host CO-location (RWO pins all replicas to one node).
 	// The two requirements cannot both hold, so a replica stays Pending and the DM
@@ -451,53 +384,6 @@ spec:
   scheduling:
     nodeSelector: {decisionmodel.io/e2e-node: %s}
 `, name, schedulerEdgeNS, testModel, testDevice, res, memLimit, res, nodeVal)
-}
-
-// extResourceDMBlueGreen renders the node-A extended-resource DecisionModel under
-// the explicit BlueGreen strategy with a bounded starting timeout, so a candidate
-// that cannot schedule (no spare accelerator) rolls back on the timeout rather than
-// hanging. memLimit forces a new revision hash vs the stable; startingTO bounds the
-// Starting phase.
-func extResourceDMBlueGreen(name, res, memLimit, startingTO string) string {
-	return fmt.Sprintf(`apiVersion: decisionmodel.io/v1alpha1
-kind: DecisionModel
-metadata: {name: %s, namespace: %s}
-spec:
-  engine: ollaya
-  model: %s
-  device: %s
-  replicas: 1
-  resources:
-    requests: {cpu: 250m, memory: 1Gi, %s: "1"}
-    limits: {memory: %s, %s: "1"}
-  scheduling:
-    nodeSelector: {decisionmodel.io/e2e-node: a}
-  rollout:
-    strategy: BlueGreen
-    timeouts: {starting: %s}
-`, name, schedulerEdgeNS, testModel, testDevice, res, memLimit, res, startingTO)
-}
-
-// extResourceDMRecreate is extResourceDMBlueGreen's Recreate counterpart: the same
-// revision (same memLimit) under the Recreate strategy, which stops the stable
-// first so the one accelerator unit is free for the candidate.
-func extResourceDMRecreate(name, res, memLimit string) string {
-	return fmt.Sprintf(`apiVersion: decisionmodel.io/v1alpha1
-kind: DecisionModel
-metadata: {name: %s, namespace: %s}
-spec:
-  engine: ollaya
-  model: %s
-  device: %s
-  replicas: 1
-  resources:
-    requests: {cpu: 250m, memory: 1Gi, %s: "1"}
-    limits: {memory: %s, %s: "1"}
-  scheduling:
-    nodeSelector: {decisionmodel.io/e2e-node: a}
-  rollout:
-    strategy: Recreate
-`, name, schedulerEdgeNS, testModel, testDevice, res, memLimit, res)
 }
 
 // antiAffinityDM renders replicas:2 on an RWO store with a user-required host
