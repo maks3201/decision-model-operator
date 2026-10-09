@@ -213,7 +213,7 @@ type evalResult struct {
 	// then fails rather than passing on a macro-F1 of 0.
 	classifiableCases int
 	// questions is the bounded per-question summary (choice/bool only), worst
-	// macro-F1 first, capped by eval.Summarize.
+	// macro-F1 first, capped by macroF1Summary.
 	questions          []eval.QuestionSummary
 	questionsTruncated bool
 	transport          int // number of per-case transport errors (not scored as answers)
