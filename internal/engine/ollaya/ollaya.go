@@ -1573,11 +1573,13 @@ fail() {
   exit "$2"
 }
 # Seed: if the controller passed the recorded manifest bytes, verify them against
-# EXPECT_DIGEST and write them to the on-disk tag path BEFORE pulling. ollaya pull
-# then trusts the on-disk manifest (spike 009) and fetches exactly the referenced
-# blobs, so the store is rebuilt to the recorded digest even if the tag moved
-# upstream. A seed whose sha256 does not match EXPECT_DIGEST is a permanent
-# DigestMismatch BEFORE anything is written.
+# EXPECT_DIGEST and write them to the on-disk tag path BEFORE pulling. This is
+# defence in depth, NOT moved-tag recovery: "ollaya pull <tag>" overwrites the
+# on-disk manifest with the tag's current bytes (ollaya-dev/ollaya#64), so the
+# post-pull digest check below is what actually catches a moved tag
+# (UpstreamTagMoved). Seeding fails fast here if the recorded bytes themselves do
+# not match EXPECT_DIGEST (a permanent DigestMismatch BEFORE anything is written),
+# and leaves a verified expected manifest in place for the pull to overwrite.
 #
 # Two mutually exclusive sources, both carrying raw manifest bytes:
 #   MANIFEST_SEED_FILE - a path to a read-only ConfigMap-mounted file (preferred;
@@ -1838,10 +1840,17 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		{Name: "MANIFEST_PATH", Value: manifestPath},
 	}
 
-	// Seed the recorded manifest bytes so the Job can rebuild exactly this digest
-	// even after the tag moved upstream (spike 009: ollaya pull trusts an on-disk
-	// manifest). The script re-verifies the seed against EXPECT_DIGEST before
-	// writing, so a wrong value fails permanently without touching the store.
+	// Seed the recorded manifest bytes before pulling. This does NOT make a moved
+	// tag recoverable: `ollaya pull <tag>` overwrites the on-disk manifest with
+	// the tag's CURRENT bytes (ollaya-dev/ollaya#64), so after the pull the store
+	// holds whatever the tag now points at. If that differs from EXPECT_DIGEST the
+	// post-pull check fails the Job with UpstreamTagMoved — the pinned revision
+	// cannot be rebuilt by re-pulling a tag that moved. The seed's value is defence
+	// in depth: a seed whose sha256 != EXPECT_DIGEST fails fast (DigestMismatch)
+	// BEFORE any pull, and it gives the controller a verified copy of the expected
+	// manifest. A future runtime that supports pull-by-digest
+	// (`<name>:<tag>@sha256:<hex>`) will let us pin without relying on the tag; it
+	// is not available in any runtime version we support today (see docs).
 	//
 	// Two sources, picked by the controller and never both:
 	//   - ManifestConfigMap set: mount that key read-only and point the script at

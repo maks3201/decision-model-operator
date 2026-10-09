@@ -413,6 +413,70 @@ var _ = Describe("per-revision manifest persistence", func() {
 		}
 	})
 
+	It("leaves exactly the stable and the admitted candidate manifests after A->B->C->D while queued", func() {
+		// With a serving stable and a candidate repeatedly re-specced (A->B->C->D)
+		// while queued behind the full budget, no manifest ConfigMap is written for
+		// any queued revision. Once the slot frees and the final revision (D) is
+		// admitted, exactly two manifest ConfigMaps exist for the DM: the stable's
+		// and D's — the intermediates never leaked and are not resurrected.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		stableRev := driveStable(r, "abcd")
+
+		// Fill the only slot so the DM's next candidate queues.
+		r.MaxConcurrentRollouts = 1
+		r.WatchNamespaces = []string{namespace}
+		r.budgetReservations = map[string]string{namespace + "/holder": "held"}
+
+		// A->B->C->D: four spec.model changes, all queued, none persisting a manifest.
+		models := []string{"kev:en", "jevk5:en", "winnow:en", "decider:en"}
+		queuedRevs := map[string]struct{}{}
+		for _, m := range models {
+			Expect(updateDM(ctx, namespace, "abcd", func(d *decisionmodelv1alpha1.DecisionModel) {
+				d.Spec.Model = m
+			})).To(Succeed())
+			rec(r, "abcd")
+			dm := getDM("abcd")
+			Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "queued behind the budget for %s", m)
+			rev := RevisionHash(dm.Spec, wantDigest, fakeImage)
+			if rev != stableRev {
+				queuedRevs[rev] = struct{}{}
+				_, err := manifestCM("abcd", rev)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "no manifest for queued revision %s", rev)
+			}
+		}
+
+		// Free the slot: the final revision (D) is admitted and its manifest written.
+		r.budgetReservations = map[string]string{}
+		dRev := RevisionHash(getDM("abcd").Spec, wantDigest, fakeImage)
+		Eventually(func() bool {
+			rec(r, "abcd")
+			cr := getDM("abcd").Status.CandidateRevision
+			return cr != nil && cr.Hash == dRev
+		}, "5s", "50ms").Should(BeTrue(), "D admitted once the slot frees")
+
+		// Exactly the stable and D manifests exist; no intermediate leaked.
+		all := &corev1.ConfigMapList{}
+		Expect(k8sClient.List(ctx, all, client.InNamespace(namespace))).To(Succeed())
+		have := map[string]struct{}{}
+		prefix := "abcd-manifest-"
+		for i := range all.Items {
+			if n := all.Items[i].Name; len(n) > len(prefix) && n[:len(prefix)] == prefix {
+				have[n[len(prefix):]] = struct{}{}
+			}
+		}
+		Expect(have).To(HaveKey(stableRev), "the stable manifest is kept")
+		Expect(have).To(HaveKey(dRev), "the admitted candidate (D) manifest is written")
+		Expect(have).To(HaveLen(2), "exactly the stable + D manifests exist, no queued intermediate leaked")
+		for rev := range queuedRevs {
+			if rev == dRev {
+				continue
+			}
+			Expect(have).NotTo(HaveKey(rev), "intermediate queued revision %s never persisted a manifest", rev)
+		}
+	})
+
 	It("persists and mounts the manifest once the candidate is admitted", func() {
 		// Admitted (no budget limit): the manifest is persisted and the prefetch
 		// Job references the ConfigMap (mounted, not an env var).

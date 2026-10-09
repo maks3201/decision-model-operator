@@ -19,12 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -204,6 +206,116 @@ var _ = Describe("durable rollout admission", func() {
 			return getDM("up-b").Status.Phase
 		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhasePending),
 			"the upgraded in-flight candidate counts; B queues without a new admission")
+	})
+
+	// Items 5-6: a crash (interceptor error) right AFTER the candidate PVC create,
+	// then after the prefetch Job create. Admission is persisted before either, so
+	// a brand-new reconciler (empty reservation map) must still see A's durable
+	// slot and queue B — the post-allocation crash does not release the slot.
+	crashAfterKindThenNoOverAdmit := func(dmName, otherName string, failKind string) {
+		proberA := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		var failed atomic.Bool
+		failed.Store(true)
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		c := interceptor.NewClient(wc, interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				// Let the write LAND, then crash the reconcile: the object exists but
+				// the reconcile returns an error (process dies right after the create).
+				if cerr := cl.Create(ctx, obj, opts...); cerr != nil {
+					return cerr
+				}
+				switch failKind {
+				case "pvc":
+					if _, ok := obj.(*corev1.PersistentVolumeClaim); ok && failed.CompareAndSwap(true, false) {
+						return fmt.Errorf("induced crash right after the candidate PVC create")
+					}
+				case "job":
+					if _, ok := obj.(*batchv1.Job); ok && failed.CompareAndSwap(true, false) {
+						return fmt.Errorf("induced crash right after the prefetch Job create")
+					}
+				}
+				return nil
+			},
+		})
+		rA := newRec(c, proberA, 1)
+		createDM(dmName, "laya:en")
+		revA := RevisionHash(getDM(dmName).Spec, defaultDigest, fakeImage)
+		proberA.set(revA, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		// Drive A until the induced crash fires; admission is already durable.
+		Eventually(func() bool {
+			rec(rA, dmName)
+			return getDM(dmName).Status.CandidateRevision != nil
+		}, "5s", "50ms").Should(BeTrue(), "A admitted (durable) despite the post-allocation crash")
+
+		// A fresh reconciler with an empty reservation map must still queue B.
+		proberB := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		rB := newRec(k8sClient, proberB, 1)
+		Expect(rB.budgetReservations).To(BeEmpty())
+		createDM(otherName, "kev:en")
+		revB := RevisionHash(getDM(otherName).Spec, defaultDigest, fakeImage)
+		proberB.set(revB, engine.Loaded{Name: "kev:en", Digest: defaultDigest, Device: "cpu"})
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(rB, otherName)
+			return getDM(otherName).Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhasePending),
+			"B queued behind A's durable slot after a post-allocation crash")
+		Expect(getDM(otherName).Status.CandidateRevision).To(BeNil(), "B not admitted")
+	}
+
+	It("does not over-admit after a crash right after the candidate PVC create", func() {
+		crashAfterKindThenNoOverAdmit("pvc-a", "pvc-other", "pvc")
+	})
+
+	It("does not over-admit after a crash right after the prefetch Job create", func() {
+		crashAfterKindThenNoOverAdmit("job-a", "job-other", "job")
+	})
+
+	// Item 7: a stress invariant — 15 DecisionModels, limit 2, reconciled in
+	// parallel goroutines over 20 iterations through ONE reconciler (as the manager
+	// does with MaxConcurrentReconciles > 1). The count+decide+reserve is serialized
+	// under budgetMu, so no matter the interleaving, at most 2 DMs may ever carry a
+	// durable candidateRevision at once. Run under -race.
+	It("never admits more than the budget under heavy parallel reconciles", func() {
+		const (
+			n     = 15
+			limit = 2
+			iters = 20
+		)
+		prober := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := newRec(k8sClient, prober, limit)
+		names := make([]string, n)
+		for i := 0; i < n; i++ {
+			names[i] = fmt.Sprintf("st-%d", i)
+			createDM(names[i], "laya:en")
+			rev := RevisionHash(getDM(names[i]).Spec, defaultDigest, fakeImage)
+			prober.set(rev, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		}
+		admitted := func() int {
+			c := 0
+			for _, nm := range names {
+				if getDM(nm).Status.CandidateRevision != nil {
+					c++
+				}
+			}
+			return c
+		}
+		for it := 0; it < iters; it++ {
+			var wg sync.WaitGroup
+			for _, nm := range names {
+				wg.Add(1)
+				go func(name string) {
+					defer wg.Done()
+					defer GinkgoRecover()
+					_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
+				}(nm)
+			}
+			wg.Wait()
+			Expect(admitted()).To(BeNumerically("<=", limit),
+				"iteration %d: never more than %d DMs admitted at once", it, limit)
+		}
+		// Steady state: exactly the budget is in flight (the rest queued), none lost.
+		Expect(admitted()).To(Equal(limit), "exactly the budget is admitted once things settle")
 	})
 })
 

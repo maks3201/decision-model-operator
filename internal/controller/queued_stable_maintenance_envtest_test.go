@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -269,5 +270,64 @@ var _ = Describe("stable maintenance while a candidate is RolloutQueued", func()
 			return d.Spec.Template.Annotations[apiKeyChecksumAnnotation]
 		}, "5s", "50ms").ShouldNot(Equal(before), "API-key rotation rolled the stable template while queued")
 		Expect(getDM("key-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "still queued")
+	})
+
+	It("recreates a deleted stable PodDisruptionBudget while the candidate is queued", func() {
+		// A replicas>1 stable has a PDB (maxUnavailable=1). While a candidate is
+		// queued the stable is fully maintained, so a hand-deleted PDB is recreated
+		// without ending the queue.
+		proberB := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		rB := newRec(proberB, 1)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "pdb-b"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(2),
+				// RWX so replicas>1 needs no co-location dance; a PDB is still created.
+				Cache: &decisionmodelv1alpha1.CacheSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+			},
+		})).To(Succeed())
+		stableRev := RevisionHash(getDM("pdb-b").Spec, defaultDigest, fakeImage)
+		proberB.set(stableRev, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		rec(rB, "pdb-b")
+		markJob("pdb-b", stableRev)
+		rec(rB, "pdb-b")
+		gatedPod("pdb-b", stableRev, "10.0.3.2")
+		// A second ready replica Pod with the SAME revision label (distinct name).
+		pod2 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "pdb-b-pod2-" + stableRev,
+				Labels: map[string]string{decisionmodelv1alpha1.LabelName: "pdb-b", decisionmodelv1alpha1.LabelRevision: stableRev},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod2)).To(Succeed())
+		pod2.Status.PodIP = "10.0.3.3"
+		pod2.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			{Type: corev1.PodConditionType(decisionmodelv1alpha1.ModelReadyGate), Status: corev1.ConditionTrue},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod2)).To(Succeed())
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(rB, "pdb-b") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		pdbKey := types.NamespacedName{Namespace: namespace, Name: pdbName(getDM("pdb-b"), stableRev)}
+		Expect(k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})).To(Succeed(), "stable PDB exists at replicas 2")
+
+		// Occupy the only slot, then queue a new candidate for pdb-b.
+		proberHold := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		rHold := newRec(proberHold, 1)
+		occupySlot(rHold, proberHold, "holder3", "10.0.3.1")
+		_, _ = queueCandidate(rB, proberB, "pdb-b")
+		Expect(getDM("pdb-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending))
+
+		// Delete the stable PDB: a still-queued reconcile recreates it.
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, pdbKey, pdb)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pdb)).To(Succeed())
+		Eventually(func() bool {
+			rec(rB, "pdb-b")
+			return k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}) == nil
+		}, "5s", "50ms").Should(BeTrue(), "stable PDB recreated while the candidate is queued")
+		Expect(getDM("pdb-b").Status.Phase).To(Equal(decisionmodelv1alpha1.PhasePending), "still queued after the PDB recreate")
 	})
 })
