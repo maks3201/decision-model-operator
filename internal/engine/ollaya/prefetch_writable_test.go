@@ -23,6 +23,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // enginePkgScripts returns every shell script string the engine renders, so a
@@ -235,5 +237,125 @@ func TestPrefetchStoreMountIsWritable(t *testing.T) {
 	}
 	if !saw {
 		t.Fatalf("no models mount at %q on the prefetch container", modelsMount)
+	}
+}
+
+// TestFileSeedWritesInsideStore runs the real rendered script for the ConfigMap
+// (file) seed path: MANIFEST_SEED_FILE points at a file on disk (standing in for
+// the read-only ConfigMap mount), TMPDIR is read-only, and the writable store is
+// a temp dir. The seed must be verified and written to the manifest path, with no
+// MANIFEST_SEED_B64 involved and nothing left in the tag dir or .seed-tmp.
+func TestFileSeedWritesInsideStore(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	manifest := []byte(`{"schemaVersion":2,"layers":[]}`)
+	p := seedParams(manifest)
+	p.ManifestConfigMap = &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cm"},
+		Key:                  "manifest",
+	}
+	c := New().PrefetchJobSpec(p).Template.Spec.Containers[0]
+	script := c.Args[0]
+
+	store := t.TempDir()
+
+	// Read-only TMPDIR: a bare mktemp would default here and fail.
+	roTmp := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(roTmp, 0o500); err != nil {
+		t.Fatalf("mkdir ro tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roTmp, 0o700) })
+
+	// The mounted manifest file (what the ConfigMap volume would project).
+	seedMount := t.TempDir()
+	seedFile := filepath.Join(seedMount, "manifest")
+	if err := os.WriteFile(seedFile, manifest, 0o444); err != nil {
+		t.Fatalf("write seed file: %v", err)
+	}
+
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ollaya"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	env["OLLAYA_MODELS"] = store
+	env["MANIFEST_PATH"] = "manifests/ollaya.dev/library/laya/en"
+	env["MANIFEST_SEED_FILE"] = seedFile // override the in-container mount path
+
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TMPDIR="+roTmp,
+	)
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("file-seed script failed under read-only TMPDIR: %v\n%s", err, out)
+	}
+
+	dest := filepath.Join(store, env["MANIFEST_PATH"])
+	got, statErr := os.ReadFile(dest)
+	if statErr != nil {
+		t.Fatalf("seed not written to %q: %v\noutput:\n%s", dest, statErr, out)
+	}
+	if string(got) != string(manifest) {
+		t.Errorf("seeded manifest = %q, want %q", got, manifest)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dest))
+	for _, e := range entries {
+		if e.Name() != filepath.Base(dest) {
+			t.Errorf("unexpected file %q left in the manifests tag dir", e.Name())
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(store, ".seed-tmp")); !os.IsNotExist(statErr) {
+		t.Errorf(".seed-tmp must be cleaned after a successful file seed (stat err = %v)", statErr)
+	}
+}
+
+// TestFileSeedRefusesUnreadableFile pins that a missing/unreadable seed file is a
+// permanent DigestMismatch (the ConfigMap is required; a missing one must not be
+// silently skipped). ollaya is NOT stubbed so a regression that fell through to
+// pull would error differently; here the script must fail before any pull.
+func TestFileSeedRefusesUnreadableFile(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	manifest := []byte(`{"schemaVersion":2,"layers":[]}`)
+	p := seedParams(manifest)
+	p.ManifestConfigMap = &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cm"},
+		Key:                  "manifest",
+	}
+	c := New().PrefetchJobSpec(p).Template.Spec.Containers[0]
+	script := c.Args[0]
+
+	store := t.TempDir()
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	env["OLLAYA_MODELS"] = store
+	env["MANIFEST_PATH"] = "manifests/ollaya.dev/library/laya/en"
+	env["MANIFEST_SEED_FILE"] = filepath.Join(store, "does-not-exist")
+
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Env = os.Environ()
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("script must fail when the seed file is unreadable; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "reason: "+PrefetchReasonDigestMismatch) {
+		t.Errorf("expected a DigestMismatch reason for an unreadable seed file; output:\n%s", out)
 	}
 }
