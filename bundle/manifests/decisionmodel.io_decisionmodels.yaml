@@ -1846,13 +1846,17 @@ spec:
                           format: int32
                           type: integer
                         id:
-                          description: ID is the question id.
+                          description: |-
+                            ID is the question id. Truncated with a short hash suffix when longer than
+                            63 characters, so status stays bounded and two long ids do not collide.
+                          maxLength: 63
                           type: string
                         macroF1:
                           description: MacroF1 is the per-question macro-F1 (decimal
                             string).
                           type: string
                       type: object
+                    maxItems: 20
                     type: array
                     x-kubernetes-list-type: atomic
                   reason:

@@ -168,21 +168,29 @@ spec:
 
 - Macro-F1 is computed over **choice and bool (`noul`) questions only** — the ones
   with a class label to average. `score` questions have no class and are excluded.
+  The overall macro-F1 is the **unweighted mean of the per-question macro-F1**: a
+  question with one case weighs the same as one with 500.
 - `maxMacroF1Drop` is a relative gate: like `maxAccuracyDrop` it is enforced only
-  when a stable revision exists to provide a baseline, and it adds the stable to
-  the baseline run (no extra evaluation).
-- **No classifiable question → the gate fails.** If a `minMacroF1` or
-  `maxMacroF1Drop` is configured but the dataset has no choice or bool question (so
-  there is nothing to average), the candidate is **rejected** with reason
-  `ClassificationUnavailable`, never promoted on a silent macro-F1 of 0 — the same
-  fail-closed rule the calibration gate uses when no case produces a probability
-  distribution.
+  when a stable revision exists to provide a baseline. When it is the only relative
+  gate configured, the operator **does run a baseline evaluation of the stable** on
+  the same dataset to compare against (the macro-F1 comes from that same baseline
+  run as `baselineAccuracy`, no second pass).
+- **No classifiable question → the gate fails** — for `minMacroF1`. If `minMacroF1`
+  is set but the dataset has no choice or bool question (nothing to average), the
+  candidate is **rejected** with reason `ClassificationUnavailable`, never promoted
+  on a silent macro-F1 of 0 — the same fail-closed rule the calibration gate uses
+  when no case produces a probability distribution. `maxMacroF1Drop` without a
+  stable revision is simply **skipped** (like `maxAccuracyDrop`): there is no
+  baseline to compare against, so it does not fail or block the first rollout.
+- A missing, empty or unscorable answer still counts as a **miss for its expected
+  class** (it does not silently vanish), so a candidate that skips the minority-class
+  cases cannot score macro-F1 1.0 on the classes it did answer.
 - `status.evaluation` records `macroF1`, `baselineMacroF1` (when a baseline ran),
   `classifiableCases`, and a bounded `questions` list (at most 20 entries, worst
   macro-F1 first, with `truncated: true` when more existed) for per-question
   visibility. A gate message names the failing comparison, e.g.
-  `macroF1 0.71 < minMacroF1 0.80` or
-  `macroF1 dropped 0.06 (baseline 0.84) > maxMacroF1Drop 0.05`.
+  `macroF1 0.7100 < minMacroF1 0.8000` or
+  `macroF1 dropped 0.0600 (baseline 0.8400) > maxMacroF1Drop 0.0500`.
 
 
 ## Reading the result
