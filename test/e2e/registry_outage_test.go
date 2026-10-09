@@ -19,6 +19,7 @@ package e2e
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -114,12 +115,27 @@ spec:
 	It("keeps the stable serving when the registry hostname does not resolve (DNS failure)", func() {
 		stableBefore := mustStable()
 
-		By("pointing the operator at a non-resolving registry host and forcing a new resolve")
+		By("re-pointing the operator at a non-resolving registry host (this rolls the manager)")
+		// patchManagerArgs restarts the manager. Right after that restart the
+		// model-ready prober briefly reports NoModelReadyPods for the single stable
+		// Pod before it re-establishes the gate — a restart artifact, NOT a
+		// registry-outage effect. We let that flap settle (manager rolled out inside
+		// patchManagerArgs, then the DM back to Ready) BEFORE triggering the failing
+		// resolve, so the strict assertion below reflects only the DNS outage. The
+		// stable does not use the registry, so it returns to Ready even with the
+		// bogus host set, as long as no new resolve is in flight.
 		patchManagerArgs(
 			"--ollaya-registry=http://"+bogusRegistryHost,
 			"--allowed-registries="+mirrorHost+","+bogusRegistryHost,
 			"--allow-insecure-registries",
 		)
+		By("waiting for the manager-restart flap to settle: the stable is Ready again")
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(registryOutageNS, "decisionmodel", dm, "{.status.phase}")
+		}, 4*time.Minute, 5*time.Second).Should(Equal("Ready"),
+			"the stable should return to Ready after the manager restart, before any registry fault")
+
+		By("forcing a fresh resolve against the non-resolving host (the actual DNS fault)")
 		patchModel("laya:multilingual")
 
 		By("Resolved=False/ResolveFailed (DNS is a transport error, not ModelNotFound), stable serves")
@@ -276,15 +292,30 @@ func patchResourcesCPU(cpu string) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// assertStableKeepsServing asserts over a short window that the DM keeps serving
-// the given stable revision (phase Ready, same stable hash) and does not go
-// Degraded on a transient candidate-side registry fault.
+// assertStableKeepsServing asserts the DM keeps SERVING the given stable revision
+// through a transient candidate-side registry fault: the stable revision identity
+// is unchanged, the rollout never lands in a terminal Failed/RolledBack, and the
+// stable's Service keeps a ready endpoint. It deliberately tolerates a transient
+// assertStableKeepsServing asserts the strict property the registry-outage specs
+// exist for: a transient, candidate-side registry fault must not disturb the
+// already-serving stable at all. The stable does not need the registry, so during
+// the fault its phase stays Ready, its revision identity is unchanged, and its
+// Service keeps a ready endpoint. Callers MUST have let any manager-restart flap
+// settle (manager rolled out AND the DM back to Ready) BEFORE injecting the fault,
+// so a strict phase==Ready here reflects the registry fault only, not a restart
+// artifact (see the DNS spec).
 func assertStableKeepsServing(stable string) {
 	Consistently(func(g Gomega) {
 		phase, _ := utils.KubectlJSONPath(registryOutageNS, "decisionmodel", registryOutageDM, "{.status.phase}")
-		g.Expect(phase).To(Equal("Ready"), "the stable must keep serving during a transient registry outage")
+		g.Expect(phase).To(Equal("Ready"),
+			"a transient candidate-side registry outage must keep the serving stable Ready")
 		stableNow, _ := utils.KubectlJSONPath(registryOutageNS, "decisionmodel", registryOutageDM,
 			"{.status.stableRevision.hash}")
-		g.Expect(stableNow).To(Equal(stable))
-	}, 20*time.Second, 5*time.Second).Should(Succeed())
+		g.Expect(stableNow).To(Equal(stable),
+			"the stable revision must not change during a transient candidate-side outage")
+		eps, _ := utils.Kubectl("get", "endpoints", registryOutageDM, "-n", registryOutageNS,
+			"-o", "jsonpath={.subsets[*].addresses[*].ip}")
+		g.Expect(strings.Fields(eps)).NotTo(BeEmpty(),
+			"the stable Service must keep a ready endpoint during a transient registry outage")
+	}, 30*time.Second, 5*time.Second).Should(Succeed())
 }

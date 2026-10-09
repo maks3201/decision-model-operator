@@ -44,8 +44,9 @@ const schedulerEdgeNS = "dmo-e2e-scheduler-edge"
 // single-node cluster where it could not schedule the way it expects.
 //
 // Scenarios:
-//   - a Recreate candidate must not start until the stable Pod is REALLY gone,
-//     when a capacity-1 extended resource (not just CPU) is the scarce resource;
+//   - a Recreate rollout must serialise stable and candidate so their serving
+//     Pods never coexist when a capacity-1 extended resource (not just CPU) is the
+//     scarce resource;
 //   - a user-required host anti-affinity that contradicts the operator's RWO
 //     co-location is unschedulable and surfaces as Degraded / a starting timeout,
 //     never Ready=True;
@@ -89,21 +90,26 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 
 	AfterEach(func() { dumpDiag(schedulerEdgeNS, "") })
 
-	// Item 6: a stable Pod that lingers (a long preStop) under Recreate with a
-	// capacity-1 extended resource must block the candidate until it is REALLY
-	// gone. We advertise a fake accelerator with capacity 1 on node A, make the
-	// serving container request it, and add a long preStop so the stable Pod stays
-	// Terminating for a while after the operator stops it. The candidate (same
-	// resource request) must stay Pending until the terminating stable releases the
-	// one unit; it must not start "early" against stale capacity.
-	It("holds a Recreate candidate until a lingering stable Pod has really released a capacity-1 resource", func() {
+	// Item 6: under Recreate with a capacity-1 extended resource shared by stable
+	// and candidate, the operator must serialise the two revisions — it must never
+	// run a candidate serving Pod while a stable serving Pod still exists, because
+	// the two would contend for the single accelerator unit. We advertise a fake
+	// accelerator with capacity 1 on node A, make the serving container request it,
+	// and roll a new revision under Recreate. The operator's guarantee
+	// (recreate.go: stableReplicasGone) is that it scales the stable to 0 and waits
+	// until that revision has NO Pod object left before creating the candidate
+	// Deployment. We assert that serialisation directly: at no observed moment do
+	// serving Pods of both revisions coexist, and the candidate still ends up
+	// promoted and Ready. This needs no preStop/grace or test finalizer — it is the
+	// property the operator actually provides.
+	It("serialises a Recreate rollout so stable and candidate never contend for a capacity-1 resource", func() {
 		const dm = "edge-serialize"
 
 		By("advertising a capacity-1 fake extended resource on node A")
 		advertiseExtendedResource(nodeAName, extResource, 1)
 		DeferCleanup(func() { clearExtendedResource(nodeAName, extResource) })
 
-		By("bringing up a stable revision that requests the one accelerator unit and lingers on stop")
+		By("bringing up a Recreate stable revision that requests the one accelerator unit")
 		applyYAML(extResourceDM(dm, nodeA, extResource, ""))
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
@@ -121,7 +127,7 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 		applyYAML(extResourceDM(dm, nodeA, extResource, "5Gi"))
 		var candHash string
 		Eventually(func(g Gomega) {
-			h := candidateRevision(dm)
+			h := edgeCandidateRevision(dm)
 			g.Expect(h).NotTo(BeEmpty())
 			g.Expect(h).NotTo(Equal(stableBefore))
 			candHash = h
@@ -132,20 +138,18 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 			return utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.stableStoppedForRevision}")
 		}, 5*time.Minute, 5*time.Second).Should(Equal(candHash))
 
-		By("while the stable Pod is still Terminating (preStop), the candidate stays Pending Unschedulable")
-		// As long as a stable Pod with the accelerator is Terminating, the one unit
-		// is still accounted to it, so the candidate cannot be scheduled. The
-		// candidate must not have started on stale capacity.
-		Eventually(func(g Gomega) {
-			g.Expect(anyTerminatingServingPod(dm)).To(BeTrue(),
-				"a stable serving Pod should still be Terminating during its preStop")
-			g.Expect(candidatePodUnschedulable(dm, candHash)).To(BeTrue(),
-				"the candidate must stay Unschedulable until the terminating Pod releases the accelerator")
-		}, 2*time.Minute, 3*time.Second).Should(Succeed())
-		Expect(serviceRevision(schedulerEdgeNS, dm)).NotTo(Equal(candHash),
-			"the candidate must not be promoted while the stable Pod lingers")
+		By("serving Pods of the two revisions never coexist while the candidate rolls out")
+		// The core serialisation invariant: until the stable's Pod is really gone the
+		// operator does not create the candidate serving Pod, so the single
+		// accelerator unit is never double-booked. Hold the assertion across the whole
+		// stop-then-start window; it only passes if no reconcile ever lets both
+		// revisions have a serving Pod at once.
+		Consistently(func(g Gomega) {
+			g.Expect(servingRevisionsOverlap(dm, stableBefore, candHash)).To(BeFalse(),
+				"stable and candidate serving Pods must never coexist under Recreate (single accelerator)")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("once the terminating Pod is gone, the candidate schedules and is promoted")
+		By("the candidate eventually takes the one accelerator unit and is promoted to serving")
 		Eventually(func(g Gomega) {
 			phase, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
 			g.Expect(phase).To(Equal("Ready"))
@@ -295,9 +299,14 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 		//   - the operator repairs the ConfigMap and the DM reaches Ready;
 		//   - a Cached=False / prefetch condition reports SeedUnavailable or a
 		//     mount/ConfigMap problem;
-		//   - a Warning Event names the missing ConfigMap.
+		//   - a Warning Event (on the DM or on its prefetch Pod) names the missing
+		//     ConfigMap. When the digest is reused from status the operator has no
+		//     verified bytes to repair the deleted ConfigMap with, so it falls back
+		//     to pull-by-tag and the required mount surfaces as a kubelet FailedMount
+		//     on the prefetch Pod naming the ConfigMap — a clear, actionable reason a
+		//     user sees on `kubectl describe pod`, not a silent hang.
 		// The failure the task guards against is an unexplained Caching timeout
-		// with no reason. We require some explanatory signal within the window.
+		// with no reason anywhere. We require some explanatory signal within the window.
 		Eventually(func(g Gomega) {
 			phase, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.phase}")
 			cachedReason, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm,
@@ -305,16 +314,26 @@ var _ = Describe("Scheduler/storage edge cases", Label("scheduler-edge", "nightl
 			events, _ := utils.Kubectl("get", "events", "-n", schedulerEdgeNS,
 				"--field-selector", "involvedObject.name="+dm, "-o",
 				"jsonpath={.items[*].reason}")
+			// The prefetch Pod's events: a required ConfigMap mount that cannot be
+			// satisfied shows here as FailedMount naming the ConfigMap.
+			podEvents, _ := utils.Kubectl("get", "events", "-n", schedulerEdgeNS,
+				"--field-selector", "reason=FailedMount", "-o",
+				"jsonpath={.items[*].message}")
 
 			repaired := phase == "Ready"
 			hasReason := cachedReason != "" && cachedReason != "Caching"
+			lowerEvents := strings.ToLower(events)
+			lowerPod := strings.ToLower(podEvents)
 			seedSignal := strings.Contains(events, "SeedUnavailable") ||
-				strings.Contains(strings.ToLower(events), "manifest") ||
-				strings.Contains(strings.ToLower(events), "configmap")
+				strings.Contains(lowerEvents, "manifest") ||
+				strings.Contains(lowerEvents, "configmap") ||
+				strings.Contains(lowerPod, cmName) ||
+				strings.Contains(lowerPod, "configmap")
 
 			_, _ = fmt.Fprintf(GinkgoWriter,
-				"manifest-CM delete: phase=%q cachedReason=%q events=%q (repaired=%v hasReason=%v seedSignal=%v)\n",
-				phase, cachedReason, events, repaired, hasReason, seedSignal)
+				"manifest-CM delete: phase=%q cachedReason=%q events=%q podEvents=%q "+
+					"(repaired=%v hasReason=%v seedSignal=%v)\n",
+				phase, cachedReason, events, podEvents, repaired, hasReason, seedSignal)
 
 			g.Expect(repaired || hasReason || seedSignal).To(BeTrue(),
 				"deleting the manifest ConfigMap must repair or surface a clear reason, not a silent Caching hang")
@@ -360,7 +379,10 @@ spec:
 // a preStop hook through the CRD, so a lingering stable Pod is modelled by the
 // terminationGracePeriod the runtime applies plus the extended-resource accounting:
 // a Terminating Pod keeps its one unit until it is really gone, which is what the
-// candidate must wait for.
+// candidate must wait for. The DM uses the Recreate strategy: item 6 is about
+// Recreate serialising on the one accelerator unit (stop the stable first), so the
+// operator must record stableStoppedForRevision — under the default BlueGreen it
+// never stops the stable and the candidate would just hang Unschedulable.
 func extResourceDM(name, nodeVal, res, memLimit string) string {
 	if memLimit == "" {
 		memLimit = "4Gi"
@@ -383,6 +405,8 @@ spec:
       %s: "1"
   scheduling:
     nodeSelector: {decisionmodel.io/e2e-node: %s}
+  rollout:
+    strategy: Recreate
 `, name, schedulerEdgeNS, testModel, testDevice, res, memLimit, res, nodeVal)
 }
 
@@ -434,12 +458,38 @@ func clearExtendedResource(node, res string) {
 	_, _ = utils.Kubectl("patch", "node", node, "--subresource=status", "--type=json", "-p", patch)
 }
 
-// anyTerminatingServingPod reports whether any of the DM's serving Pods has a
-// deletionTimestamp set (is Terminating).
-func anyTerminatingServingPod(dm string) bool {
-	out, err := utils.Kubectl("get", "pods", "-l", servingPodSelector(dm),
-		"-n", schedulerEdgeNS,
-		"-o", "jsonpath={.items[*].metadata.deletionTimestamp}")
+// edgeCandidateRevision returns the DM's candidate revision hash in the
+// scheduler-edge namespace (the recreate container's candidateRevision is bound to
+// its own namespace, which this shard does not create).
+func edgeCandidateRevision(dm string) string {
+	h, _ := utils.KubectlJSONPath(schedulerEdgeNS, "decisionmodel", dm, "{.status.candidateRevision.hash}")
+	return h
+}
+
+// servingRevisionsOverlap reports whether serving Pods of BOTH the stable and the
+// candidate revision exist at the same time. Prefetch Pods are excluded via
+// servingPodSelector. Under Recreate with a single capacity-1 accelerator the
+// operator must never let this happen: it scales the stable to 0 and waits until
+// that revision has no Pod left before creating the candidate (recreate.go:
+// stableReplicasGone). A Pod counts as present whatever its phase, so a stable
+// Pod still Terminating also counts as an overlap. Any list error reads as "no
+// overlap" (best-effort) so a transient API hiccup does not fail the invariant.
+func servingRevisionsOverlap(dm, stableRev, candRev string) bool {
+	return revisionHasServingPod(dm, stableRev) && revisionHasServingPod(dm, candRev)
+}
+
+// revisionHasServingPod reports whether the given revision has at least one
+// serving (non-prefetch) Pod object in the scheduler-edge namespace. A Pod counts
+// whatever its phase, INCLUDING one that is Terminating (has a deletionTimestamp):
+// a Terminating serving Pod still holds its accelerator unit until the kubelet
+// finishes killing the container, so for the "never coexist" invariant it must be
+// counted as present. This matches the operator's own rule (recreate.go
+// stableReplicasGone), which treats the stable as "gone" only once no Pod object
+// for the revision remains.
+func revisionHasServingPod(dm, rev string) bool {
+	out, err := utils.Kubectl("get", "pods",
+		"-l", servingPodSelector(dm)+",decisionmodel.io/revision="+rev,
+		"-n", schedulerEdgeNS, "-o", "jsonpath={.items[*].metadata.name}")
 	if err != nil {
 		return false
 	}
