@@ -310,6 +310,10 @@ func (r *DecisionModelReconciler) promote(
 		if prevStable != nil {
 			dm.Status.PreviousRevision = &decisionmodelv1alpha1.PreviousRevisionStatus{
 				Hash: prevStable.Hash, PromotedAt: &now, Revision: prevStable.DeepCopy(),
+				// Record the strategy the rollout ran under so a rollback in the
+				// stabilization window stages correctly even if the live spec's
+				// strategy changed since (it is not part of the revision hash).
+				Strategy: rolloutStrategy(dm),
 			}
 		}
 		setStatusCondition(dm, metav1.Condition{

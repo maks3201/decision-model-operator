@@ -71,12 +71,17 @@ func (r *DecisionModelReconciler) gateRolloutBudget(
 // until the manager cache reflects that write, an in-memory reservation
 // (ns/name -> rev) stands in and counts as active, closing the cache-lag window.
 //
-// The count derives from cluster state (status.candidateRevision) plus the
-// reservation set; FIFO is by phaseTransitionTime among queued (Pending)
-// DecisionModels plus dm itself. The cached List is sufficient (no uncached
-// APIReader): the only staleness that matters is this process's own just-written
-// candidateRevision, which the reservation covers until the cache catches up; a
-// reservation is dropped once the cached DM shows the candidate.
+// Two-phase read to keep the hot path cheap: a queued DM re-decides every
+// rolloutQueuedRequeue (~10s), so paying an uncached APIReader List on every such
+// reconcile would hammer the API server with one List per queued DM per 10s.
+// Instead the decision is first made from the CACHED List; if it would QUEUE, that
+// is returned directly (a stale cache can only make a DM wait one extra cycle,
+// never over-admit, so queuing needs no uncached confirmation). Only when the
+// cached decision would ADMIT do we re-confirm against the UNCACHED List — an
+// uncached read cannot miss a slot a just-admitted DM already took, including an
+// admission by a different leader or this leader's own not-yet-cached write — so
+// the hard cross-leader limit still holds, now paid only at the moment of
+// admission rather than on every queued tick.
 func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -86,14 +91,25 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 		return false, ctrl.Result{}, nil // unlimited
 	}
 
-	// Count from an UNCACHED read of DecisionModels in the watched scope. Admission
-	// is persisted (status.candidateRevision) before any allocation, so an uncached
-	// List cannot miss a slot a just-admitted DM already took — including an
-	// admission by a different leader, or this leader's own write that the manager
-	// cache has not caught up to yet. This is the only budget read that must be
-	// uncached; it runs only when a brand-new candidate is deciding admission (not
-	// on steady-state reconciles). The cost is one List of DecisionModels in the
-	// watched namespaces per admission decision.
+	// Phase 1: decide from the cached List (cheap, served from the informer).
+	cached := &decisionmodelv1alpha1.DecisionModelList{}
+	if err := r.listInScope(ctx, cached); err != nil {
+		return false, ctrl.Result{}, err
+	}
+	r.budgetMu.Lock()
+	admit := r.budgetWouldAdmitLocked(cached, dm)
+	r.budgetMu.Unlock()
+	if !admit {
+		// Over budget on the cached view: queue. A stale cache can only delay, not
+		// over-admit, so no uncached confirmation is needed here (the common hot
+		// path for a fleet of queued DMs).
+		return true, r.queueRollout(ctx, dm), nil
+	}
+
+	// Phase 2: the cached view would admit — re-confirm against an UNCACHED List so
+	// a slot a just-admitted DM already took (another leader, or this leader's
+	// own write the cache has not caught up to) is counted. Reserve under the same
+	// lock so the count+decide+reserve is atomic for this process.
 	list := &decisionmodelv1alpha1.DecisionModelList{}
 	if err := r.listInScopeUncached(ctx, list); err != nil {
 		return false, ctrl.Result{}, err
@@ -101,25 +117,76 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 
 	r.budgetMu.Lock()
 	defer r.budgetMu.Unlock()
+	return r.decideRolloutBudgetLocked(ctx, list, dm, rev)
+}
 
+// budgetWouldAdmitLocked reports whether dm would be admitted given the supplied
+// List, without mutating any reservation. It is the read-only predicate used for
+// the cheap cached phase-1 check. Caller holds budgetMu.
+func (r *DecisionModelReconciler) budgetWouldAdmitLocked(
+	list *decisionmodelv1alpha1.DecisionModelList,
+	dm *decisionmodelv1alpha1.DecisionModel,
+) bool {
+	active, waiting := r.countBudgetLocked(list, dm)
+	slots := r.MaxConcurrentRollouts - active
+	if slots <= 0 {
+		return false
+	}
+	return r.rankAmongWaiting(waiting, dm) < slots
+}
+
+// decideRolloutBudgetLocked runs the authoritative count+decide+reserve against
+// the (uncached) List. It syncs reservations, admits dm (taking a reservation) or
+// queues it. Caller holds budgetMu.
+func (r *DecisionModelReconciler) decideRolloutBudgetLocked(
+	ctx context.Context,
+	list *decisionmodelv1alpha1.DecisionModelList,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) (bool, ctrl.Result, error) {
 	// Reconcile reservations against the freshly listed state: drop any whose DM
 	// now visibly carries that candidate (admission durable), or that is gone.
 	r.syncReservationsLocked(list)
 
-	self := dm.Namespace + "/" + dm.Name
-	active := 0
-	type queued struct {
-		key string
-		t   int64
+	active, waiting := r.countBudgetLocked(list, dm)
+	slots := r.MaxConcurrentRollouts - active
+	if slots <= 0 {
+		return true, r.queueRollout(ctx, dm), nil
 	}
-	var waiting []queued
+	if r.rankAmongWaiting(waiting, dm) < slots {
+		// Admitted: reserve the slot until status.candidateRevision is visible.
+		if r.budgetReservations == nil {
+			r.budgetReservations = map[string]string{}
+		}
+		r.budgetReservations[dm.Namespace+"/"+dm.Name] = rev
+		return false, ctrl.Result{}, nil
+	}
+	return true, r.queueRollout(ctx, dm), nil
+}
+
+// budgetQueued is a queued DecisionModel's key and FIFO timestamp.
+type budgetQueued struct {
+	key string
+	t   int64
+}
+
+// countBudgetLocked counts the active rollouts in the fleet (excluding dm) and
+// collects the DecisionModels waiting ahead of/alongside dm. Active = a DM with a
+// durable candidate, inside its stabilization window, or holding a reservation; a
+// reservation for a DM absent from the (possibly lagged) List also counts. Caller
+// holds budgetMu.
+func (r *DecisionModelReconciler) countBudgetLocked(
+	list *decisionmodelv1alpha1.DecisionModelList,
+	dm *decisionmodelv1alpha1.DecisionModel,
+) (active int, waiting []budgetQueued) {
+	self := dm.Namespace + "/" + dm.Name
 	seen := map[string]struct{}{}
 	for i := range list.Items {
 		d := &list.Items[i]
 		key := d.Namespace + "/" + d.Name
 		seen[key] = struct{}{}
 		if key == self {
-			continue // dm handled separately below
+			continue // dm handled separately by the caller
 		}
 		if d.Status.CandidateRevision != nil {
 			active++
@@ -133,16 +200,13 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 			continue
 		}
 		// A same-process reservation (admitted-but-not-yet-persisted candidate)
-		// still occupies a slot. With persist-first admission the uncached List
-		// above already sees any durable candidateRevision, so this only covers the
-		// in-reconcile window before the persist; it is a single-process
-		// optimisation, not the cross-leader guarantee (that is the uncached read).
+		// still occupies a slot.
 		if _, reserved := r.budgetReservations[key]; reserved {
 			active++
 			continue
 		}
 		if d.Status.Phase == decisionmodelv1alpha1.PhasePending {
-			waiting = append(waiting, queued{key: key, t: transitionNanos(d)})
+			waiting = append(waiting, budgetQueued{key: key, t: transitionNanos(d)})
 		}
 	}
 	// A reservation for a DM not in this (possibly lagged) List still counts.
@@ -154,42 +218,35 @@ func (r *DecisionModelReconciler) rolloutBudgetBlocks(
 			active++
 		}
 	}
+	return active, waiting
+}
 
-	slots := r.MaxConcurrentRollouts - active
-	if slots <= 0 {
-		return true, r.queueRollout(ctx, dm), nil
-	}
-
-	// Rank dm against the other waiting DecisionModels by phaseTransitionTime
-	// (FIFO). dm's own timestamp is its current Pending transition, or now when it
-	// is entering the queue this reconcile.
-	selfQ := queued{key: self, t: r.now().UnixNano()}
+// rankAmongWaiting returns dm's FIFO rank (0-based) among the waiting
+// DecisionModels, by phaseTransitionTime with a stable key tiebreak. dm's own
+// timestamp is its current Pending transition, or now when it is entering the
+// queue this reconcile.
+func (r *DecisionModelReconciler) rankAmongWaiting(
+	waiting []budgetQueued,
+	dm *decisionmodelv1alpha1.DecisionModel,
+) int {
+	self := dm.Namespace + "/" + dm.Name
+	selfQ := budgetQueued{key: self, t: r.now().UnixNano()}
 	if dm.Status.Phase == decisionmodelv1alpha1.PhasePending && dm.Status.PhaseTransitionTime != nil {
 		selfQ.t = dm.Status.PhaseTransitionTime.UnixNano()
 	}
-	all := append(waiting, selfQ)
+	all := append(append([]budgetQueued{}, waiting...), selfQ)
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].t != all[j].t {
 			return all[i].t < all[j].t
 		}
 		return all[i].key < all[j].key // stable tiebreak
 	})
-	rank := 0
 	for i := range all {
 		if all[i].key == selfQ.key {
-			rank = i
-			break
+			return i
 		}
 	}
-	if rank < slots {
-		// Admitted: reserve the slot until status.candidateRevision is visible.
-		if r.budgetReservations == nil {
-			r.budgetReservations = map[string]string{}
-		}
-		r.budgetReservations[self] = rev
-		return false, ctrl.Result{}, nil
-	}
-	return true, r.queueRollout(ctx, dm), nil
+	return len(all) // unreachable
 }
 
 // syncReservationsLocked drops reservations whose admission is now durable and
@@ -264,7 +321,10 @@ func (r *DecisionModelReconciler) listInScope(
 // just-persisted admission (status.candidateRevision) is never missed by a lagging
 // manager cache — the cross-leader correctness read for the rollout budget. It
 // requires no new RBAC (the operator already lists/watches DecisionModels) and
-// runs only on an admission decision, not every reconcile.
+// runs only when the cheap cached phase-1 check would ADMIT, to confirm the slot
+// is really free — never on a queued DM's steady-state re-decide (which stays on
+// the cached List), so a fleet of queued DecisionModels does not hammer the API
+// server with uncached Lists every requeue.
 func (r *DecisionModelReconciler) listInScopeUncached(
 	ctx context.Context,
 	list *decisionmodelv1alpha1.DecisionModelList,

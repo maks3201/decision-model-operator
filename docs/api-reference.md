@@ -292,6 +292,7 @@ _Appears in:_
 | `hash` _string_ | Hash is the demoted revision's hash. |  |  |
 | `promotedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#time-v1-meta)_ | PromotedAt is when the newer revision was promoted (this one demoted). |  | Optional: \{\} <br /> |
 | `revision` _[RevisionStatus](#revisionstatus)_ | Revision is the demoted revision's full recorded identity (engine, model,<br />digest, device, image, resources, placement). It is retained so that, if the<br />new stable turns out unhealthy during the stabilization window, the operator<br />can promote this revision back to stable and render its workloads from its<br />own recorded state rather than from a live Deployment that may already be<br />gone. |  | Optional: \{\} <br /> |
+| `strategy` _[RolloutStrategy](#rolloutstrategy)_ | Strategy is the rollout strategy the promotion ran under (BlueGreen or<br />Recreate). It is recorded so a rollback during the stabilization window takes<br />the strategy the rollout was actually staged with, not the strategy the live<br />spec happens to carry now (spec.rollout.strategy can change mid-rollout and is<br />not part of the revision hash). Empty is treated as BlueGreen for records<br />written by an older operator. |  | Optional: \{\} <br /> |
 
 
 #### PromotionPolicy
@@ -435,6 +436,7 @@ RolloutStrategy selects how a new revision replaces the running one.
 
 
 _Appears in:_
+- [PreviousRevisionStatus](#previousrevisionstatus)
 - [RolloutSpec](#rolloutspec)
 
 | Field | Description |

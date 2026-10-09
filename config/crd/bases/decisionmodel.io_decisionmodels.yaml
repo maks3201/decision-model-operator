@@ -2224,6 +2224,15 @@ spec:
                           version across operator upgrades under --runtime-version-policy=Pinned.
                         type: string
                     type: object
+                  strategy:
+                    description: |-
+                      Strategy is the rollout strategy the promotion ran under (BlueGreen or
+                      Recreate). It is recorded so a rollback during the stabilization window takes
+                      the strategy the rollout was actually staged with, not the strategy the live
+                      spec happens to carry now (spec.rollout.strategy can change mid-rollout and is
+                      not part of the revision hash). Empty is treated as BlueGreen for records
+                      written by an older operator.
+                    type: string
                 type: object
               recreateRollback:
                 description: |-

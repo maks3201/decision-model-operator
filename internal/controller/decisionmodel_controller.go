@@ -114,6 +114,10 @@ const (
 	reasonStartTimeout       = "StartTimeout"
 	reasonCacheTimeout       = "CacheTimeout"
 	reasonCacheSpecImmutable = "CacheSpecImmutable"
+	// reasonRecreateRollbackTimeout marks a staged Recreate rollback abandoned
+	// because the target revision never became model-ready within the Starting
+	// timeout (measured from status.recreateRollback.startedAt).
+	reasonRecreateRollbackTimeout = "RecreateRollbackTimeout"
 
 	reasonEvaluationUnsupported     = "EvaluationUnsupported"
 	reasonDatasetInvalid            = "DatasetInvalid"
@@ -175,37 +179,38 @@ const defaultAllowedRegistry = "ollaya.dev"
 
 // Event reasons (kept distinct from condition reasons for clarity).
 const (
-	eventResolved              = "Resolved"
-	eventPrefetchStarted       = "PrefetchStarted"
-	eventCached                = "Cached"
-	eventRevisionStarting      = "RevisionStarting"
-	eventPromoted              = "Promoted"
-	eventRolledBack            = "RolledBack"
-	eventFailed                = "Failed"
-	eventProbeMismatch         = "ProbeMismatch"
-	eventEvaluationStarted     = "EvaluationStarted"
-	eventEvaluationPassed      = "EvaluationPassed"
-	eventEvaluationFailed      = "EvaluationFailed"
-	eventEvaluationOnHold      = "EvaluationOnHold"
-	eventDeprecatedSecretLabel = "DeprecatedSecretLabel"
-	eventDatasetChanged        = "DatasetChanged"
-	eventResourceConflict      = "ResourceConflict"
-	eventStoreLost             = "StoreLost"
-	eventStorePrefetchFail     = "StorePrefetchFailed"
-	eventStoreTerminating      = "StoreTerminating"
-	eventRuntimeUpdate         = "RuntimeUpdateAvailable"
-	eventStabilized            = "Stabilized"
-	eventRolledBackPromo       = "RolledBackAfterPromotion"
-	eventCandidateRejected     = "CandidateRejected"
-	eventCandidateSuperseded   = "CandidateSuperseded"
-	eventRetryNoop             = "RetryNoop"
-	eventUnpinnedRuntimeImage  = "UnpinnedRuntimeImage"
-	eventServingImageApplied   = "ServingImageApplied"
-	eventReplicasCoLocated     = "ReplicasCoLocated"
-	eventStableStopped         = "StableStopped"
-	eventStableRestored        = "StableRestored"
-	eventManifestRepaired      = "ManifestRepaired"
-	eventManifestInvalid       = "ManifestInvalid"
+	eventResolved                = "Resolved"
+	eventPrefetchStarted         = "PrefetchStarted"
+	eventCached                  = "Cached"
+	eventRevisionStarting        = "RevisionStarting"
+	eventPromoted                = "Promoted"
+	eventRolledBack              = "RolledBack"
+	eventFailed                  = "Failed"
+	eventProbeMismatch           = "ProbeMismatch"
+	eventEvaluationStarted       = "EvaluationStarted"
+	eventEvaluationPassed        = "EvaluationPassed"
+	eventEvaluationFailed        = "EvaluationFailed"
+	eventEvaluationOnHold        = "EvaluationOnHold"
+	eventDeprecatedSecretLabel   = "DeprecatedSecretLabel"
+	eventDatasetChanged          = "DatasetChanged"
+	eventResourceConflict        = "ResourceConflict"
+	eventStoreLost               = "StoreLost"
+	eventStorePrefetchFail       = "StorePrefetchFailed"
+	eventStoreTerminating        = "StoreTerminating"
+	eventRuntimeUpdate           = "RuntimeUpdateAvailable"
+	eventStabilized              = "Stabilized"
+	eventRecreateRollbackTimeout = "RecreateRollbackTimeout"
+	eventRolledBackPromo         = "RolledBackAfterPromotion"
+	eventCandidateRejected       = "CandidateRejected"
+	eventCandidateSuperseded     = "CandidateSuperseded"
+	eventRetryNoop               = "RetryNoop"
+	eventUnpinnedRuntimeImage    = "UnpinnedRuntimeImage"
+	eventServingImageApplied     = "ServingImageApplied"
+	eventReplicasCoLocated       = "ReplicasCoLocated"
+	eventStableStopped           = "StableStopped"
+	eventStableRestored          = "StableRestored"
+	eventManifestRepaired        = "ManifestRepaired"
+	eventManifestInvalid         = "ManifestInvalid"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -481,15 +486,12 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// token clears failedRevision only when the spec returned to the stable revision.
 	r.applyRetryToken(ctx, &dm, isStable)
 
-	// A staged Recreate rollback in progress (the new stable turned unhealthy in
-	// its stabilization window and was torn down to free the GPU for the previous
-	// revision) is authoritative: finish it before any other dispatch. It renders
-	// the target (recorded stable) and switches the Service to it only once it is
-	// model-ready, then clears the marker. Driven here so it works regardless of
-	// whether the current spec also recorded a FailedRevision.
-	if dm.Status.RecreateRollback != nil && stable != nil &&
-		dm.Status.RecreateRollback.Target == stable.Hash {
-		return r.reconcileRecreateRollback(ctx, &dm, eng, stable, apiKey)
+	// A staged Recreate rollback (the new stable turned unhealthy in its
+	// stabilization window and was torn down to free the GPU for the previous
+	// revision) is authoritative: finish it before any other dispatch, regardless
+	// of whether the current spec also recorded a FailedRevision.
+	if handled, res, derr := r.dispatchRecreateRollback(ctx, &dm, eng, stable, apiKey, storeLost, storeTerminating); handled {
+		return res, derr
 	}
 
 	// Do not automatically retry a revision that already failed. A spec change
@@ -570,22 +572,43 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 	// candidate repeatedly re-specced while queued writes neither (no leak). The
 	// manifest persist is a no-op when there is nothing verified to write (hard pin
 	// / reused digest / moved tag): the prefetch then falls back to pull-by-tag.
-	// The candidateRevision write is the durable admission record (A-079), counted
-	// through an uncached List, so recording it before the PVC/Job makes
-	// --max-concurrent-rollouts a hard limit across leaders.
+	// The candidateRevision write is the durable admission record; the budget's
+	// phase-2 uncached List counts it, so recording it before the PVC/Job makes
+	// --max-concurrent-rollouts a hard limit across leaders (under leader election,
+	// where exactly one manager admits at a time; without leader election two
+	// managers could each pass their own uncached read before the other's write
+	// landed).
 	if dm.Status.CandidateRevision == nil || dm.Status.CandidateRevision.Hash != rev {
 		if err := r.persistCandidateManifest(ctx, dm, rev, candidate.Digest); err != nil {
+			// The admission did not become durable, so the same-process slot
+			// reservation would otherwise be held across every retry (syncReservations
+			// only drops it once a durable candidate is visible, which never happens
+			// here). Release it so a persistent manifest-write failure cannot pin a
+			// rollout slot; the next reconcile re-counts and re-reserves if it still
+			// wins the budget. Same for the conflict / error / not-persisted returns
+			// below.
+			r.releaseReservation(dm.Namespace, dm.Name)
 			return r.finish(ctx, dm, ctrl.Result{}, err)
+		}
+		// Replacing an in-flight candidate (A) with a different one (B): A's manifest
+		// ConfigMap would otherwise be stranded if A never got a store PVC for
+		// gcRevisions to key off (a budget-queued candidate that was admitted then
+		// re-specced). Mark A's hash so gcRevisions deletes <dm>-manifest-<A> by name.
+		if old := dm.Status.CandidateRevision; old != nil && old.Hash != rev {
+			markManifestAbandoned(ctx, old.Hash)
 		}
 		dm.Status.CandidateRevision = candidate
 		persisted, conflict, perr := r.persistStatus(ctx, dm)
 		if conflict {
+			r.releaseReservation(dm.Namespace, dm.Name)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		if perr != nil {
+			r.releaseReservation(dm.Namespace, dm.Name)
 			return r.finish(ctx, dm, ctrl.Result{}, perr)
 		}
 		if !persisted {
+			r.releaseReservation(dm.Namespace, dm.Name)
 			return ctrl.Result{}, nil
 		}
 		// The admission write advanced the live resourceVersion; refresh the
