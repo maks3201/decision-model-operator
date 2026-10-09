@@ -4,11 +4,12 @@ description: >-
   Kubernetes Operator for Ollaya-served System-1 decision models (DecisionModel
   CRD).
 type: application
-version: 0.3.0
-appVersion: 0.3.0
+version: 0.4.0
+appVersion: 0.4.0
 kubeVersion: '>=1.29.0-0'
 home: https://maks3201.github.io/decision-model-operator/
-icon: https://raw.githubusercontent.com/maks3201/decision-model-operator/main/docs/assets/logo.png
+icon: >-
+  https://raw.githubusercontent.com/maks3201/decision-model-operator/main/docs/assets/logo.png
 sources:
   - https://github.com/maks3201/decision-model-operator
 keywords:
@@ -32,7 +33,7 @@ annotations:
   artifacthub.io/prerelease: 'false'
   artifacthub.io/images: |
     - name: manager
-      image: ghcr.io/maks3201/decision-model-operator:v0.3.0 # x-release-please-version
+      image: ghcr.io/maks3201/decision-model-operator:v0.4.0 # x-release-please-version
       platforms:
         - linux/amd64
         - linux/arm64
