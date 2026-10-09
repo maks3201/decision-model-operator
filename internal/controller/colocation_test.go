@@ -111,4 +111,68 @@ func TestApplyColocation(t *testing.T) {
 			t.Fatalf("expected 1 term after a repeated apply, got %d", len(terms))
 		}
 	})
+
+	t.Run("does not mutate the source affinity (no aliasing)", func(t *testing.T) {
+		// Simulate applyScheduling/freezeFromLive: spec.Affinity aliases a shared
+		// object (dm.Spec or the informer cache).
+		shared := &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   "topology.kubernetes.io/zone",
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+			}},
+		}}
+		spec := &corev1.PodSpec{Affinity: shared}
+		applyColocation(spec, labels, 2, rwo)
+		// The shared object must be unchanged: still exactly its one user term.
+		if n := len(shared.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution); n != 1 {
+			t.Fatalf("source affinity mutated: user pod-affinity terms = %d, want 1", n)
+		}
+		if hasColocationTerm(shared, labels) {
+			t.Errorf("source affinity gained our co-location term (aliasing write)")
+		}
+		// The rendered spec got its own copy with both terms.
+		if !hasColocationTerm(spec.Affinity, labels) {
+			t.Errorf("rendered spec missing the co-location term")
+		}
+		if spec.Affinity == shared {
+			t.Errorf("rendered spec still points at the shared affinity (not deep-copied)")
+		}
+	})
+
+	t.Run("removes our term on 2 -> 1, keeps user terms", func(t *testing.T) {
+		spec := &corev1.PodSpec{}
+		applyColocation(spec, labels, 2, rwo)
+		if !hasColocationTerm(spec.Affinity, labels) {
+			t.Fatalf("term not added at replicas 2")
+		}
+		applyColocation(spec, labels, 1, rwo) // scale down
+		if spec.Affinity != nil {
+			t.Errorf("affinity not collapsed to nil after removing our only term, got %+v", spec.Affinity)
+		}
+	})
+
+	t.Run("removes our term on RWO 2 -> RWX 2 so replicas can spread", func(t *testing.T) {
+		spec := &corev1.PodSpec{}
+		applyColocation(spec, labels, 2, rwo)
+		applyColocation(spec, labels, 2, rwx) // switch to shareable
+		if hasColocationTerm(spec.Affinity, labels) {
+			t.Errorf("co-location term not removed after switching to ReadWriteMany")
+		}
+	})
+
+	t.Run("keeps user terms when removing ours", func(t *testing.T) {
+		userTerm := corev1.PodAffinityTerm{
+			TopologyKey:   "topology.kubernetes.io/zone",
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		}
+		spec := &corev1.PodSpec{Affinity: &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{userTerm},
+		}}}
+		applyColocation(spec, labels, 2, rwo) // adds ours (now 2 terms)
+		applyColocation(spec, labels, 1, rwo) // removes ours (back to the user term)
+		terms := spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		if len(terms) != 1 || terms[0].TopologyKey != "topology.kubernetes.io/zone" {
+			t.Fatalf("user term not preserved after removing ours: %+v", terms)
+		}
+	})
 }

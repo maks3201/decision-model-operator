@@ -204,4 +204,58 @@ var _ = Describe("replicas co-location on a ReadWriteOnce store", func() {
 		}
 		Expect(sawCoLocated).To(BeTrue(), "ReplicasCoLocated Event emitted on the transition into co-location")
 	})
+
+	It("removes the co-location term on scale 2 -> 1 (RWO), keeping a user affinity", func() {
+		eng := newFakeEngine()
+		r := newReconciler(eng)
+		userAff := &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   "topology.kubernetes.io/zone",
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+			}},
+		}}
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "down"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(2),
+				Scheduling: &decisionmodelv1alpha1.SchedulingSpec{Affinity: userAff},
+			},
+		})).To(Succeed())
+		rev, _ := driveToDeployment(r, "down")
+		Expect(hasColocationTerm(getDep("down", rev).Spec.Template.Spec.Affinity, revisionLabels(getDM("down"), rev))).To(BeTrue())
+
+		Expect(updateDM(ctx, namespace, "down", func(d *decisionmodelv1alpha1.DecisionModel) {
+			one := int32(1)
+			d.Spec.Replicas = &one
+		})).To(Succeed())
+		Eventually(func() bool {
+			rec(r, "down")
+			return hasColocationTerm(getDep("down", rev).Spec.Template.Spec.Affinity, revisionLabels(getDM("down"), rev))
+		}, "5s", "50ms").Should(BeFalse(), "co-location term removed on scale down")
+		// User term preserved.
+		terms := getDep("down", rev).Spec.Template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		Expect(terms).To(HaveLen(1))
+		Expect(terms[0].TopologyKey).To(Equal("topology.kubernetes.io/zone"))
+	})
+
+	It("does not rewrite the Deployment once co-location is applied (no update loop)", func() {
+		eng := newFakeEngine()
+		r := newReconciler(eng)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "loop"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(2),
+			},
+		})).To(Succeed())
+		rev, _ := driveToDeployment(r, "loop")
+		Expect(hasColocationTerm(getDep("loop", rev).Spec.Template.Spec.Affinity, revisionLabels(getDM("loop"), rev))).To(BeTrue())
+
+		// After co-location is applied, further reconciles must not rewrite the
+		// Deployment (its resourceVersion stays put): applyColocation is a no-op
+		// when the desired state already matches.
+		before := getDep("loop", rev).ResourceVersion
+		rec(r, "loop")
+		rec(r, "loop")
+		Expect(getDep("loop", rev).ResourceVersion).To(Equal(before), "no needless Deployment update after co-location")
+	})
 })
