@@ -65,6 +65,13 @@ type Params struct {
 	RuntimeVersion string
 	// CacheClaimName is the PVC holding the model store.
 	CacheClaimName string
+	// ManifestConfigMap, if set, names the ConfigMap key holding this revision's
+	// raw manifest (sha256 == Model.Digest). The prefetch Job mounts it read-only
+	// and seeds the store from it instead of carrying the bytes in an environment
+	// variable (argv/env strings are capped at 128 KiB on Linux). The controller
+	// sets it only after the ConfigMap is persisted and verified; empty means
+	// "seed from Model.Manifest if present, else pull by tag and verify".
+	ManifestConfigMap *corev1.ConfigMapKeySelector
 	// StoreSubPath isolates this revision's model store inside the PVC
 	// (mounted via volumeMount.subPath). The controller sets it to the revision
 	// hash, so a tag that moved upstream cannot overwrite the manifest a stable

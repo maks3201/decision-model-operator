@@ -24,8 +24,10 @@ Every minor release starts as a release candidate; patches may skip it when the 
 
 1. Tag `vX.Y.0-rc.N` from `main` (GitHub pre-release, image `:vX.Y.0-rc.N`).
 2. Validate the RC against the checklist in §3 using **the published artifacts**, not a source build.
-3. Problems → fix on `main`, next `rc.N+1`. No final release from a commit that was not an RC (for minors).
-4. Final `vX.Y.0` = the last RC's commit, via the Release Please PR.
+3. Problems → fix on `main`, next `rc.N+1`. No final release from code that was not an RC (for minors).
+4. Final `vX.Y.0` = the Release Please PR rebased onto the last RC's commit (`gh pr update-branch <N> --rebase`):
+   the release commit adds only the changelog and version bumps on top of that RC, so the application code is
+   identical to the RC. Any other commit between the RC and the release PR means a new RC.
 
 ## 3. Go / no-go checklist
 
