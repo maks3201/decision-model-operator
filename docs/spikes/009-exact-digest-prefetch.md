@@ -1,5 +1,11 @@
 # Spike 009 — exact-digest prefetch and moved-tag recovery
 
+> **Correction (2026-10-09).** The Ollaya maintainers state that `ollaya pull <tag>` always fetches the tag's
+> manifest, downloads its blobs and writes it over the on-disk one (`pull_one` in
+> `crates/ollaya-registry/src/pull.rs`; ollaya-dev/ollaya#64), and that they will not support the seeded-manifest
+> behaviour. Q4 below most likely observed a store whose blobs were already present, so nothing was fetched. Do
+> not rely on Q4: a lost store with a moved tag fails with `UpstreamTagMoved` and is not rebuilt.
+
 Tested 2026-10-07 on macOS arm64 (OrbStack) against `ghcr.io/ollaya-dev/ollaya:0.10.0`
 (the current default runtime) and `:0.12.0`, CPU path only. The question: prefetch
 pulls by **tag** and then verifies `sha256(manifest)` against the recorded digest.
