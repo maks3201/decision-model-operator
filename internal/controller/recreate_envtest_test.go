@@ -512,4 +512,132 @@ var _ = Describe("Recreate rollout strategy", func() {
 		rec(r2, "rs")
 		Expect(depExists("rs", rev2)).To(BeTrue(), "candidate started after the stable Pods are gone")
 	})
+
+	It("fails a staged Recreate rollback whose target never becomes model-ready, clearing the marker", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rto"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "rto")
+		rev2 := driveRecreatePromote(r, pr, "rto", rev1, "10.0.7.2")
+
+		// New stable turns unhealthy -> staged rollback to rev1.
+		settleDeployment("rto", rev2)
+		deleteStablePod("rto", rev2)
+		rec(r, "rto")
+		clock.add(postPromotionDebounce + time.Minute)
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "rto")
+			return getDM("rto").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil())
+
+		// Free the GPU (failed Pods gone) but NEVER make the target model-ready, so
+		// the rollback waits. Advancing past the Starting timeout (from
+		// recreateRollback.startedAt) abandons the rollback: Failed + marker cleared.
+		deleteStablePod("rto", rev2)
+		clock.add(startingTimeout(getDM("rto")) + time.Minute)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "rto")
+			return getDM("rto").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseFailed), "rollback abandoned after the timeout")
+		Expect(getDM("rto").Status.RecreateRollback).To(BeNil(), "stale rollback marker cleared on timeout")
+		deg := meta_Find(getDM("rto"), decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg).NotTo(BeNil())
+		Expect(deg.Reason).To(Equal(reasonRecreateRollbackTimeout))
+	})
+
+	It("re-deletes the failed revision's workloads at the top of the rollback (crash-safe) and never starts the target before they are gone", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rcr"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "rcr")
+		rev2 := driveRecreatePromote(r, pr, "rcr", rev1, "10.0.8.2")
+
+		// Stage the rollback, but simulate a crash between rollbackToPrevious's
+		// status persist and its deleteRevisionWorkloads: the marker is set yet the
+		// failed revision's Deployment + a serving Pod still exist.
+		settleDeployment("rcr", rev2)
+		deleteStablePod("rcr", rev2)
+		rec(r, "rcr")
+		clock.add(postPromotionDebounce + time.Minute)
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "rcr")
+			return getDM("rcr").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil())
+		// Re-create a serving Pod for the failed revision to mimic a delete that did
+		// not take (crash before/within the delete): the failed revision still holds
+		// the GPU.
+		gatedPod("rcr", rev2, "10.0.8.9")
+
+		// The rollback must re-issue the delete at its top and NOT scale the target
+		// up while the failed Pod is present (its Deployment lingers at 0 from the
+		// window; it must stay at 0 until the GPU is free).
+		rec(r, "rcr")
+		Expect(depReplicas("rcr", rev1)).To(Equal(int32(0)),
+			"target not scaled up while the failed revision's Pods still hold the GPU")
+		// The failed revision's Deployment is (re)deleted.
+		Eventually(func() bool {
+			rec(r, "rcr")
+			return depExists("rcr", rev2)
+		}, "5s", "50ms").Should(BeFalse(), "failed revision workloads re-deleted at the top of the rollback")
+
+		// Once the failed Pod is gone, the target scales up and the Service switches.
+		deleteStablePod("rcr", rev2)
+		rec(r, "rcr")
+		Expect(depReplicas("rcr", rev1)).To(Equal(int32(1)), "target scaled up after the GPU is free")
+		gatedPod("rcr", rev1, "10.0.8.3")
+		Eventually(func() string {
+			rec(r, "rcr")
+			return svcRev("rcr")
+		}, "5s", "50ms").Should(Equal(rev1))
+	})
+
+	It("clears a stale RecreateRollback marker whose target no longer matches the stable", func() {
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "stale"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "stale")
+
+		// Inject a staged-rollback marker whose Target does not match the recorded
+		// stable (e.g. a status edit, or the stable moved under it). It could never
+		// be driven (the dispatch guard requires Target == stable.Hash), so a
+		// reconcile must clear it rather than leave the DM wedged.
+		Expect(updateDMStatus(ctx, namespace, "stale", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.RecreateRollback = &decisionmodelv1alpha1.RecreateRollbackStatus{
+				Failed: "deadbeef", Target: "notthestable",
+			}
+		})).To(Succeed())
+
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "stale")
+			return getDM("stale").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil(), "stale marker cleared")
+		// The DM keeps serving its stable; the stale marker did not break it.
+		Expect(getDM("stale").Status.StableRevision.Hash).To(Equal(rev1))
+		Expect(getDM("stale").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseReady))
+	})
 })

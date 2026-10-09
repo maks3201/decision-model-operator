@@ -25,7 +25,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	batchv1 "k8s.io/api/batch/v1"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 	"github.com/maks3201/decision-model-operator/internal/engine"
@@ -100,8 +103,17 @@ func (r *DecisionModelReconciler) ensureManifestConfigMap(
 // given (already digest-verified) bytes. On AlreadyExists it checks ownership: a
 // foreign ConfigMap with our name is a conflict (never overwritten); an owned one
 // is invalid (the caller only reaches here when manifestBytes returned nil), so it
-// is deleted and recreated so exact-digest recovery is restored rather than
-// silently degrading to pull-by-tag.
+// is repaired by delete-then-recreate so exact-digest recovery is restored rather
+// than silently degrading to pull-by-tag. The delete carries a UID+resourceVersion
+// precondition so it can only remove the exact object we inspected, never a
+// replacement a concurrent writer created in between.
+//
+// A prefetch Job for the revision may already mount this ConfigMap. Deleting and
+// recreating the ConfigMap under the same name keeps a running Job Pod's existing
+// mount valid, but a Job Pod created in the delete→recreate gap (a retry/backoff
+// restart) could fail to mount. So when a Job exists, after recreating the
+// ConfigMap we delete the Job too (option b): it is recreated by the normal
+// prefetch path and re-mounts the now-correct ConfigMap, closing the race.
 func (r *DecisionModelReconciler) writeManifestConfigMap(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -135,16 +147,59 @@ func (r *DecisionModelReconciler) writeManifestConfigMap(
 	if !ownedBy(live, dm) {
 		return r.conflictIfNotOwned(ctx, dm, live, "ConfigMap")
 	}
-	// Ours but invalid (manifestBytes was nil): delete and recreate so the stored
-	// bytes match the recorded digest again. Deleting by the live object (with its
-	// resourceVersion) avoids racing a concurrent writer.
-	if derr := r.Delete(ctx, live); derr != nil && !apierrors.IsNotFound(derr) {
+	// Delete the exact live object (UID + resourceVersion precondition), then
+	// recreate it so the stored bytes match the recorded digest again. The
+	// precondition fails the delete if a concurrent writer replaced the object
+	// since the Get above, so we never delete someone else's newer ConfigMap.
+	precond := client.Preconditions{UID: &live.UID, ResourceVersion: &live.ResourceVersion}
+	if derr := r.Delete(ctx, live, precond); derr != nil && !apierrors.IsNotFound(derr) {
 		return derr
 	}
 	r.event(ctx, dm, corev1.EventTypeNormal, eventManifestRepaired,
 		"repaired the model manifest for revision %s (recreated from the verified manifest)", rev)
 	if cerr := r.Create(ctx, cm); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
 		return cerr
+	}
+	// If a prefetch Job for this revision already exists it may have been created
+	// against the now-replaced ConfigMap; delete it so it is recreated and mounts
+	// the repaired ConfigMap, rather than a Pod retry racing the delete→recreate
+	// gap. Idempotent: a NotFound is fine, and deleting an owned Job is safe (the
+	// prefetch is restartable). Only our Job is touched.
+	if derr := r.deletePrefetchJobIfOwned(ctx, dm, rev); derr != nil {
+		return derr
+	}
+	return nil
+}
+
+// deletePrefetchJobIfOwned deletes the prefetch Job for a revision when it exists
+// and is owned by this DM (propagation Background so its Pods go too). Read
+// through the uncached APIReader so a just-created Job is seen. A NotFound is
+// ignored; a foreign Job with our name is left untouched.
+func (r *DecisionModelReconciler) deletePrefetchJobIfOwned(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) error {
+	rdr, err := r.reader()
+	if err != nil {
+		return err
+	}
+	job := &batchv1.Job{}
+	key := types.NamespacedName{Namespace: dm.Namespace, Name: prefetchName(dm, rev)}
+	if gerr := rdr.Get(ctx, key, job); gerr != nil {
+		if apierrors.IsNotFound(gerr) {
+			return nil
+		}
+		return gerr
+	}
+	if !ownedBy(job, dm) {
+		return nil
+	}
+	policy := metav1.DeletePropagationBackground
+	precond := client.Preconditions{UID: &job.UID, ResourceVersion: &job.ResourceVersion}
+	if derr := r.Delete(ctx, job, precond, &client.DeleteOptions{PropagationPolicy: &policy}); derr != nil &&
+		!apierrors.IsNotFound(derr) && !apierrors.IsConflict(derr) {
+		return derr
 	}
 	return nil
 }
@@ -215,8 +270,8 @@ func (r *DecisionModelReconciler) manifestBytes(
 
 // seedManifest points the prefetch Job at the persisted manifest for rev so it
 // can rebuild EXACTLY the recorded digest. When an owned, digest-verified
-// ConfigMap exists it sets params.ManifestConfigMap (the Job mounts it read-only,
-// B-070) AND params.Model.Manifest (kept for the env/seed fallback and for engines
+// ConfigMap exists it sets params.ManifestConfigMap (the Job mounts it read-only)
+// AND params.Model.Manifest (kept for the env/seed fallback and for engines
 // that read the bytes directly). A missing/foreign/stale ConfigMap leaves both
 // empty (pull-by-tag fallback). It only READS: the ConfigMap is written on the
 // admitted candidate path (persistCandidateManifest) before the prefetch Job, so
@@ -284,7 +339,10 @@ func (r *DecisionModelReconciler) deleteManifestConfigMapIfOwned(
 	if !ownedBy(cm, dm) {
 		return nil
 	}
-	if derr := r.Delete(ctx, cm); derr != nil && !apierrors.IsNotFound(derr) {
+	// Delete the exact object we inspected (UID + resourceVersion precondition),
+	// so a concurrent recreate under the same name is not deleted by mistake.
+	precond := client.Preconditions{UID: &cm.UID, ResourceVersion: &cm.ResourceVersion}
+	if derr := r.Delete(ctx, cm, precond); derr != nil && !apierrors.IsNotFound(derr) {
 		return derr
 	}
 	return nil

@@ -412,7 +412,7 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	// 0, free the GPU, bring the target up, switch the Service only when it is
 	// model-ready) via a durable marker; the stable path drives the remaining
 	// steps restart-safely. Do NOT switch the Service here.
-	if rolloutStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate {
+	if rollbackStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate {
 		startedAt := metav1.NewTime(r.now())
 		dm.Status.RecreateRollback = &decisionmodelv1alpha1.RecreateRollbackStatus{
 			Failed: failed.Hash, Target: prev.Hash, StartedAt: &startedAt,

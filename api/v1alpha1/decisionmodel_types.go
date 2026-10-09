@@ -521,6 +521,14 @@ type PreviousRevisionStatus struct {
 	// gone.
 	// +optional
 	Revision *RevisionStatus `json:"revision,omitempty"`
+	// Strategy is the rollout strategy the promotion ran under (BlueGreen or
+	// Recreate). It is recorded so a rollback during the stabilization window takes
+	// the strategy the rollout was actually staged with, not the strategy the live
+	// spec happens to carry now (spec.rollout.strategy can change mid-rollout and is
+	// not part of the revision hash). Empty is treated as BlueGreen for records
+	// written by an older operator.
+	// +optional
+	Strategy RolloutStrategy `json:"strategy,omitempty"`
 }
 
 // RecreateRollbackStatus is the durable state of a staged Recreate rollback: the

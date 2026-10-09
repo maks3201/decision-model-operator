@@ -50,6 +50,7 @@ const (
 	metricPhaseDurationSeconds    = "decisionmodel_phase_duration_seconds"
 	metricEvaluationAccuracy      = "decisionmodel_evaluation_accuracy"
 	metricEvaluationECE           = "decisionmodel_evaluation_ece"
+	metricEvaluationMacroF1       = "decisionmodel_evaluation_macro_f1"
 	metricProbeResultsTotal       = "decisionmodel_probe_results_total"
 	metricRegistryResolveDuration = "decisionmodel_registry_resolve_duration_seconds"
 	metricRevisionInfo            = "decisionmodel_revision_info"
@@ -78,6 +79,11 @@ const (
 	rolloutRolledBack               = "rolled_back"
 	rolloutFailed                   = "failed"
 	rolloutRolledBackAfterPromotion = "rolled_back_after_promotion"
+	// Recreate strategy capacity management (bounded: two fixed values added to the
+	// existing decisionmodel_rollouts_total result label — no new metric, no
+	// unbounded cardinality).
+	rolloutStableStopped  = "stable_stopped"
+	rolloutStableRestored = "stable_restored"
 )
 
 // Probe result label values.
@@ -144,6 +150,13 @@ var (
 		Help: "Expected Calibration Error of the last completed evaluation (decimal in [0,1]).",
 	}, []string{labelNamespace, labelName})
 
+	evaluationMacroF1Gauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metricEvaluationMacroF1,
+		Help: "Macro-averaged F1 of the last completed evaluation over choice/bool " +
+			"questions (decimal in [0,1]). Not exported when the dataset had no " +
+			"classifiable question.",
+	}, []string{labelNamespace, labelName})
+
 	probeResultsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricProbeResultsTotal,
 		Help: "Total model-readiness probe results by outcome " +
@@ -172,6 +185,7 @@ func init() {
 		phaseDurationSeconds,
 		evaluationAccuracyGauge,
 		evaluationECEGauge,
+		evaluationMacroF1Gauge,
 		probeResultsTotal,
 		registryResolveDuration,
 		revisionInfoGauge,
@@ -201,6 +215,14 @@ func recordStatusMetrics(dm *decisionmodelv1alpha1.DecisionModel) {
 		}
 		if v, err := strconv.ParseFloat(e.ECE, 64); err == nil {
 			evaluationECEGauge.WithLabelValues(ns, name).Set(v)
+		}
+		// Macro-F1 is only meaningful when the dataset had a classifiable question;
+		// status leaves MacroF1 empty otherwise. Do NOT export a stale 0: set the
+		// gauge when present, delete the series when absent.
+		if v, err := strconv.ParseFloat(e.MacroF1, 64); err == nil {
+			evaluationMacroF1Gauge.WithLabelValues(ns, name).Set(v)
+		} else {
+			evaluationMacroF1Gauge.DeleteLabelValues(ns, name)
 		}
 	}
 
@@ -235,6 +257,7 @@ func deleteMetrics(namespace, name string) {
 	phaseDurationSeconds.DeletePartialMatch(l)
 	evaluationAccuracyGauge.DeletePartialMatch(l)
 	evaluationECEGauge.DeletePartialMatch(l)
+	evaluationMacroF1Gauge.DeletePartialMatch(l)
 	probeResultsTotal.DeletePartialMatch(l)
 	revisionInfoGauge.DeletePartialMatch(l)
 }
