@@ -372,10 +372,32 @@ spec:
                           baseline; empty disables the relative ECE gate.
                         pattern: ^(0(\.[0-9]+)?|1(\.0+)?)$
                         type: string
+                      maxMacroF1Drop:
+                        description: |-
+                          MaxMacroF1Drop is the maximum tolerated macro-F1 drop vs the stable baseline
+                          (decimal string, e.g. "0.05"). Like maxAccuracyDrop it is only enforced when
+                          a stable revision exists to provide a baseline; empty means no drop
+                          constraint. Macro-F1 is computed over choice and bool (noul) questions only;
+                          if the dataset has no such question a configured gate fails with a clear
+                          reason.
+                        pattern: ^(0(\.[0-9]+)?|1(\.0+)?)$
+                        type: string
                       minAccuracy:
                         description: |-
                           MinAccuracy is the minimum accuracy (decimal string in [0,1], e.g. "0.90")
                           the candidate must reach to be promoted.
+                        pattern: ^(0(\.[0-9]+)?|1(\.0+)?)$
+                        type: string
+                      minMacroF1:
+                        description: |-
+                          MinMacroF1 is the minimum macro-averaged F1 (decimal string in [0,1], e.g.
+                          "0.80") the candidate must reach to be promoted. Macro-F1 weights every
+                          class equally, so unlike accuracy it does not hide a class the model never
+                          predicts. It is computed over choice and bool (noul) questions only; score
+                          questions are excluded (there is no class to average). If the dataset has no
+                          choice or bool question, a configured macro-F1 gate fails with a clear
+                          reason rather than passing silently. Empty disables the absolute macro-F1
+                          gate.
                         pattern: ^(0(\.[0-9]+)?|1(\.0+)?)$
                         type: string
                       scoreTolerance:
@@ -1718,6 +1740,10 @@ spec:
                     description: BaselineECE is the stable revision's ECE for this
                       dataset, if known.
                     type: string
+                  baselineMacroF1:
+                    description: BaselineMacroF1 is the stable revision's macro-F1
+                      for this dataset, if known.
+                    type: string
                   brier:
                     description: Brier is the candidate's Brier score (decimal string).
                     type: string
@@ -1731,6 +1757,14 @@ spec:
                     type: integer
                   cases:
                     description: Cases is the number of questions scored.
+                    format: int32
+                    type: integer
+                  classifiableCases:
+                    description: |-
+                      ClassifiableCases is the number of scored choice/bool records that fed
+                      macro-F1. A macro-F1 gate (minMacroF1 / maxMacroF1Drop) does not pass when
+                      this is 0: macro-F1 over no class is 0, which would otherwise either fail an
+                      absolute floor spuriously or look like a perfect no-drop.
                     format: int32
                     type: integer
                   completedAt:
@@ -1753,6 +1787,11 @@ spec:
                       wrong or unanswerable.
                     format: int32
                     type: integer
+                  macroF1:
+                    description: |-
+                      MacroF1 is the candidate's macro-averaged F1 over choice and bool questions
+                      (decimal string). Empty when the dataset has no classifiable question.
+                    type: string
                   maxAccuracyDrop:
                     description: MaxAccuracyDrop echoes the accuracy-drop limit the
                       gate applied, if any.
@@ -1765,8 +1804,16 @@ spec:
                     description: MaxECEIncrease echoes the relative ECE-increase limit
                       the gate applied, if any.
                     type: string
+                  maxMacroF1Drop:
+                    description: MaxMacroF1Drop echoes the macro-F1-drop limit the
+                      gate applied, if any.
+                    type: string
                   minAccuracy:
                     description: MinAccuracy echoes the accuracy floor the gate applied,
+                      if any.
+                    type: string
+                  minMacroF1:
+                    description: MinMacroF1 echoes the macro-F1 floor the gate applied,
                       if any.
                     type: string
                   policyHash:
@@ -1776,6 +1823,37 @@ spec:
                       AwaitingPromotion whose current policy hash differs is re-evaluated rather
                       than promoted on the stale result.
                     type: string
+                  questions:
+                    description: |-
+                      Questions is a bounded per-question breakdown (at most 20 entries, worst
+                      macro-F1 first) carried for visibility. It covers the choice/bool questions
+                      that fed macro-F1; score questions are not listed. Truncated is true when
+                      more questions existed than are listed.
+                    items:
+                      description: |-
+                        QuestionEvaluation is a bounded per-question entry in an EvaluationStatus: the
+                        question id, how many records it had, its accuracy and its macro-F1. Only
+                        choice/bool questions appear (the ones that feed macro-F1).
+                      properties:
+                        accuracy:
+                          description: Accuracy is the per-question accuracy (decimal
+                            string).
+                          type: string
+                        cases:
+                          description: Cases is the number of scored records for this
+                            question.
+                          format: int32
+                          type: integer
+                        id:
+                          description: ID is the question id.
+                          type: string
+                        macroF1:
+                          description: MacroF1 is the per-question macro-F1 (decimal
+                            string).
+                          type: string
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
                   reason:
                     description: Reason is the gate message (e.g. the failing comparison),
                       human-readable.
@@ -1797,6 +1875,11 @@ spec:
                       operator upgrade that changes scoring re-evaluates a parked candidate.
                     format: int32
                     type: integer
+                  truncated:
+                    description: |-
+                      Truncated is true when the Questions list was capped and does not show every
+                      classifiable question.
+                    type: boolean
                 type: object
               failedRevision:
                 description: |-

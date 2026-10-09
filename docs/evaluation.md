@@ -97,6 +97,8 @@ spec:
           key: cases.jsonl
       minAccuracy: "0.90"       # candidate must reach at least this accuracy
       maxAccuracyDrop: "0.02"   # and not drop more than this vs the stable baseline (optional)
+      minMacroF1: "0.80"        # macro-averaged F1 floor over choice/bool questions (optional)
+      maxMacroF1Drop: "0.05"    # macro-F1 must not drop more than this vs baseline (optional)
       maxECE: "0.10"            # absolute calibration gate (optional)
       maxECEIncrease: "0.05"    # calibration must not worsen this much vs baseline (optional)
       maxCases: 500             # cap on dataset lines used (optional, default 500)
@@ -109,6 +111,8 @@ Gate fields (all decimal strings in [0,1]):
 |-------------------|---------|------------|
 | `minAccuracy`     | Minimum candidate accuracy to promote. | required |
 | `maxAccuracyDrop` | Max accuracy drop vs the stable baseline. | no drop constraint |
+| `minMacroF1`      | Minimum candidate macro-F1 (choice/bool questions). | absolute macro-F1 gate off |
+| `maxMacroF1Drop`  | Max macro-F1 drop vs the stable baseline. | relative macro-F1 gate off |
 | `maxECE`          | Max absolute Expected Calibration Error. | absolute ECE gate off |
 | `maxECEIncrease`  | Max ECE increase vs the stable baseline. | relative ECE gate off |
 | `maxCases`        | First N dataset lines scored. | 500 |
@@ -143,6 +147,43 @@ the serving Pod never read different keys.
 calibration metrics: they measure whether the model's stated confidence matches
 how often it is right. Accuracy alone does not catch an over-confident model;
 the ECE gates do.
+
+## Macro-F1: catching class imbalance
+
+Accuracy hides class imbalance. If 90% of the golden cases expect `billing`, a
+router that answers `billing` every time scores 0.90 accuracy while never getting
+a single `refund` or `sales` case right. **Macro-F1** averages the per-class F1
+with every class weighted equally, so a class the model never predicts drags the
+score down regardless of how rare it is.
+
+```yaml
+spec:
+  rollout:
+    evaluation:
+      datasetRef: { configMapRef: { name: support-router-eval, key: cases.jsonl } }
+      minAccuracy: "0.90"
+      minMacroF1: "0.80"      # a majority-only predictor fails here even at 0.90 accuracy
+      maxMacroF1Drop: "0.05"  # or require it not to regress vs the stable baseline
+```
+
+- Macro-F1 is computed over **choice and bool (`noul`) questions only** — the ones
+  with a class label to average. `score` questions have no class and are excluded.
+- `maxMacroF1Drop` is a relative gate: like `maxAccuracyDrop` it is enforced only
+  when a stable revision exists to provide a baseline, and it adds the stable to
+  the baseline run (no extra evaluation).
+- **No classifiable question → the gate fails.** If a `minMacroF1` or
+  `maxMacroF1Drop` is configured but the dataset has no choice or bool question (so
+  there is nothing to average), the candidate is **rejected** with reason
+  `ClassificationUnavailable`, never promoted on a silent macro-F1 of 0 — the same
+  fail-closed rule the calibration gate uses when no case produces a probability
+  distribution.
+- `status.evaluation` records `macroF1`, `baselineMacroF1` (when a baseline ran),
+  `classifiableCases`, and a bounded `questions` list (at most 20 entries, worst
+  macro-F1 first, with `truncated: true` when more existed) for per-question
+  visibility. A gate message names the failing comparison, e.g.
+  `macroF1 0.71 < minMacroF1 0.80` or
+  `macroF1 dropped 0.06 (baseline 0.84) > maxMacroF1Drop 0.05`.
+
 
 ## Reading the result
 

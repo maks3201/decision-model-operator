@@ -338,6 +338,28 @@ type EvaluationSpec struct {
 	// +optional
 	MaxAccuracyDrop string `json:"maxAccuracyDrop,omitempty"`
 
+	// MinMacroF1 is the minimum macro-averaged F1 (decimal string in [0,1], e.g.
+	// "0.80") the candidate must reach to be promoted. Macro-F1 weights every
+	// class equally, so unlike accuracy it does not hide a class the model never
+	// predicts. It is computed over choice and bool (noul) questions only; score
+	// questions are excluded (there is no class to average). If the dataset has no
+	// choice or bool question, a configured macro-F1 gate fails with a clear
+	// reason rather than passing silently. Empty disables the absolute macro-F1
+	// gate.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	// +optional
+	MinMacroF1 string `json:"minMacroF1,omitempty"`
+
+	// MaxMacroF1Drop is the maximum tolerated macro-F1 drop vs the stable baseline
+	// (decimal string, e.g. "0.05"). Like maxAccuracyDrop it is only enforced when
+	// a stable revision exists to provide a baseline; empty means no drop
+	// constraint. Macro-F1 is computed over choice and bool (noul) questions only;
+	// if the dataset has no such question a configured gate fails with a clear
+	// reason.
+	// +kubebuilder:validation:Pattern=`^(0(\.[0-9]+)?|1(\.0+)?)$`
+	// +optional
+	MaxMacroF1Drop string `json:"maxMacroF1Drop,omitempty"`
+
 	// MaxCases caps how many dataset cases are used (first N).
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=5000
@@ -512,6 +534,23 @@ const (
 	EvaluationFailed EvaluationResult = "Failed"
 )
 
+// QuestionEvaluation is a bounded per-question entry in an EvaluationStatus: the
+// question id, how many records it had, its accuracy and its macro-F1. Only
+// choice/bool questions appear (the ones that feed macro-F1).
+type QuestionEvaluation struct {
+	// ID is the question id.
+	ID string `json:"id,omitempty"`
+	// Cases is the number of scored records for this question.
+	// +optional
+	Cases int32 `json:"cases,omitempty"`
+	// Accuracy is the per-question accuracy (decimal string).
+	// +optional
+	Accuracy string `json:"accuracy,omitempty"`
+	// MacroF1 is the per-question macro-F1 (decimal string).
+	// +optional
+	MacroF1 string `json:"macroF1,omitempty"`
+}
+
 // EvaluationStatus records the outcome of an eval-gated rollout evaluation.
 type EvaluationStatus struct {
 	// Revision is the revision hash the evaluation was run against.
@@ -536,6 +575,19 @@ type EvaluationStatus struct {
 	Brier string `json:"brier,omitempty"`
 	// BaselineECE is the stable revision's ECE for this dataset, if known.
 	BaselineECE string `json:"baselineEce,omitempty"`
+	// MacroF1 is the candidate's macro-averaged F1 over choice and bool questions
+	// (decimal string). Empty when the dataset has no classifiable question.
+	// +optional
+	MacroF1 string `json:"macroF1,omitempty"`
+	// BaselineMacroF1 is the stable revision's macro-F1 for this dataset, if known.
+	// +optional
+	BaselineMacroF1 string `json:"baselineMacroF1,omitempty"`
+	// ClassifiableCases is the number of scored choice/bool records that fed
+	// macro-F1. A macro-F1 gate (minMacroF1 / maxMacroF1Drop) does not pass when
+	// this is 0: macro-F1 over no class is 0, which would otherwise either fail an
+	// absolute floor spuriously or look like a perfect no-drop.
+	// +optional
+	ClassifiableCases int32 `json:"classifiableCases,omitempty"`
 	// MinAccuracy echoes the accuracy floor the gate applied, if any.
 	// +optional
 	MinAccuracy string `json:"minAccuracy,omitempty"`
@@ -548,6 +600,23 @@ type EvaluationStatus struct {
 	// MaxECEIncrease echoes the relative ECE-increase limit the gate applied, if any.
 	// +optional
 	MaxECEIncrease string `json:"maxEceIncrease,omitempty"`
+	// MinMacroF1 echoes the macro-F1 floor the gate applied, if any.
+	// +optional
+	MinMacroF1 string `json:"minMacroF1,omitempty"`
+	// MaxMacroF1Drop echoes the macro-F1-drop limit the gate applied, if any.
+	// +optional
+	MaxMacroF1Drop string `json:"maxMacroF1Drop,omitempty"`
+	// Questions is a bounded per-question breakdown (at most 20 entries, worst
+	// macro-F1 first) carried for visibility. It covers the choice/bool questions
+	// that fed macro-F1; score questions are not listed. Truncated is true when
+	// more questions existed than are listed.
+	// +optional
+	// +listType=atomic
+	Questions []QuestionEvaluation `json:"questions,omitempty"`
+	// Truncated is true when the Questions list was capped and does not show every
+	// classifiable question.
+	// +optional
+	Truncated bool `json:"truncated,omitempty"`
 	// Result is the gate outcome: Passed or Failed.
 	// +kubebuilder:validation:Enum=Passed;Failed
 	// +optional
