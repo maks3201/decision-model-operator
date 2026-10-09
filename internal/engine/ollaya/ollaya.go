@@ -1510,16 +1510,18 @@ func prefetchResources() corev1.ResourceRequirements {
 // failure (exit 1) is retried by the Job up to backoffLimit. These values are
 // also what classifyPrefetchFailure maps back to a reason.
 const (
-	prefetchExitTransient      = 1 // network / 5xx / timeout: retry
-	prefetchExitModelNotFound  = 3 // manifest 404 / tag not found: permanent
-	prefetchExitDigestMismatch = 4 // pulled digest != expected: permanent
-	prefetchExitTagMoved       = 5 // pulled a valid but different manifest: tag moved upstream, permanent
+	prefetchExitTransient       = 1 // network / 5xx / timeout: retry
+	prefetchExitModelNotFound   = 3 // manifest 404 / tag not found: permanent
+	prefetchExitDigestMismatch  = 4 // pulled digest != expected: permanent
+	prefetchExitTagMoved        = 5 // pulled a valid but different manifest: tag moved upstream, permanent
+	prefetchExitSeedUnavailable = 6 // the seed manifest file is missing/unreadable: permanent
 
 	// String forms for embedding in the shell script (const concatenation).
-	prefetchExitTransientStr      = "1"
-	prefetchExitModelNotFoundStr  = "3"
-	prefetchExitDigestMismatchStr = "4"
-	prefetchExitTagMovedStr       = "5"
+	prefetchExitTransientStr       = "1"
+	prefetchExitModelNotFoundStr   = "3"
+	prefetchExitDigestMismatchStr  = "4"
+	prefetchExitTagMovedStr        = "5"
+	prefetchExitSeedUnavailableStr = "6"
 )
 
 // Prefetch failure reasons written to the termination message (and the last log
@@ -1530,6 +1532,11 @@ const (
 	PrefetchReasonDigestMismatch   = "DigestMismatch"
 	PrefetchReasonUpstreamTagMoved = "UpstreamTagMoved"
 	PrefetchReasonTransient        = "Transient"
+	// PrefetchReasonSeedUnavailable means the manifest seed the controller
+	// mounted (ManifestConfigMap) is missing or unreadable in the prefetch
+	// container. It is a configuration/setup fault, not a registry serving
+	// different bytes (DigestMismatch), so it carries its own permanent reason.
+	PrefetchReasonSeedUnavailable = "SeedUnavailable"
 )
 
 // prefetchScript pulls the model and verifies its digest, then optionally prunes
@@ -1605,9 +1612,9 @@ if [ -n "${MANIFEST_SEED_FILE:-}" ] || [ -n "${MANIFEST_SEED_B64:-}" ]; then
     if [ ! -r "$MANIFEST_SEED_FILE" ]; then
       echo "seed manifest file $MANIFEST_SEED_FILE is not readable" >&2
       rm -rf "$seed_tmpdir"
-      fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `
+      fail ` + PrefetchReasonSeedUnavailable + ` ` + prefetchExitSeedUnavailableStr + `
     fi
-    cat "$MANIFEST_SEED_FILE" > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
+    cat "$MANIFEST_SEED_FILE" > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonSeedUnavailable + ` ` + prefetchExitSeedUnavailableStr + `; }
   else
     printf '%s' "$MANIFEST_SEED_B64" | base64 -d > "$seed_tmp" || { rm -rf "$seed_tmpdir"; fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + `; }
   fi
@@ -1706,8 +1713,8 @@ const storeRootMount = "/store-root"
 const terminationMessagePath = "/dev/termination-log"
 
 // prefetchPodFailurePolicy fails the Job immediately on a permanent prefetch exit
-// code (a missing tag or a digest mismatch) and counts anything else toward the
-// normal retry budget. Requires RestartPolicy: Never.
+// code (a missing tag, a digest mismatch, a moved tag or an unavailable seed) and
+// counts anything else toward the normal retry budget. Requires RestartPolicy: Never.
 func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
 	return &batchv1.PodFailurePolicy{
 		Rules: []batchv1.PodFailurePolicyRule{
@@ -1715,7 +1722,7 @@ func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
 				Action: batchv1.PodFailurePolicyActionFailJob,
 				OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
 					Operator: batchv1.PodFailurePolicyOnExitCodesOpIn,
-					Values:   []int32{prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved},
+					Values:   []int32{prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved, prefetchExitSeedUnavailable},
 				},
 			},
 		},
@@ -1734,6 +1741,8 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 	switch {
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonUpstreamTagMoved):
 		return PrefetchReasonUpstreamTagMoved, true
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonSeedUnavailable):
+		return PrefetchReasonSeedUnavailable, true
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonDigestMismatch):
 		return PrefetchReasonDigestMismatch, true
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonModelNotFound):
@@ -1748,6 +1757,8 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 		return PrefetchReasonDigestMismatch, true
 	case prefetchExitModelNotFound:
 		return PrefetchReasonModelNotFound, true
+	case prefetchExitSeedUnavailable:
+		return PrefetchReasonSeedUnavailable, true
 	default:
 		return PrefetchReasonTransient, false
 	}

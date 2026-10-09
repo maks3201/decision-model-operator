@@ -321,9 +321,11 @@ func TestFileSeedWritesInsideStore(t *testing.T) {
 }
 
 // TestFileSeedRefusesUnreadableFile pins that a missing/unreadable seed file is a
-// permanent DigestMismatch (the ConfigMap is required; a missing one must not be
-// silently skipped). ollaya is NOT stubbed so a regression that fell through to
-// pull would error differently; here the script must fail before any pull.
+// permanent SeedUnavailable failure — its own reason, distinct from a registry
+// serving different bytes (DigestMismatch). The ConfigMap is required; a missing
+// one must not be silently skipped. ollaya is NOT stubbed, so a regression that
+// fell through to pull would error differently; here the script must fail before
+// any pull.
 func TestFileSeedRefusesUnreadableFile(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")
@@ -355,7 +357,7 @@ func TestFileSeedRefusesUnreadableFile(t *testing.T) {
 	if err == nil {
 		t.Fatalf("script must fail when the seed file is unreadable; output:\n%s", out)
 	}
-	if !strings.Contains(string(out), "reason: "+PrefetchReasonDigestMismatch) {
-		t.Errorf("expected a DigestMismatch reason for an unreadable seed file; output:\n%s", out)
+	if !strings.Contains(string(out), "reason: "+PrefetchReasonSeedUnavailable) {
+		t.Errorf("expected a SeedUnavailable reason for an unreadable seed file; output:\n%s", out)
 	}
 }

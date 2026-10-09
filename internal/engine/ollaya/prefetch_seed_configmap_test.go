@@ -197,6 +197,9 @@ func TestPrefetchScriptFileSeedBranch(t *testing.T) {
 		`!= "$EXPECT_DIGEST"`,       // before writing
 		`mv "$seed_tmp"`,            // atomic write to the tag path
 		`ollaya pull -- "$MODEL"`,   // then pull
+		// An unreadable/missing seed file is its own permanent reason, not a
+		// digest mismatch (exit 6 / SeedUnavailable).
+		"fail " + PrefetchReasonSeedUnavailable + " " + "6",
 	}
 	for _, w := range wants {
 		if !strings.Contains(script, w) {

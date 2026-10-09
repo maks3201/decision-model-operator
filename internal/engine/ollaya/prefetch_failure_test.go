@@ -46,9 +46,9 @@ func TestPrefetchFailFastPolicy(t *testing.T) {
 	for _, v := range rule.OnExitCodes.Values {
 		got[v] = true
 	}
-	if !got[prefetchExitModelNotFound] || !got[prefetchExitDigestMismatch] || !got[prefetchExitTagMoved] {
-		t.Errorf("fail-fast exit codes = %v, want %d, %d and %d",
-			rule.OnExitCodes.Values, prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved)
+	if !got[prefetchExitModelNotFound] || !got[prefetchExitDigestMismatch] || !got[prefetchExitTagMoved] || !got[prefetchExitSeedUnavailable] {
+		t.Errorf("fail-fast exit codes = %v, want %d, %d, %d and %d",
+			rule.OnExitCodes.Values, prefetchExitModelNotFound, prefetchExitDigestMismatch, prefetchExitTagMoved, prefetchExitSeedUnavailable)
 	}
 	if got[prefetchExitTransient] {
 		t.Errorf("transient exit %d must NOT be in the fail-fast set", prefetchExitTransient)
@@ -103,9 +103,11 @@ func TestClassifyPrefetchFailure(t *testing.T) {
 		{"upstream tag moved from message", "reason: UpstreamTagMoved\n", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from message", "reason: ModelNotFound\n", 3, PrefetchReasonModelNotFound, true},
 		{"transient from message", "reason: Transient\n", 1, PrefetchReasonTransient, false},
+		{"seed unavailable from message", "reason: SeedUnavailable\n", 6, PrefetchReasonSeedUnavailable, true},
 		{"digest mismatch from exit code only", "", 4, PrefetchReasonDigestMismatch, true},
 		{"upstream tag moved from exit code only", "", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from exit code only", "", 3, PrefetchReasonModelNotFound, true},
+		{"seed unavailable from exit code only", "", 6, PrefetchReasonSeedUnavailable, true},
 		{"transient from exit code only", "", 1, PrefetchReasonTransient, false},
 		{"unknown exit code is transient", "", 2, PrefetchReasonTransient, false},
 		{"empty is transient", "", 0, PrefetchReasonTransient, false},
