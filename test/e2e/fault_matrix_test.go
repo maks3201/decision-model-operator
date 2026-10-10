@@ -225,7 +225,9 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 			for _, s := range gates {
 				g.Expect(s).To(Equal("True"), "every serving Pod's model-ready gate must stay True (got %v)", gates)
 			}
-			g.Expect(fmEndpointCount(dm)).To(Equal(3), "the Service must keep exactly 3 ready endpoints")
+			eps := fmEndpointCount(dm)
+			g.Expect(eps).To(Equal(3),
+				"the Service must keep exactly 3 distinct ready endpoints (got %d)", eps)
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 		close(stop)
 
@@ -319,12 +321,19 @@ func fmGateStatuses(name string) []string {
 	return strings.Fields(out)
 }
 
-// fmEndpointCount returns the number of ready endpoint addresses backing the DM's
-// Service.
+// fmEndpointCount returns the number of DISTINCT ready endpoint addresses backing the
+// DM's Service. The legacy Endpoints object can, under reconcile churn, split ready
+// addresses across several subsets (so the raw flattened address list over-counts the
+// same Pod IPs); de-duplicating by IP yields the real ready-backend count, which for a
+// stable with N replicas must stay N.
 func fmEndpointCount(name string) int {
 	out, _ := utils.Kubectl("get", "endpoints", name, "-n", faultMatrixNS,
 		"-o", "jsonpath={.subsets[*].addresses[*].ip}")
-	return len(strings.Fields(out))
+	seen := map[string]struct{}{}
+	for _, ip := range strings.Fields(out) {
+		seen[ip] = struct{}{}
+	}
+	return len(seen)
 }
 
 // candidateRevisionIn returns the DM's candidate revision hash in the given
