@@ -156,3 +156,77 @@ func TestParamsRegistryDoesNotAffectExplicitHostName(t *testing.T) {
 		t.Errorf("OLLAYA_REGISTRY = %q (present=%v), want https://reg.internal:8443", got, ok)
 	}
 }
+
+// RecordedRegistry returns the registry a revision is ACTUALLY served/prefetched
+// from, which the controller records on the revision: the name's own host for an
+// explicit-host name (scheme defaulted to https, an explicit scheme kept), else
+// the engine's configured registry. For an explicit-host name this is the real
+// source (the CLI ignores OLLAYA_REGISTRY), so the recorded value — and the
+// store-recovery allow-list guard that reads it — reflect the true host.
+func TestRecordedRegistry(t *testing.T) {
+	const flag = "http://mirror:8080"
+	tests := []struct {
+		name     string
+		registry string // engine --ollaya-registry (empty = engine default)
+		model    string
+		want     string
+	}{
+		// host-less names fall back to the configured registry (the flag, or the
+		// engine default when unset).
+		{"host-less, default engine", "", "laya:en", defaultRegistryURL},
+		{"host-less, flag set", flag, "laya:en", flag},
+		{"host-less with namespace, flag set", flag, "ns/laya:en", flag},
+		// explicit-host names record the NAME's host, independent of the flag.
+		{"explicit host, no scheme -> https", flag, "custom.registry.io/ns/laya:en", "https://custom.registry.io"},
+		{"explicit host, default engine", "", "custom.registry.io/ns/laya:en", "https://custom.registry.io"},
+		{"explicit host with port -> https", flag, "registry.example.com:5000/ns/laya:en", "https://registry.example.com:5000"},
+		{"explicit http scheme kept", flag, "http://localhost:5000/ns/laya:en", "http://localhost:5000"},
+		{"explicit https scheme kept", flag, "https://reg.internal:8443/ns/laya:en", "https://reg.internal:8443"},
+		{"explicit host, default namespace", flag, "ollaya.dev/laya:en", "https://ollaya.dev"},
+		// a name that cannot parse falls back to the configured registry (the
+		// controller resolves/guards the bad name elsewhere); never returns "".
+		{"unparseable name -> configured registry", flag, "not a valid name", flag},
+		{"empty name -> configured registry", flag, "", flag},
+		{"empty name, default engine -> engine default", "", "", defaultRegistryURL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var e *Engine
+			if tt.registry == "" {
+				e = New()
+			} else {
+				e = New(WithRegistryURL(tt.registry))
+			}
+			if got := e.RecordedRegistry(tt.model); got != tt.want {
+				t.Errorf("RecordedRegistry(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+			// It must never return "" (a revision would record "unrecorded").
+			if e.RecordedRegistry(tt.model) == "" {
+				t.Errorf("RecordedRegistry(%q) returned empty", tt.model)
+			}
+		})
+	}
+}
+
+// RecordedRegistry agrees with RegistryHost on which host an explicit-host name
+// targets: the recorded registry's authority (scheme stripped) equals the host
+// RegistryHost reports, so the store-recovery guard checks the same host the
+// name resolves to.
+func TestRecordedRegistryAgreesWithRegistryHost(t *testing.T) {
+	e := New(WithRegistryURL("http://mirror:8080"))
+	for _, model := range []string{
+		"custom.registry.io/ns/laya:en",
+		"registry.example.com:5000/ns/laya:en",
+		"http://localhost:5000/ns/laya:en",
+	} {
+		rec := e.RecordedRegistry(model)
+		recHost, _ := hostFromRegistryURL(rec)
+		wantHost, _, err := e.RegistryHost(model)
+		if err != nil {
+			t.Fatalf("RegistryHost(%q) error: %v", model, err)
+		}
+		if recHost != wantHost {
+			t.Errorf("model %q: RecordedRegistry host %q != RegistryHost %q", model, recHost, wantHost)
+		}
+	}
+}

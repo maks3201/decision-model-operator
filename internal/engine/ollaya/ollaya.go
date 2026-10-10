@@ -121,6 +121,28 @@ func (e *Engine) ConfiguredRegistry() string {
 	return e.registryURL
 }
 
+// RecordedRegistry returns the registry base URL the controller should record on
+// a revision for model: the name's own host when it is an explicit-host name
+// (host/[ns/]model:tag), scheme defaulted to https, else the engine's configured
+// registry (ConfiguredRegistry). This is the registry the revision is ACTUALLY
+// served and prefetched from: for an explicit-host name the ollaya CLI pulls from
+// and serves from the name's host and ignores OLLAYA_REGISTRY entirely (the flag
+// only supplies the default for a host-LESS name — verified in the image: a pull
+// of ollaya.dev/library/laya:en succeeds with OLLAYA_REGISTRY=http://bogus and
+// writes manifests/ollaya.dev/...). Recording ConfiguredRegistry for such a name
+// is misleading and, worse, makes the store-recovery allow-list guard check the
+// flag's host instead of the real source. A name that fails to parse falls back
+// to ConfiguredRegistry (the controller resolves/guards it elsewhere). The result
+// is always a concrete URL, so a revision never records "" (never later mistaken
+// for unrecorded).
+func (e *Engine) RecordedRegistry(model string) string {
+	p, err := parseName(model)
+	if err != nil {
+		return e.ConfiguredRegistry()
+	}
+	return p.registryBase(e.ConfiguredRegistry())
+}
+
 // DefaultRegistry returns the engine's built-in default registry base URL
 // (https://ollaya.dev), independent of --ollaya-registry. The controller adopts
 // it onto a legacy stable whose live serving Pod carries no OLLAYA_REGISTRY env:
