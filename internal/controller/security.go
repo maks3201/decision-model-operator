@@ -99,6 +99,52 @@ func (r *DecisionModelReconciler) checkRegistryURLAllowed(registryURL string) (r
 	return "", ""
 }
 
+// modelNameHasExplicitHost reports whether the model name carries an explicit
+// registry host (e.g. "mirror.example.com/ns/laya:en" or "localhost:5000/laya"),
+// as opposed to a host-less name ("laya:en", "ns/laya:en") that pulls from the
+// engine's configured/default registry. It mirrors the ollaya engine's own
+// parser (looksLikeHost): the first of 2+ "/"-separated segments is a host when it
+// carries a scheme, contains "." or ":", or is "localhost". Kept in sync with
+// internal/engine/ollaya parseName; a host-less name's pull source is the recorded
+// registry, so only an explicit-host name needs the model-host allow-list check.
+func modelNameHasExplicitHost(model string) bool {
+	s := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return true
+	}
+	segs := strings.Split(s, "/")
+	if len(segs) < 2 {
+		return false
+	}
+	first := segs[0]
+	if first == "localhost" || strings.HasPrefix(first, "localhost:") {
+		return true
+	}
+	return strings.Contains(first, ".") || strings.Contains(first, ":")
+}
+
+// recoveryRegistryGuard reports whether a store-recovery pull for the stable
+// revision is still permitted under the CURRENT allow-list / insecure policy. The
+// pull host has two possible sources: the registry recorded on the revision (an
+// explicit --ollaya-registry base URL), checked always; and the model name's own
+// host, checked ONLY for an explicit-host name. A host-less name pulls from the
+// recorded registry, so RegistryHost would return the engine default (not the
+// recorded pull source) and must not be consulted — otherwise a mirror-recorded
+// stable is wrongly refused after the flag is reset to the default. Returns a
+// reason ("" when allowed) and a message.
+func (r *DecisionModelReconciler) recoveryRegistryGuard(
+	eng engine.Engine,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+) (reason, message string) {
+	if reason, message = r.checkRegistryURLAllowed(stable.Registry); reason != "" {
+		return reason, message
+	}
+	if modelNameHasExplicitHost(stable.Model) {
+		return r.checkRegistryAllowed(eng, stable.Model)
+	}
+	return "", ""
+}
+
 // checkRegistryAllowed validates the model's registry host against the
 // allow-list and insecure policy, using the engine's own parser via the
 // engine.RegistryHoster contract. It fails closed: an engine without the
