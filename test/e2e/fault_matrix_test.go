@@ -219,6 +219,20 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 		}()
 
 		By("no gate flap and endpoints stay at 3 for the whole window")
+		// On failure, dump the live Pods and Endpoints so a >3 endpoint count can be
+		// diagnosed (reconcile-driven Pod churn vs a measurement artifact).
+		DeferCleanup(func() {
+			if CurrentSpecReport().Failed() {
+				pods, _ := utils.Kubectl("get", "pods", "-n", faultMatrixNS,
+					"-l", "decisionmodel.io/name="+dm, "-o", "wide")
+				_, _ = fmt.Fprintf(GinkgoWriter, "concurrent-reconcile pods:\n%s\n", pods)
+				eps, _ := utils.Kubectl("get", "endpoints", dm, "-n", faultMatrixNS, "-o", "yaml")
+				_, _ = fmt.Fprintf(GinkgoWriter, "concurrent-reconcile endpoints:\n%s\n", eps)
+				rs, _ := utils.Kubectl("get", "rs", "-n", faultMatrixNS,
+					"-l", "decisionmodel.io/name="+dm, "-o", "wide")
+				_, _ = fmt.Fprintf(GinkgoWriter, "concurrent-reconcile replicasets:\n%s\n", rs)
+			}
+		})
 		Consistently(func(g Gomega) {
 			gates := fmGateStatuses(dm)
 			g.Expect(gates).To(HaveLen(3), "expected three serving Pods, got gates %v", gates)
