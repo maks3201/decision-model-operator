@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.0](https://github.com/maks3201/decision-model-operator/compare/v0.4.0...v0.5.0) (2026-10-10)
+
+
+### Features
+
+* **chart:** queued-rollout alert, macro-F1 in alerts and dashboard ([#97](https://github.com/maks3201/decision-model-operator/issues/97)) ([ab6bc88](https://github.com/maks3201/decision-model-operator/commit/ab6bc880efac08b9e9c9dd20f475fe92e0c1732b))
+* co-locate replicas on a ReadWriteOnce store ([#86](https://github.com/maks3201/decision-model-operator/issues/86)) ([1e9891b](https://github.com/maks3201/decision-model-operator/commit/1e9891b1c73bd1befbd3c50e9c37765279c2e484))
+* **eval:** macro-F1 evaluation gates ([#84](https://github.com/maks3201/decision-model-operator/issues/84)) ([7f48ec1](https://github.com/maks3201/decision-model-operator/commit/7f48ec1de3ac45b857d1554f3ec2de11961e48be))
+* **metrics:** macro-F1 gauge and Recreate stop/restore results ([#96](https://github.com/maks3201/decision-model-operator/issues/96)) ([77aa4c6](https://github.com/maks3201/decision-model-operator/commit/77aa4c642100740b34f8cb06fd220c9fdbc275cb))
+* **ollaya:** seed the prefetch manifest from a mounted ConfigMap ([#91](https://github.com/maks3201/decision-model-operator/issues/91)) ([737408c](https://github.com/maks3201/decision-model-operator/commit/737408cb5ee763c9e9ebdc3de7da78922ef49a8d))
+* Recreate rollout strategy; maintain the stable while queued ([#93](https://github.com/maks3201/decision-model-operator/issues/93)) ([6072368](https://github.com/maks3201/decision-model-operator/commit/6072368ea589d68806f0ff309cde3caea2d5d09e))
+
+
+### Bug Fixes
+
+* a manager flag change never rolls a running stable ([#116](https://github.com/maks3201/decision-model-operator/issues/116)) ([44c2015](https://github.com/maks3201/decision-model-operator/commit/44c2015a7329e053ffeed73f7b3761189f989c88))
+* durable rollout admission, manifest lifecycle, Recreate rollback ([#95](https://github.com/maks3201/decision-model-operator/issues/95)) ([7fc030f](https://github.com/maks3201/decision-model-operator/commit/7fc030f43910873b1596de9e614144ded644100b))
+* **eval:** count missing answers in macro-F1 and bound the status ([#87](https://github.com/maks3201/decision-model-operator/issues/87)) ([ee86ba4](https://github.com/maks3201/decision-model-operator/commit/ee86ba4a853c5044103c03b26a47f5641df702cc))
+* harden Recreate rollback, rollout reservations, manifest repair ([#99](https://github.com/maks3201/decision-model-operator/issues/99)) ([ed89bc1](https://github.com/maks3201/decision-model-operator/commit/ed89bc139082c089018f7867f37979085978e567))
+* **ollaya:** report an unavailable seed file as SeedUnavailable ([#92](https://github.com/maks3201/decision-model-operator/issues/92)) ([8bb3463](https://github.com/maks3201/decision-model-operator/commit/8bb34632c34d937fe5a01419e305e40b70a6b6d5))
+* read the fleet for rollout admission under the budget lock ([#109](https://github.com/maks3201/decision-model-operator/issues/109)) ([f2d98f7](https://github.com/maks3201/decision-model-operator/commit/f2d98f7d75bec6de5da169d49a213a9a13969d86))
+* Recreate exits, honest Ready, quiet steady state + invariant tests ([#105](https://github.com/maks3201/decision-model-operator/issues/105)) ([b783294](https://github.com/maks3201/decision-model-operator/commit/b7832942f3a8e962ce927cd39a0765c11881b4d3))
+
 ## [0.4.0](https://github.com/maks3201/decision-model-operator/compare/v0.3.0...v0.4.0) (2026-10-09)
 
 

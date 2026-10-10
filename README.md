@@ -76,9 +76,9 @@ StorageClass (kind works).
 <!-- x-release-please-start-version -->
 ```sh
 helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
-  --version 0.4.0 --namespace decision-model-operator-system --create-namespace
+  --version 0.5.0 --namespace decision-model-operator-system --create-namespace
 
-kubectl apply -f https://raw.githubusercontent.com/maks3201/decision-model-operator/v0.4.0/config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml
+kubectl apply -f https://raw.githubusercontent.com/maks3201/decision-model-operator/v0.5.0/config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml
 kubectl get dm support-router -w
 ```
 <!-- x-release-please-end -->
@@ -184,7 +184,7 @@ and, if a relative gate is set, scores production on the same cases. Results lan
 <!-- x-release-please-start-version -->
 ```sh
 # kubectl instead of Helm
-kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.4.0/install.yaml
+kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.5.0/install.yaml
 ```
 <!-- x-release-please-end -->
 
@@ -197,15 +197,15 @@ have build provenance attestations:
 ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
 ISSUER=https://token.actions.githubusercontent.com
 
-cosign verify ghcr.io/maks3201/decision-model-operator:v0.4.0 \
+cosign verify ghcr.io/maks3201/decision-model-operator:v0.5.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
-cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.4.0 \
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.5.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance
 
-docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.4.0 --format '{{json .SBOM}}'
+docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.5.0 --format '{{json .SBOM}}'
 ```
 <!-- x-release-please-end -->
 
