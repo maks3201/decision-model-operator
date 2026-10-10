@@ -227,8 +227,12 @@ func (f *fakeEngine) ClassifyPrefetchFailure(terminationMessage string, _ int32)
 		return "ModelNotFound", true
 	case strings.Contains(terminationMessage, "DigestMismatch"):
 		return "DigestMismatch", true
+	case strings.Contains(terminationMessage, engine.PrefetchReasonUnknown):
+		// Non-permanent but NOT positively transient (auth, ENOSPC, OOM): the
+		// controller keeps the bounded budget for these, mirroring the real engine.
+		return engine.PrefetchReasonUnknown, false
 	default:
-		return "Transient", false
+		return engine.PrefetchReasonTransient, false
 	}
 }
 

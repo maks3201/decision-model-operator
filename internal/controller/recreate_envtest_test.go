@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -507,6 +508,60 @@ var _ = Describe("Recreate rollout strategy", func() {
 		zero.ResourceVersion = ""
 		zero.Spec.Rollout.Evaluation.MinAccuracy = "0.0"
 		Expect(k8sClient.Create(ctx, zero)).To(HaveOccurred())
+
+		// An ABSENT minAccuracy (the evaluation object has no minAccuracy key) under
+		// Recreate must be rejected with the SAME message, not a CEL "no such key"
+		// runtime error. The typed struct always includes the field, so build the
+		// object unstructured to omit the key entirely.
+		absent := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": decisionmodelv1alpha1.GroupVersion.String(),
+			"kind":       "DecisionModel",
+			"metadata":   map[string]interface{}{"namespace": namespace, "name": "cel-absent"},
+			"spec": map[string]interface{}{
+				"engine": "ollaya", "model": model1, "device": "cpu", "replicas": int64(1),
+				"rollout": map[string]interface{}{
+					"strategy": "Recreate",
+					"evaluation": map[string]interface{}{
+						"datasetRef": map[string]interface{}{
+							"configMapRef": map[string]interface{}{"name": "golden", "key": "cases.jsonl"},
+						},
+						// no minAccuracy key at all
+						"maxAccuracyDrop": "0.02",
+					},
+				},
+			},
+		}}
+		errAbsent := k8sClient.Create(ctx, absent)
+		Expect(errAbsent).To(HaveOccurred())
+		// minAccuracy is a required field on the evaluation object, so an absent key
+		// is rejected with a clear "Required value" message and the CEL rule is
+		// skipped (the object fails structural validation first) — crucially NOT the
+		// cryptic CEL "no such key" runtime error. The has() guard also makes the CEL
+		// rule itself safe against an absent minAccuracy.
+		Expect(errAbsent.Error()).NotTo(ContainSubstring("no such key"),
+			"an absent minAccuracy must not surface a CEL no-such-key runtime error")
+		Expect(errAbsent.Error()).To(ContainSubstring("minAccuracy"),
+			"the rejection names the missing minAccuracy field")
+
+		// BlueGreen (default strategy) with a zero minAccuracy is accepted: the
+		// relative-gate-skip concern (and so the non-zero-minAccuracy requirement) is
+		// Recreate-only, so the CEL rule must not fire for BlueGreen.
+		bg := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "cel-bg"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{
+					// default BlueGreen (strategy omitted)
+					Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+						DatasetRef:      decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden", Key: "cases.jsonl"}},
+						MinAccuracy:     "0",
+						MaxAccuracyDrop: "0.02",
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, bg)).To(Succeed(),
+			"BlueGreen with a zero minAccuracy is accepted (the non-zero rule is Recreate-only)")
 
 		// A real floor is accepted.
 		good := &decisionmodelv1alpha1.DecisionModel{

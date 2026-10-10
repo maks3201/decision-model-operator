@@ -1626,14 +1626,7 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 			"prefetching %q (%s) into store", dm.Spec.Model, digest)
 	}
 	if jobFailed {
-		msg := "prefetch Job failed"
-		if permanent, detail := r.prefetchFailureReason(ctx, dm, eng, rev); detail != "" {
-			msg = "prefetch failed: " + detail
-			if permanent {
-				msg += " (permanent)"
-			}
-		}
-		return r.rollbackOrFail(ctx, dm, candidate, reasonPrefetchFailed, msg)
+		return r.handleCandidatePrefetchFailure(ctx, dm, eng, candidate, rev)
 	}
 	if !jobDone {
 		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseCaching)
@@ -1711,6 +1704,53 @@ func (r *DecisionModelReconciler) reconcileCandidate(
 		return r.rollbackOrFail(ctx, dm, candidate, reasonStartTimeout, "starting exceeded timeout")
 	}
 	return r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
+}
+
+// handleCandidatePrefetchFailure handles a candidate prefetch Job that failed. A
+// PERMANENT failure (bad tag, digest mismatch) rolls back/fails at once. A
+// non-permanent (transient) failure does NOT roll back while the caching progress
+// deadline (phaseTransitionTime + cachingTimeout) has not passed: it recreates the
+// prefetch Job after a capped backoff (durable, from the Job's failure time) and
+// stays in Caching, so a brief registry outage during a rollout does not roll the
+// candidate back. At the deadline a still-failing transient rolls back as a
+// CacheTimeout.
+func (r *DecisionModelReconciler) handleCandidatePrefetchFailure(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	candidate *decisionmodelv1alpha1.RevisionStatus,
+	rev string,
+) (ctrl.Result, error) {
+	permanent, reason, detail := r.prefetchFailureReason(ctx, dm, eng, rev)
+	// A positively-identified TRANSIENT failure (reason == Transient) retries while
+	// the caching deadline has not passed. A PERMANENT failure, or an UNKNOWN /
+	// unreadable one (reason != Transient — auth, ENOSPC, OOM, no classifier), rolls
+	// back/fails at once: those are not self-healing, so a rollout must not sit in
+	// Caching retrying until the deadline.
+	if reason == engine.PrefetchReasonTransient && !r.phaseExceeded(dm, cachingTimeout(dm)) {
+		r.setPhase(ctx, dm, decisionmodelv1alpha1.PhaseCaching)
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionCached,
+			Status:  metav1.ConditionFalse,
+			Reason:  reasonCaching,
+			Message: "prefetch hit a transient error (" + detail + "); retrying with backoff",
+		})
+		return r.retryTransientCandidatePrefetch(ctx, dm, rev)
+	}
+	msg := "prefetch Job failed"
+	rbReason := reasonPrefetchFailed
+	if detail != "" {
+		msg = "prefetch failed: " + detail
+		switch {
+		case permanent:
+			msg += " (permanent)"
+		case reason == engine.PrefetchReasonTransient:
+			// Transient but the caching deadline passed while it kept failing: a timeout.
+			msg += " (transient; caching exceeded timeout)"
+			rbReason = reasonCacheTimeout
+		}
+	}
+	return r.rollbackOrFail(ctx, dm, candidate, rbReason, msg)
 }
 
 // resolveDigest returns the digest to pin this reconcile to. An explicit

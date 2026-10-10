@@ -171,12 +171,18 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 			return r.deleteIfOwned(ctx, dm, job, &client.DeleteOptions{PropagationPolicy: &bg})
 		}
 		if jobFailed(job) {
-			// The recovery prefetch failed: surface StorePrefetchFailed so the
-			// candidate rollout does not hide a stable store that cannot refill. The
-			// bounded-retry teardown and permanent-reason classification stay on the
+			// Classify: a positively-identified TRANSIENT failure stays StoreLost
+			// (self-healing, retried); a permanent/unknown one surfaces
+			// StorePrefetchFailed so the candidate rollout does not hide a stable
+			// store that cannot refill. The bounded-retry teardown stays on the
 			// stable path's recoverStableStore; here we only make the failure visible
-			// (deduped by reason).
-			r.degradeStorePrefetchFailed(ctx, dm, claim)
+			// (deduped).
+			_, reason, _ := r.prefetchFailureReason(ctx, dm, eng, stable.Hash)
+			if reason == engine.PrefetchReasonTransient {
+				r.degradeStoreLost(ctx, dm, claim)
+			} else {
+				r.degradeStorePrefetchFailed(ctx, dm, claim)
+			}
 			return nil
 		}
 		// Ongoing prefetch: the store is still being rebuilt.
@@ -193,6 +199,12 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 	// rollout is not blocked.
 	if gReason, gMsg := r.recoveryRegistryGuard(eng, stable); gReason != "" {
 		r.degradeStoreRecoveryBlocked(ctx, dm, stable, gReason, gMsg)
+		return nil
+	}
+	// A pending transient backoff gates recreation here too (same durable
+	// NextRetryTime the stable path uses): do not recreate before it elapses.
+	if pending, _ := r.transientBackoffPending(dm); pending {
+		r.degradeStoreLost(ctx, dm, claim)
 		return nil
 	}
 	r.degradeStoreLost(ctx, dm, claim)
@@ -296,8 +308,13 @@ func (r *DecisionModelReconciler) recoverStableStore(
 	}
 
 	// Once recovery is exhausted, StorePrefetchFailed owns the Degraded condition;
-	// do not overwrite it with StoreLost on every reconcile (no status churn).
-	if !storeRecoverExhausted(dm) {
+	// do not overwrite it with StoreLost on every reconcile (no status churn). While
+	// a transient retry saga is active (TransientAttempts > 0 and not exhausted) the
+	// transient StoreLost message (set by retryTransientRecovery, naming the cause)
+	// must stay — the generic StoreLost message here would flip it between backoff
+	// cycles and re-fire the Warning each cycle.
+	transientActive := dm.Status.StoreRecovery != nil && dm.Status.StoreRecovery.TransientAttempts > 0
+	if !storeRecoverExhausted(dm) && !transientActive {
 		r.degradeStoreLost(ctx, dm, claim)
 	}
 
@@ -445,20 +462,30 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 		return res, ferr
 	}
 
-	// A failed recovery prefetch: count it once per Job UID, then delete and
-	// requeue (recreate next reconcile). Past the bound, give up.
+	// A failed recovery prefetch. A permanent failure (bad tag, digest mismatch)
+	// gives up at once, Degraded with the classified reason. A classified-TRANSIENT
+	// failure (a registry outage) does NOT count toward a give-up budget: recreate
+	// the Job after a capped backoff and stay Degraded=StoreLost while the stable
+	// keeps serving. An UNKNOWN/unreadable failure (no classified reason) keeps
+	// today's bounded budget → StorePrefetchFailed, so a mystery failure still
+	// terminates rather than retrying forever.
 	if st.jobFailedNow {
-		// A permanent failure (e.g. the tag does not exist, or the pulled digest
-		// does not match) cannot be fixed by retrying: give up at once without
-		// burning the bounded attempts, Degraded with the classified reason.
-		if permanent, detail := r.prefetchFailureReason(ctx, dm, eng, stable.Hash); permanent {
+		permanent, reason, detail := r.prefetchFailureReason(ctx, dm, eng, stable.Hash)
+		switch {
+		case permanent:
 			r.degradeStorePrefetchReason(ctx, dm, claim, detail)
 			res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 			return res, ferr
+		case reason == engine.PrefetchReasonTransient && !storeRecoverExhausted(dm):
+			// Positively identified transient outage (network/availability): retry
+			// unbounded with a capped backoff, staying Degraded=StoreLost.
+			return r.retryTransientRecovery(ctx, dm, claim, st, detail, delJob)
 		}
+		// Unknown / unreadable / no classifier (and a transient that somehow follows
+		// an exhausted budget): today's bounded budget → StorePrefetchFailed, so a
+		// mystery failure still terminates rather than retrying forever.
 		if r.countFailedRecovery(dm, st.job.UID) {
 			r.degradeStorePrefetchFailed(ctx, dm, claim)
-			// Stop churning: slow requeue, no further counting or writes.
 			res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
 			return res, ferr
 		}
@@ -490,6 +517,21 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	// No Job present (PVC exists, recovery active): create a fresh prefetch. The
 	// registry/host allow-list gate ran earlier in recoverStableStore (step 4), so
 	// by here the pull host is still allowed.
+	// Once the bounded budget is exhausted (an unknown/unreadable failure), do not
+	// recreate: StorePrefetchFailed owns the condition until a retry token / new
+	// revision resets it.
+	if storeRecoverExhausted(dm) {
+		r.degradeStorePrefetchFailed(ctx, dm, claim)
+		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: regateInterval}, nil)
+		return res, ferr
+	}
+	// A transient failure may have scheduled a capped backoff before the next Job
+	// may be created: hold until it elapses (derived from durable NextRetryTime, so
+	// a restart mid-backoff still waits), staying Degraded=StoreLost.
+	if pending, wait := r.transientBackoffPending(dm); pending {
+		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: wait}, nil)
+		return res, ferr
+	}
 	// Seed the recorded manifest; the Job verifies the result against the pinned
 	// digest, so a tag that moved since promotion fails with UpstreamTagMoved
 	// instead of serving other bytes. A missing manifest means pull-by-tag + verify.
@@ -654,6 +696,31 @@ func (r *DecisionModelReconciler) degradeStoreLost(
 	})
 }
 
+// degradeStoreLostTransient sets Degraded=True/StoreLost with a message naming the
+// transient cause, deduped: the Event fires only when the Degraded reason+message
+// changes, so repeated backoff reconciles do not repeat it. The reason stays
+// StoreLost (not StorePrefetchFailed) because a classified-transient failure is
+// expected to self-heal and the recovery keeps retrying.
+func (r *DecisionModelReconciler) degradeStoreLostTransient(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	claim, detail string,
+) {
+	msg := fmt.Sprintf("stable store PVC %q recovery hit a transient error (%s); retrying with backoff", claim, detail)
+	prev := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	changed := prev == nil || prev.Status != metav1.ConditionTrue ||
+		prev.Reason != reasonStoreLost || prev.Message != msg
+	if changed {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventStoreLost, "%s", msg)
+	}
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reasonStoreLost,
+		Message: msg,
+	})
+}
+
 // degradeStoreRecoveryBlocked sets Degraded=True with the given registry/host
 // refusal reason and emits exactly one Warning per distinct reason+message: the
 // Event fires only when the Degraded signal changes, so a per-reconcile requeue
@@ -777,6 +844,130 @@ var errStoreLostRecovering = errors.New("stable store lost; recovering")
 
 // storeTerminatingRequeue is how long to wait for a terminating store PVC to go.
 const storeTerminatingRequeue = 5 * time.Second
+
+// Capped-backoff bounds for retrying a prefetch Job that failed with a
+// classified-transient error (e.g. a registry outage). The interval doubles from
+// transientBackoffBase, capped at transientBackoffMax. Derived from durable state
+// (the failed Job's failure time + a persisted attempt count), never memory.
+const (
+	transientBackoffBase = 30 * time.Second
+	transientBackoffMax  = 5 * time.Minute
+)
+
+// transientBackoff returns the backoff interval for the attempt-th transient
+// prefetch failure (attempt counted from 1): base * 2^(attempt-1), capped at the
+// max. attempt <= 0 is treated as 1.
+func transientBackoff(attempt int32) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := transientBackoffBase
+	for i := int32(1); i < attempt; i++ {
+		d *= 2
+		if d >= transientBackoffMax {
+			return transientBackoffMax
+		}
+	}
+	if d > transientBackoffMax {
+		d = transientBackoffMax
+	}
+	return d
+}
+
+// retryTransientRecovery handles a recovery prefetch Job that failed with a
+// classified-transient error. It does NOT count toward maxStoreRecoverAttempts:
+// it stays Degraded=StoreLost (message naming the transient cause) and recreates
+// the Job after a capped backoff. The backoff is durable: NextRetryTime is
+// computed from the controller clock (r.now()) at the FIRST observation of the
+// failed Job and persisted, so it survives an operator restart and does not trust
+// kube-controller-manager wall time against the injectable clock.
+//
+// Persist-then-act: on the first sight of a failed Job UID it records the
+// bookkeeping (LastTransientJob/TransientAttempts/NextRetryTime) and returns
+// WITHOUT deleting the Job, so a status-write failure cannot leave an uncounted
+// retry (the next reconcile re-observes the same still-present failed Job and
+// re-records idempotently). It deletes the failed Job only on a later pass, once
+// LastTransientJob == UID is durable; recreation is then gated on NextRetryTime in
+// the no-Job branch.
+func (r *DecisionModelReconciler) retryTransientRecovery(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	claim string,
+	st storeRecoveryState,
+	detail string,
+	delJob func() error,
+) (ctrl.Result, error) {
+	s := dm.Status.StoreRecovery
+	if s == nil {
+		s = &decisionmodelv1alpha1.StoreRecoveryStatus{}
+		dm.Status.StoreRecovery = s
+	}
+	// First sight of this failed Job: record the backoff bookkeeping and return
+	// (persist-then-act). The Job is NOT deleted yet — only once the record is
+	// durable (a later pass sees LastTransientJob == UID). NextRetryTime is from
+	// the controller clock at first observation, not the Job's kube wall time.
+	if s.LastTransientJob != string(st.job.UID) {
+		s.LastTransientJob = string(st.job.UID)
+		s.TransientAttempts++
+		next := metav1.NewTime(r.now().Add(transientBackoff(s.TransientAttempts)))
+		s.NextRetryTime = &next
+		r.degradeStoreLostTransient(ctx, dm, claim, detail)
+		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
+		return res, ferr
+	}
+	// The failure is durably recorded: keep the transient Degraded message and
+	// delete the failed Job. Recreation is gated on NextRetryTime in the no-Job
+	// branch (restart-safe: that gate reads the durable NextRetryTime, not memory),
+	// so a restart mid-backoff sees no Job and still waits before recreating.
+	r.degradeStoreLostTransient(ctx, dm, claim, detail)
+	if derr := delJob(); derr != nil {
+		res, ferr := r.finish(ctx, dm, ctrl.Result{}, derr)
+		return res, ferr
+	}
+	res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
+	return res, ferr
+}
+
+// transientBackoffPending reports whether a transient-failure backoff is still in
+// effect (the next recovery prefetch Job must not be created yet) and the
+// remaining wait. Derived from the durable NextRetryTime, so it survives a
+// restart. Returns (false, 0) when no backoff is pending.
+func (r *DecisionModelReconciler) transientBackoffPending(dm *decisionmodelv1alpha1.DecisionModel) (bool, time.Duration) {
+	s := dm.Status.StoreRecovery
+	if s == nil || s.NextRetryTime == nil {
+		return false, 0
+	}
+	if wait := s.NextRetryTime.Sub(r.now()); wait > 0 {
+		return true, wait
+	}
+	return false, 0
+}
+
+// retryTransientCandidatePrefetch recreates a candidate's failed prefetch Job so
+// a transient failure (registry outage) does not roll the candidate back: it
+// deletes the failed Job and requeues, and ensurePrefetchJob creates a fresh one
+// next reconcile. The caller has established the failure is transient and the
+// caching deadline has not passed, so this keeps the candidate in Caching. The
+// hard bound is the outer caching deadline (cachingTimeout); within it the Job's
+// own backoffLimit/activeDeadline pace each attempt, so no extra durable candidate
+// backoff state is needed. Idempotent: a NotFound Job just means the recreate
+// already happened.
+func (r *DecisionModelReconciler) retryTransientCandidatePrefetch(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) (ctrl.Result, error) {
+	bg := metav1.DeletePropagationBackground
+	err := r.deleteIfOwned(ctx, dm,
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: dm.Namespace, Name: prefetchName(dm, rev)}},
+		&client.DeleteOptions{PropagationPolicy: &bg})
+	if err != nil {
+		res, ferr := r.finish(ctx, dm, ctrl.Result{}, err)
+		return res, ferr
+	}
+	res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: storeTerminatingRequeue}, nil)
+	return res, ferr
+}
 
 // ensurePVC creates the per-revision model-store PVC and returns it. On
 // an existing PVC it does not mutate access modes (immutable). Each revision
@@ -1113,33 +1304,36 @@ func (r *DecisionModelReconciler) ensurePrefetchJob(
 // prefetchFailureReason classifies why a revision's prefetch Job failed by
 // reading the newest failed prefetch Pod's terminated container state and asking
 // the engine's PrefetchFailureClassifier capability. It returns whether the
-// failure is permanent (retrying cannot help) and a human-readable detail
-// beginning with the classified reason, for the condition message/Event. detail
-// is "" when nothing could be read (no classifier, no failed Pod/message), so
-// the caller keeps its generic message.
+// failure is permanent (retrying cannot help), the raw classified reason (one of
+// the engine.PrefetchReason* strings, "" when nothing could be read), and a
+// human-readable detail beginning with that reason for the condition
+// message/Event. Only reason == engine.PrefetchReasonTransient is a positively
+// identified self-healing outage; engine.PrefetchReasonUnknown (and "" — no
+// classifier or no readable failed Pod) is NOT transient and keeps the bounded
+// budget / rollback.
 func (r *DecisionModelReconciler) prefetchFailureReason(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
 	eng engine.Engine,
 	rev string,
-) (permanent bool, detail string) {
+) (permanent bool, reason, detail string) {
 	classifier, ok := eng.(engine.PrefetchFailureClassifier)
 	if !ok {
-		return false, ""
+		return false, "", ""
 	}
 	msg, exit, found := r.newestFailedPrefetchTermination(ctx, dm, rev)
 	if !found {
-		return false, ""
+		return false, "", ""
 	}
-	reason, permanent := classifier.ClassifyPrefetchFailure(msg, exit)
+	reason, permanent = classifier.ClassifyPrefetchFailure(msg, exit)
 	if reason == "" {
-		return permanent, ""
+		return permanent, "", ""
 	}
 	detail = reason
 	if msg != "" {
 		detail = fmt.Sprintf("%s (%s)", reason, strings.TrimSpace(msg))
 	}
-	return permanent, detail
+	return permanent, reason, detail
 }
 
 // newestFailedPrefetchTermination returns the terminated-container message and
