@@ -29,21 +29,30 @@ type registryConfigurer interface {
 	// ConfiguredRegistry is the registry --ollaya-registry set, or the engine
 	// default when unset. Always a concrete URL (never "").
 	ConfiguredRegistry() string
+	// RecordedRegistry is the registry base URL a NEW candidate for model is
+	// actually served/prefetched from: the name's own host for an explicit-host
+	// name (host/[ns/]model:tag), else ConfiguredRegistry for a host-less name.
+	// Always a concrete URL (never ""). Recording the true host (not the flag) for
+	// an explicit-host name makes status.<revision>.registry truthful and lets the
+	// store-recovery allow-list guard check the real source.
+	RecordedRegistry(model string) string
 	// DefaultRegistry is the engine's built-in default registry, independent of
 	// the flag — the registry a stable with no recorded/live registry runs on.
 	DefaultRegistry() string
 }
 
 // recordedCandidateRegistry is the registry base URL to record on a new candidate
-// revision (RevisionStatus.Registry): the engine's configured registry when the
-// engine reports one, else "". Recording it (the explicit default included) lets
-// the stable revision render its serving Pods / prefetch Job from the registry it
-// was prefetched against, so a later change of the operator's default registry
-// never re-renders a running stable. Rendering a default-registry revision stays
-// byte-identical because the engine suppresses the env for its default.
-func recordedCandidateRegistry(eng engine.Engine) string {
+// revision (RevisionStatus.Registry) for model: the registry the candidate is
+// actually served/prefetched from (the name's own host for an explicit-host name,
+// else the engine's configured registry) when the engine reports one, else "".
+// Recording it (the explicit default included) lets the stable revision render its
+// serving Pods / prefetch Job from the registry it was prefetched against, so a
+// later change of the operator's default registry never re-renders a running
+// stable. Rendering a default-registry revision stays byte-identical because the
+// engine suppresses the env for its default.
+func recordedCandidateRegistry(eng engine.Engine, model string) string {
 	if rc, ok := eng.(registryConfigurer); ok {
-		return rc.ConfiguredRegistry()
+		return rc.RecordedRegistry(model)
 	}
 	return ""
 }

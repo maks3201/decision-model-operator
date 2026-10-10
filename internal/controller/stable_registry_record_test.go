@@ -162,6 +162,57 @@ var _ = Describe("recording the registry on a revision", func() {
 			To(Equal(srv.URL))
 	})
 
+	It("records the explicit host of the model name as the candidate registry, not the flag", func() {
+		// A new candidate whose model name carries an explicit host must record that
+		// host (https-defaulted / scheme kept) as its registry, NOT the --ollaya-
+		// registry flag: the ollaya CLI pulls/serves an explicit-host name from the
+		// name's host and ignores OLLAYA_REGISTRY. The controller passes dm.Spec.Model
+		// to RecordedRegistry; the engine returns the name's host. Resolve targets the
+		// name's host (http scheme -> the httptest server), so recording and resolving
+		// agree.
+		const bogusFlag = "https://unused-mirror.example:9999"
+		explicitModel := "http://" + regHost + "/library/laya:en" // explicit host == srv (insecure http)
+		r := &DecisionModelReconciler{
+			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			// The flag points at a DIFFERENT mirror; the recorded value must come from
+			// the model name's host, not this flag.
+			Engines:                 map[string]engine.Engine{"ollaya": ollaya.New(ollaya.WithRegistryURL(bogusFlag))},
+			Prober:                  &fakeProber{loaded: engine.Loaded{Name: explicitModel, Digest: wantDigest, Device: "cpu"}},
+			AllowedRegistries:       []string{regHost},
+			AllowInsecureRegistries: true,
+			Recorder:                events.NewFakeRecorder(64),
+		}
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "explicit"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: explicitModel, Device: "cpu", Replicas: int32Ptr(1),
+			},
+		})).To(Succeed())
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "explicit"}})
+
+		cand := getDM("explicit").Status.CandidateRevision
+		Expect(cand).NotTo(BeNil(), "the candidate is admitted (resolve succeeded against the name's host)")
+		Expect(cand.Registry).To(Equal("http://"+regHost),
+			"the candidate records the model name's explicit host, not the --ollaya-registry flag")
+		Expect(cand.Registry).NotTo(Equal(bogusFlag))
+	})
+
+	It("records the configured flag as the registry for a host-less candidate", func() {
+		// A host-less name has no host of its own, so the recorded registry is the
+		// engine's configured flag (the pull source for a host-less name).
+		r := newReconcilerFor(srv.URL, regHost)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "hostless"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+			},
+		})).To(Succeed())
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "hostless"}})
+		cand := getDM("hostless").Status.CandidateRevision
+		Expect(cand).NotTo(BeNil())
+		Expect(cand.Registry).To(Equal(srv.URL), "a host-less candidate records the configured flag")
+	})
+
 	It("does not roll the stable when the flag is reset to the default (recorded registry wins)", func() {
 		// The known limit of the freeze-only fix: resetting --ollaya-registry to the
 		// default dropped OLLAYA_REGISTRY from the fresh render and rolled the stable.

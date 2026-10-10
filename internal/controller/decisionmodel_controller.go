@@ -952,7 +952,7 @@ func (r *DecisionModelReconciler) candidateIdentity(
 		// rendered from its own state, not a (possibly newer) spec.
 		Image:          image,
 		RuntimeVersion: recordedCandidateRuntimeVersion(eng, dm, effVer),
-		Registry:       recordedCandidateRegistry(eng),
+		Registry:       recordedCandidateRegistry(eng, dm.Spec.Model),
 		Resources:      dm.Spec.Resources,
 		Placement:      placementRecord(dm.Spec.Scheduling),
 	}
