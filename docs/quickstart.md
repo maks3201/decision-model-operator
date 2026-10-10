@@ -233,8 +233,8 @@ or `-o jsonpath='{.status.conditions}'`):
 | `EvaluationTimeout` | phase `RolledBack` (stable exists) or `Failed`; `Degraded=True` | Evaluation exceeded its deadline. | Reduce `maxCases` or check the model. |
 | `EvaluatedWithSkippedGates` | `Evaluated=True`; the candidate **passed** and the rollout proceeds | The candidate met the **absolute** gates (`minAccuracy`, `minMacroF1`, `maxEce`) but the **relative** gate (`maxAccuracyDrop` vs the stable baseline) was **skipped**: under `spec.rollout.strategy: Recreate` the stable is scaled to zero during evaluation, so no baseline could be measured. `status.evaluation.reason` says the same. | Expected under `Recreate` — no action; the candidate is promoted on its absolute scores. If you need the relative-drop guard enforced, use `spec.rollout.strategy: BlueGreen` (the default), which keeps the stable serving as a baseline but needs capacity for both revisions at once. |
 | `ResourceConflict` | `Ready=False`, `Degraded=True` reason `ResourceConflict` | An object the operator needs (Service, Deployment, Job or PVC) already exists under the DecisionModel's name but is **not owned by it** (different or absent controller owner). The operator never modifies or deletes a foreign object; a foreign **Service** blocks promotion, so traffic cannot reach the model. | Rename or remove the conflicting object (it was not created by this operator), then the next reconcile proceeds. |
-| `StoreLost` | `Degraded=True` reason `StoreLost`; stable keeps whatever Pods are ready | The stable revision's model-store PVC went missing (e.g. deleted out of band). The operator **recreates** it (annotated `decisionmodel.io/store-recovering`) and **re-runs the prefetch** before letting Pods serve on it; it will not serve an empty store. | Usually none — recovery is automatic. Check StorageClass/quota if it stays here. |
-| `StorePrefetchFailed` | `Degraded=True` reason `StorePrefetchFailed`; held without churn | The recovery prefetch Job exhausted its retries (bad registry, digest mismatch, disk). | Fix the underlying cause, then bump `decisionmodel.io/retry` to re-run recovery. |
+| `StoreLost` | `Degraded=True` reason `StoreLost`; stable keeps whatever Pods are ready | The stable revision's model-store PVC went missing (e.g. deleted out of band). The operator **recreates** it (annotated `decisionmodel.io/store-recovering`) and **re-runs the prefetch** before letting Pods serve on it; it will not serve an empty store. A recovery prefetch that fails with a **transient** error (registry outage) stays on `StoreLost` and is retried with a capped backoff (30s doubling to 5m) — a transient outage does **not** escalate to `StorePrefetchFailed`. | Usually none — recovery is automatic and keeps retrying through a transient outage. Check StorageClass/quota if it stays here. |
+| `StorePrefetchFailed` | `Degraded=True` reason `StorePrefetchFailed`; held without churn | The recovery prefetch failed **permanently** (bad registry/tag, digest mismatch) or an **unknown/unclassified** failure exhausted the bounded retries. A classified-transient outage never reaches this reason — it keeps retrying on `StoreLost`. | Fix the underlying cause, then bump `decisionmodel.io/retry` to re-run recovery. |
 | `StoreTerminating` | `Degraded=True` reason `StoreTerminating`; the stable **keeps serving** | The stable store PVC was deleted but is still `Terminating` because the stable Pods still mount it (the `kubernetes.io/pvc-protection` finalizer). The operator does **not** stop the stable automatically (a PVC delete cannot be undone). | Delete the stable Pods so the PVC can finish deleting and recovery can run (`StoreLost` → recreate + prefetch). Expect a short serving gap while the Pods restart. |
 
 For candidate failures (`DatasetInvalid`, `EvaluationFailed`, `EvaluationTimeout`,
@@ -271,8 +271,14 @@ The prefetch Job tells a **transient** download failure from a **permanent** one
 and reacts differently:
 
 - **Transient** (network error, registry/Hugging Face `5xx`, timeout): the Job
-  retries up to its `backoffLimit` (4) within the Caching deadline, so a short
-  outage recovers on its own.
+  retries up to its `backoffLimit` (4) internally; if the whole Job still fails on
+  a transient error the operator **recreates the prefetch Job** after a capped
+  backoff (30s doubling to 5m) rather than giving up — so a longer outage recovers
+  on its own without a manual retry. For a **candidate** rollout this continues
+  while the Caching deadline (`cachingTimeout`, default 30m) has not passed; at the
+  deadline the candidate rolls back / fails as a `CacheTimeout`. For **store
+  recovery** it stays on `StoreLost` and keeps retrying (it never escalates to
+  `StorePrefetchFailed` on a transient error).
 - **Permanent** — the Job fails **immediately** (no wasted retries):
   - **`ModelNotFound`** — the registry has no such tag (`spec.model` is wrong, or
     a bare name resolved to a different artifact). Fix the tag; a digest pin

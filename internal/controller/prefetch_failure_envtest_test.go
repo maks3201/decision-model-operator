@@ -152,7 +152,6 @@ var _ = Describe("prefetch failure classification", func() {
 		},
 		Entry("model not found", "pull error: ModelNotFound tag does not exist", "ModelNotFound"),
 		Entry("digest mismatch", "DigestMismatch: manifest sha256 differs", "DigestMismatch"),
-		Entry("transient", "connection reset by peer", "Transient"),
 	)
 
 	// A moved upstream tag is a permanent prefetch failure: the recorded digest

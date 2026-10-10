@@ -222,7 +222,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!(has(self.promotion) && has(self.manualPromotion) && self.manualPromotion) || self.promotion == 'Manual'",message="manualPromotion: true conflicts with promotion; use promotion: Manual"
 // +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.promotion) || self.promotion != 'Manual')",message="strategy: Recreate cannot be combined with promotion: Manual (production would be down while the candidate waits for approval)"
 // +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate') || (!has(self.manualPromotion) || !self.manualPromotion)",message="strategy: Recreate cannot be combined with manualPromotion: true (production would be down while the candidate waits for approval)"
-// +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate' && has(self.evaluation)) || !self.evaluation.minAccuracy.matches('^0(\\\\.0+)?$')",message="strategy: Recreate with evaluation requires a non-zero minAccuracy: relative gates (maxAccuracyDrop/maxECEIncrease/maxMacroF1Drop) are skipped under Recreate because the stopped stable gives no baseline, so a zero minAccuracy would promote with no effective gate"
+// +kubebuilder:validation:XValidation:rule="!(has(self.strategy) && self.strategy == 'Recreate' && has(self.evaluation)) || (has(self.evaluation.minAccuracy) && !self.evaluation.minAccuracy.matches('^0(\\\\.0+)?$'))",message="strategy: Recreate with evaluation requires a non-zero minAccuracy: relative gates (maxAccuracyDrop/maxECEIncrease/maxMacroF1Drop) are skipped under Recreate because the stopped stable gives no baseline, so a zero minAccuracy would promote with no effective gate"
 type RolloutSpec struct {
 	// Strategy selects how a new revision replaces the running one: BlueGreen
 	// (default) runs both at once and switches traffic only after the candidate
@@ -592,6 +592,32 @@ type StoreRecoveryStatus struct {
 	// until a new revision or a decisionmodel.io/retry token resets it.
 	// +optional
 	Exhausted bool `json:"exhausted,omitempty"`
+
+	// TransientAttempts counts recovery prefetch Jobs that failed with a
+	// positively-classified transient error (engine.PrefetchReasonTransient, e.g. a
+	// registry outage). Transient failures do NOT count toward Attempts/Exhausted:
+	// the recovery keeps retrying with a capped backoff and stays Degraded=StoreLost.
+	// This counter only drives the backoff interval. Reset (with the whole
+	// StoreRecovery object) by clearStoreRecover when the store is recovered
+	// (a Complete prefetch repopulated it), when the stable store becomes serveable
+	// again, on a new revision, and on a decisionmodel.io/retry token.
+	// +optional
+	TransientAttempts int32 `json:"transientAttempts,omitempty"`
+
+	// LastTransientJob is the UID of the last transiently-failed prefetch Job
+	// already accounted for, so a repeated observation of the same Job does not
+	// re-advance the backoff. Same reset triggers as TransientAttempts.
+	// +optional
+	LastTransientJob string `json:"lastTransientJob,omitempty"`
+
+	// NextRetryTime is the earliest time the next recovery prefetch Job may be
+	// (re)created after a transient failure. It is computed from the controller
+	// clock at the first observation of the failed Job plus the capped backoff and
+	// persisted here, so the backoff survives an operator restart (the no-Job
+	// create gate reads it, not any in-memory timer). Same reset triggers as
+	// TransientAttempts.
+	// +optional
+	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
 }
 
 // EvaluationResult is the outcome of applying the evaluation gate.
