@@ -42,6 +42,7 @@ func resetMetrics() {
 	evaluationMacroF1Gauge.Reset()
 	probeResultsTotal.Reset()
 	revisionInfoGauge.Reset()
+	conditionGauge.Reset()
 	// registryResolveDuration is a plain Histogram (no labels) and cannot be
 	// reset; tests that assert on it read its sample count as a delta.
 }
@@ -357,6 +358,84 @@ func TestRevisionInfoDeletedOnDMDelete(t *testing.T) {
 	deleteMetrics("ns", "dm")
 	if n := testutil.CollectAndCount(revisionInfoGauge); n != 0 {
 		t.Errorf("revision_info series after delete = %d, want 0", n)
+	}
+}
+
+func TestConditionGaugeSeriesLifecycle(t *testing.T) {
+	resetMetrics()
+	dm := newDM("dm")
+	dm.Status.Phase = decisionmodelv1alpha1.PhaseReady
+	setCond := func(d *decisionmodelv1alpha1.DecisionModel, condType, status, reason string) {
+		for i := range d.Status.Conditions {
+			if d.Status.Conditions[i].Type == condType {
+				d.Status.Conditions[i].Status = metav1.ConditionStatus(status)
+				d.Status.Conditions[i].Reason = reason
+				return
+			}
+		}
+		d.Status.Conditions = append(d.Status.Conditions, metav1.Condition{
+			Type: condType, Status: metav1.ConditionStatus(status), Reason: reason,
+		})
+	}
+
+	// Ready=True/AsExpected and Degraded=True/StoreLost -> one series each.
+	setCond(dm, decisionmodelv1alpha1.ConditionReady, "True", "AsExpected")
+	setCond(dm, decisionmodelv1alpha1.ConditionDegraded, "True", reasonStoreLost)
+	recordStatusMetrics(dm)
+
+	if n := testutil.CollectAndCount(conditionGauge); n != 2 {
+		t.Fatalf("condition series = %d, want 2 (Ready+Degraded)", n)
+	}
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionReady, "True", "AsExpected")); got != 1 {
+		t.Errorf("Ready condition gauge = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionDegraded, "True", reasonStoreLost)); got != 1 {
+		t.Errorf("Degraded(StoreLost) condition gauge = %v, want 1", got)
+	}
+
+	// The Degraded reason changes: exactly one Degraded series, carrying the new
+	// reason; the old reason series is gone (no stale series).
+	setCond(dm, decisionmodelv1alpha1.ConditionDegraded, "True", reasonRegistryNotAllowed)
+	recordStatusMetrics(dm)
+
+	if n := testutil.CollectAndCount(conditionGauge); n != 2 {
+		t.Fatalf("condition series after reason change = %d, want 2 (one per type)", n)
+	}
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionDegraded, "True", reasonStoreLost)); got != 0 {
+		t.Errorf("stale Degraded(StoreLost) series survived: %v", got)
+	}
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionDegraded, "True", reasonRegistryNotAllowed)); got != 1 {
+		t.Errorf("Degraded(RegistryNotAllowed) gauge = %v, want 1", got)
+	}
+
+	// The Ready status flips to False: the series carries the new status, still one
+	// per type.
+	setCond(dm, decisionmodelv1alpha1.ConditionReady, "False", "Degraded")
+	recordStatusMetrics(dm)
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionReady, "True", "AsExpected")); got != 0 {
+		t.Errorf("stale Ready(True) series survived a status flip: %v", got)
+	}
+	if got := testutil.ToFloat64(conditionGauge.WithLabelValues(
+		"ns", "dm", decisionmodelv1alpha1.ConditionReady, "False", "Degraded")); got != 1 {
+		t.Errorf("Ready(False) gauge = %v, want 1", got)
+	}
+
+	// Degraded clears (store serveable again): its series is removed; Ready remains.
+	dm.Status.Conditions = []metav1.Condition{dm.Status.Conditions[0]} // keep Ready only
+	recordStatusMetrics(dm)
+	if n := testutil.CollectAndCount(conditionGauge); n != 1 {
+		t.Fatalf("condition series after Degraded cleared = %d, want 1 (Ready only)", n)
+	}
+
+	// Deleting the DM removes all its condition series.
+	deleteMetrics("ns", "dm")
+	if n := testutil.CollectAndCount(conditionGauge); n != 0 {
+		t.Errorf("condition series after DM delete = %d, want 0", n)
 	}
 }
 

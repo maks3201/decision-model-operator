@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -54,6 +55,7 @@ const (
 	metricProbeResultsTotal       = "decisionmodel_probe_results_total"
 	metricRegistryResolveDuration = "decisionmodel_registry_resolve_duration_seconds"
 	metricRevisionInfo            = "decisionmodel_revision_info"
+	metricCondition               = "decisionmodel_condition"
 )
 
 // Metric label keys.
@@ -65,6 +67,9 @@ const (
 	labelRole      = "role"
 	labelModel     = "model"
 	labelDigest    = "digest"
+	labelType      = "type"
+	labelStatus    = "status"
+	labelReason    = "reason"
 )
 
 // Revision-info role label values.
@@ -174,6 +179,19 @@ var (
 		Help: "The model and digest of each live revision role of a DecisionModel " +
 			"(always 1). At most two series per DecisionModel: role=stable and role=candidate.",
 	}, []string{labelNamespace, labelName, labelRole, labelModel, labelDigest})
+
+	// conditionGauge carries the current status+reason of a DecisionModel's
+	// Ready and Degraded conditions (always 1). Exactly one series per
+	// (DecisionModel, type): the old series is deleted when the status or reason
+	// changes, so a dashboard never sees a stale reason reported as current.
+	// Cardinality is bounded — type is one of two fixed values, status is
+	// True/False, and reason strings are controller constants.
+	conditionGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metricCondition,
+		Help: "Current status and reason of a DecisionModel condition (always 1). " +
+			"One series per (DecisionModel, type) for type=Ready and type=Degraded; " +
+			"the status and reason labels carry the live condition.",
+	}, []string{labelNamespace, labelName, labelType, labelStatus, labelReason})
 )
 
 func init() {
@@ -189,6 +207,7 @@ func init() {
 		probeResultsTotal,
 		registryResolveDuration,
 		revisionInfoGauge,
+		conditionGauge,
 	)
 }
 
@@ -228,6 +247,27 @@ func recordStatusMetrics(dm *decisionmodelv1alpha1.DecisionModel) {
 
 	recordRevisionInfo(ns, name, roleStable, dm.Status.StableRevision)
 	recordRevisionInfo(ns, name, roleCandidate, dm.Status.CandidateRevision)
+
+	recordConditionGauge(ns, name, dm, decisionmodelv1alpha1.ConditionReady)
+	recordConditionGauge(ns, name, dm, decisionmodelv1alpha1.ConditionDegraded)
+}
+
+// recordConditionGauge keeps exactly one decisionmodel_condition series per
+// (DecisionModel, type): it first deletes any existing series for the type (the
+// status and reason are in the label set, so a status/reason change would
+// otherwise leave a stale series), then sets the current one. When the condition
+// is absent only the delete runs, so the metric stays bounded to the condition
+// types that actually exist. Reason strings are controller constants, so
+// cardinality is bounded.
+func recordConditionGauge(ns, name string, dm *decisionmodelv1alpha1.DecisionModel, condType string) {
+	conditionGauge.DeletePartialMatch(prometheus.Labels{
+		labelNamespace: ns, labelName: name, labelType: condType,
+	})
+	c := meta.FindStatusCondition(dm.Status.Conditions, condType)
+	if c == nil {
+		return
+	}
+	conditionGauge.WithLabelValues(ns, name, condType, string(c.Status), c.Reason).Set(1)
 }
 
 // recordRevisionInfo keeps exactly one decisionmodel_revision_info series per
@@ -260,6 +300,7 @@ func deleteMetrics(namespace, name string) {
 	evaluationMacroF1Gauge.DeletePartialMatch(l)
 	probeResultsTotal.DeletePartialMatch(l)
 	revisionInfoGauge.DeletePartialMatch(l)
+	conditionGauge.DeletePartialMatch(l)
 }
 
 // observeRegistryResolve records a registry resolution duration. No DM labels,
