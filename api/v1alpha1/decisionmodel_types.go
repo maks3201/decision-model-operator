@@ -812,6 +812,20 @@ type DecisionModelStatus struct {
 	// +optional
 	StableStoppedForRevision string `json:"stableStoppedForRevision,omitempty"`
 
+	// StoreFinalizeStoppedForRevision records that the named stable revision's
+	// Deployment was scaled to 0 so its Terminating model-store PVC can finalize:
+	// the kubernetes.io/pvc-protection finalizer holds a PVC with a deletionTimestamp
+	// as long as a Pod mounts it, and a Deployment that keeps recreating a Pod on
+	// that PVC would otherwise deadlock the deletion forever. It is set only while
+	// the store PVC is Terminating AND no stable Pod is model-ready (an in-flight
+	// store swap with nothing left to serve); it is derived from the live PVC state
+	// and the probe each reconcile, persisted so the scale-to-0 is restart-safe. It
+	// is cleared as soon as the PVC is no longer Terminating (gone -> normal
+	// recovery recreates and prefetches it) or a stable Pod becomes model-ready
+	// again. Independent of StableStoppedForRevision (the Recreate capacity stop).
+	// +optional
+	StoreFinalizeStoppedForRevision string `json:"storeFinalizeStoppedForRevision,omitempty"`
+
 	// RecreateRollback drives the capacity-safe rollback of a Recreate rollout
 	// when the newly promoted stable turns unhealthy inside its stabilization
 	// window. On one GPU the unhealthy new stable and the recovery target cannot

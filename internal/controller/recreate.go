@@ -81,6 +81,12 @@ func desiredReplicasForRevision(dm *decisionmodelv1alpha1.DecisionModel, rev str
 		dm.Status.StableRevision != nil && dm.Status.StableRevision.Hash == rev {
 		return 0
 	}
+	// Scaled to 0 so a Terminating store PVC can finalize (no model-ready Pod left
+	// to serve): the Deployment must not keep recreating a Pod on the dying PVC, or
+	// pvc-protection deadlocks the deletion forever.
+	if dm.Status.StoreFinalizeStoppedForRevision == rev && rev != "" {
+		return 0
+	}
 	if rollbackStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate &&
 		dm.Status.PreviousRevision != nil && dm.Status.PreviousRevision.Hash == rev {
 		return 0

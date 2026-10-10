@@ -354,6 +354,75 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(degradedReason(getDM("term"))).To(Equal(reasonStoreLost))
 	})
 
+	// When the store PVC is Terminating AND no stable Pod is model-ready, the
+	// operator must scale the stable Deployment to 0 so pvc-protection can finalize
+	// the PVC (a Deployment that keeps recreating a Pod on the dying PVC deadlocks
+	// the deletion forever). Then normal recovery recreates + prefetches it and the
+	// stable scales back.
+	It("scales the stable to 0 when its store is Terminating and nothing is model-ready, then recovers", func() {
+		r := newRec(k8sClient, newProber())
+		rev := driveToStable(r, "unstick")
+		pvcKey := types.NamespacedName{Namespace: namespace, Name: "unstick-store-" + rev}
+		depKey := types.NamespacedName{Namespace: namespace, Name: "unstick-" + rev}
+		rec := func() {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "unstick"}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("the store PVC is Terminating (finalizer kept) and the only serving Pod is gone")
+		pvc := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
+		Expect(pvc.DeletionTimestamp).NotTo(BeNil(), "PVC is Terminating")
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "unstick-pod-0"}})).To(Succeed())
+
+		By("reconciles record the scale-to-0 marker and render the stable Deployment at 0")
+		Eventually(func() int32 {
+			rec()
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+			if dep.Spec.Replicas == nil {
+				return -1
+			}
+			return *dep.Spec.Replicas
+		}, "5s", "50ms").Should(Equal(int32(0)), "the stable Deployment is scaled to 0 so the PVC can finalize")
+		dm := getDM("unstick")
+		Expect(dm.Status.StoreFinalizeStoppedForRevision).To(Equal(rev), "the scale-to-0 is recorded durably")
+		Expect(degradedReason(dm)).To(Equal(reasonStoreTerminating), "Degraded stays StoreTerminating while scaled to 0")
+		deg := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg.Message).To(ContainSubstring("scaled the stable Deployment to 0"))
+
+		By("the PVC finalizes (nothing mounts it now); recovery recreates it (annotated) and clears the marker")
+		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
+		pvc.Finalizers = nil
+		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, pvcKey, &corev1.PersistentVolumeClaim{}))
+		}, "5s", "50ms").Should(BeTrue())
+		rec()
+		recreated := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, pvcKey, recreated)).To(Succeed())
+		Expect(recreated.Annotations).To(HaveKeyWithValue(storeRecoveringAnnotation, annotationTrue), "recovery recreated the store")
+		Expect(getDM("unstick").Status.StoreFinalizeStoppedForRevision).To(BeEmpty(), "the marker clears once the PVC is no longer Terminating")
+
+		By("recovery completes: the store refills and the stable scales back to its replicas")
+		Eventually(func() bool {
+			rec()
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM("unstick"), rev)}, &batchv1.Job{}) == nil
+		}, "5s", "50ms").Should(BeTrue(), "the recovery prefetch Job is created")
+		markJobComplete(prefetchName(getDM("unstick"), rev))
+		Eventually(func() int32 {
+			rec()
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+			if dep.Spec.Replicas == nil {
+				return -1
+			}
+			return *dep.Spec.Replicas
+		}, "10s", "50ms").Should(Equal(int32(1)), "the stable Deployment scales back once its store is recovered")
+	})
+
 	// A new decisionmodel.io/retry token resets an exhausted stable-store
 	// recovery and is consumed once; the same token does nothing. The token logic
 	// lives in applyRetryToken; it is exercised deterministically below (the full
