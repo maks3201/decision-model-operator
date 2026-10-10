@@ -504,8 +504,11 @@ spec:
 		_ = stableBefore
 	})
 
-	// PENDING: depends on hitting the Stabilizing window and the 30s post-promotion
-	// debounce precisely; enable alongside the store-loss scenario once the chaos CI is
+	// Post-promotion stabilization safety net: a brief stable-Pod loss inside the
+	// post-promotion debounce (30s) self-heals with no rollback, but a stable held
+	// below quorum past the debounce rolls back to the previous revision. The window
+	// is driven entirely from status (the Stabilizing condition and
+	// status.lastPromotionTime), never a wall-clock guess.
 	It("tolerates a brief stable-Pod loss in the debounce but rolls back when held down past it", func() {
 		stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(err).NotTo(HaveOccurred())
@@ -523,8 +526,8 @@ spec:
 			promotion:    "Automatic",
 		})
 
-		var candHash string
-		By("waiting for the Stabilizing window to open")
+		var candHash, promotedAt string
+		By("waiting for the Stabilizing window to open (driven from status, not wall-clock)")
 		Eventually(func(g Gomega) {
 			h, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 			g.Expect(h).NotTo(Equal(stableBefore))
@@ -533,6 +536,11 @@ spec:
 			stab, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
 				"{.status.conditions[?(@.type=='Stabilizing')].status}")
 			g.Expect(stab).To(Equal("True"))
+			// status.lastPromotionTime anchors the post-promotion window; it must be
+			// set once the candidate is promoted, so the debounce is measured from
+			// status rather than a guessed wall-clock offset.
+			promotedAt, _ = utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.lastPromotionTime}")
+			g.Expect(promotedAt).NotTo(BeEmpty(), "status.lastPromotionTime must be set after promotion")
 		}, 12*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("(a) deleting the stable Pod once; it recovers within the 30s debounce, no rollback")
@@ -551,6 +559,11 @@ spec:
 			"a stable Pod that returns within the debounce must not trigger a rollback")
 		mid, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 		Expect(mid).To(Equal(candHash), "the revision stays stable after a brief Pod loss")
+		// Still the same post-promotion window: no re-promotion happened, so the
+		// anchor is unchanged.
+		stillPromotedAt, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.lastPromotionTime}")
+		Expect(stillPromotedAt).To(Equal(promotedAt),
+			"a brief Pod loss must not re-promote; the stabilization window anchor is unchanged")
 
 		By("(b) holding the stable Pods down past the debounce -> RolledBackAfterPromotion")
 		// Keep the new stable below quorum for longer than postPromotionDebounce (30s) so
@@ -573,11 +586,14 @@ spec:
 		Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(BeNumerically(">=", 1),
 			"holding the stable down past the debounce should emit RolledBackAfterPromotion")
 		closeStop() // stop deleting so the rolled-back previous revision can serve
-		// Rolled back to the previous revision; it is the stable again and still serving.
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
-		}, 3*time.Minute, 5*time.Second).Should(Equal(stableBefore),
-			"the Service/stable should return to the previous revision after the rollback")
+		// Rolled back to the previous revision: it is the stable again AND the Service
+		// selects it again (traffic is back on the previous revision).
+		Eventually(func(g Gomega) {
+			h, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			g.Expect(h).To(Equal(stableBefore), "the stable should return to the previous revision")
+			g.Expect(serviceRevision(chaosNS, dm)).To(Equal(stableBefore),
+				"the Service should select the previous revision after the rollback")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 	})
 })
 
