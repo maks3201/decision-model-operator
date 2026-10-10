@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -260,9 +261,9 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 			for _, s := range gates {
 				g.Expect(s).To(Equal("True"), "every serving Pod's model-ready gate must stay True (got %v)", gates)
 			}
-			eps := fmEndpointCount(dm)
-			g.Expect(eps).To(Equal(3),
-				"the Service must keep exactly 3 distinct ready endpoints (got %d)", eps)
+			eps := fmReadyEndpointIPs(dm)
+			g.Expect(eps).To(HaveLen(3),
+				"the Service must keep exactly 3 distinct ready endpoints (got %d: %v)", len(eps), eps)
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 		close(stop)
 	})
@@ -377,14 +378,19 @@ func fmGateStatuses(name string) []string {
 // addresses across several subsets (so the raw flattened address list over-counts the
 // same Pod IPs); de-duplicating by IP yields the real ready-backend count, which for a
 // stable with N replicas must stay N.
-func fmEndpointCount(name string) int {
+func fmReadyEndpointIPs(name string) []string {
 	out, _ := utils.Kubectl("get", "endpoints", name, "-n", faultMatrixNS,
 		"-o", "jsonpath={.subsets[*].addresses[*].ip}")
 	seen := map[string]struct{}{}
 	for _, ip := range strings.Fields(out) {
 		seen[ip] = struct{}{}
 	}
-	return len(seen)
+	ips := make([]string, 0, len(seen))
+	for ip := range seen {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	return ips
 }
 
 // fmDumpEndpoints prints the Service's Endpoints and EndpointSlices and every Pod's
