@@ -233,6 +233,15 @@ spec:
 		stableBefore := mustStable()
 		pvc := dm + "-store-" + stableBefore
 
+		By("waiting for the post-promotion stabilization window to close")
+		// The previous spec just promoted this stable. Losing all its Pods inside the
+		// stabilization window is, correctly, a rollback trigger; this spec is about
+		// store recovery of a settled stable, so wait until the previous revision is
+		// collected (status.previousRevision cleared) before injecting the fault.
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(registryOutageNS, "decisionmodel", dm, "{.status.previousRevision}")
+		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
+
 		By("faulting the registry, then deleting the stable store PVC and its Pod to force recovery")
 		setMirrorFault("503")
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", registryOutageNS, "--wait=false")
