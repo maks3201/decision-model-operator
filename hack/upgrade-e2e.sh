@@ -62,6 +62,38 @@ kc() { kubectl --context "${kctx}" "$@"; }
 jp() { kc get "$1" "$2" -n "${NS}" -o "jsonpath=$3" 2>/dev/null; }
 note() { echo "=== $* ==="; }
 
+# active_rs <dm> <stable> -- the ReplicaSet currently backing the stable serving
+# Deployment, derived from the running serving Pod's pod-template-hash label
+# (<deployment>-<pod-template-hash>). A roll of the pod template gives the Pods a new
+# pod-template-hash and thus a new ReplicaSet name, so a changed value proves a roll.
+active_rs() {
+  local dm="$1" stable="$2" pth
+  pth="$(kc get pods -n "${NS}" -l "decisionmodel.io/name=${dm},!decisionmodel.io/prefetch-revision" \
+    -o 'jsonpath={.items[0].metadata.labels.pod-template-hash}' 2>/dev/null)"
+  [[ -n "${pth}" ]] || return 0
+  printf '%s-%s' "${dm}-${stable}" "${pth}"
+}
+
+# serving_pod_uids <dm> -- space-separated UIDs of the DM's serving Pods (prefetch
+# Pods excluded via the !prefetch-revision selector), sorted so the comparison is
+# order-independent. A rolled Pod gets a new UID, so a changed set proves a roll.
+serving_pod_uids() {
+  local dm="$1"
+  kc get pods -n "${NS}" -l "decisionmodel.io/name=${dm},!decisionmodel.io/prefetch-revision" \
+    -o 'jsonpath={.items[*].metadata.uid}' 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ' | xargs
+}
+
+# registry_field_present -- true if the installed CRD carries
+# status.stableRevision.registry (the recorded per-revision registry). The adoption
+# assertion only applies once that field exists; before it, the check is skipped so
+# this script stays correct on an older "to" side.
+registry_field_present() {
+  local t
+  t="$(kc get crd decisionmodels.decisionmodel.io \
+    -o 'jsonpath={.spec.versions[*].schema.openAPIV3Schema.properties.status.properties.stableRevision.properties.registry.type}' 2>/dev/null)"
+  [[ -n "${t}" ]]
+}
+
 # wait_ready <dm> — block until the DecisionModel reaches Ready (cold pull + load).
 wait_ready() {
   local dm="$1" phase=""
@@ -77,21 +109,30 @@ wait_ready() {
 
 # Per-DM recorded identity, keyed by DM name (files under $work).
 record_before() {
-  local dm="$1" stable dep spechash res
+  local dm="$1" stable dep spechash res gen rs uids
   stable="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
   dep="${dm}-${stable}"
   spechash="$(jp deploy "${dep}" '{.metadata.annotations.decisionmodel\.io/spec-hash}')"
   res="$(jp deploy "${dep}" '{.spec.template.spec.containers[0].resources}')"
+  gen="$(jp deploy "${dep}" '{.metadata.generation}')"
+  rs="$(active_rs "${dm}" "${stable}")"
+  uids="$(serving_pod_uids "${dm}")"
   [[ -n "${stable}" ]] || { echo "FAIL: no stableRevision.hash recorded for ${dm} on ${from_tag}"; exit 1; }
   [[ -n "${spechash}" ]] || { echo "FAIL: no spec-hash on the stable Deployment ${dep}"; exit 1; }
-  printf '%s\n%s\n%s\n%s\n' "${stable}" "${dep}" "${spechash}" "${res}" >"${work}/${dm}.before"
+  [[ -n "${gen}" ]] || { echo "FAIL: no generation on the stable Deployment ${dep}"; exit 1; }
+  [[ -n "${rs}" ]] || { echo "FAIL: no active ReplicaSet for the stable Deployment ${dep}"; exit 1; }
+  [[ -n "${uids}" ]] || { echo "FAIL: no serving Pod for ${dm} on ${from_tag}"; exit 1; }
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "${stable}" "${dep}" "${spechash}" "${res}" "${gen}" "${rs}" "${uids}" >"${work}/${dm}.before"
   echo "pre-upgrade  ${dm}: stable=${stable} deploy=${dep} spec-hash=${spechash} resources=${res:-<empty>}"
+  echo "pre-upgrade  ${dm}: generation=${gen} replicaset=${rs} pod-uids=${uids}"
 }
 
 # assert_not_rerolled <dm> — compare post-upgrade state to the recorded identity.
 assert_not_rerolled() {
-  local dm="$1" stable_before dep spechash_before res_before
-  { read -r stable_before; read -r dep; read -r spechash_before; read -r res_before; } <"${work}/${dm}.before"
+  local dm="$1" stable_before dep spechash_before res_before gen_before rs_before uids_before
+  { read -r stable_before; read -r dep; read -r spechash_before; read -r res_before
+    read -r gen_before; read -r rs_before; read -r uids_before; } <"${work}/${dm}.before"
 
   local ok="" phase stable_now cand_now
   for _ in $(seq 1 60); do
@@ -104,10 +145,14 @@ assert_not_rerolled() {
     sleep 5
   done
 
-  local spechash_after res_after
+  local spechash_after res_after gen_after rs_after uids_after
   spechash_after="$(jp deploy "${dep}" '{.metadata.annotations.decisionmodel\.io/spec-hash}')"
   res_after="$(jp deploy "${dep}" '{.spec.template.spec.containers[0].resources}')"
+  gen_after="$(jp deploy "${dep}" '{.metadata.generation}')"
+  rs_after="$(active_rs "${dm}" "${stable_before}")"
+  uids_after="$(serving_pod_uids "${dm}")"
   echo "post-upgrade ${dm}: phase=${phase:-} stable=${stable_now:-} candidate=${cand_now:-<none>} spec-hash=${spechash_after:-} resources=${res_after:-<empty>}"
+  echo "post-upgrade ${dm}: generation=${gen_after:-} replicaset=${rs_after:-} pod-uids=${uids_after:-}"
 
   local fail=""
   [[ "${ok}" = "yes" ]] || fail="phase=${phase:-}, stable ${stable_before} -> ${stable_now:-}, candidate=${cand_now:-}"
@@ -115,10 +160,18 @@ assert_not_rerolled() {
   [[ -z "${cand_now:-}" ]] || fail="a candidate was created by the upgrade: ${cand_now}"
   [[ "${spechash_after:-}" = "${spechash_before}" ]] || fail="stable spec-hash changed ${spechash_before} -> ${spechash_after:-} (pod template rewritten)"
   [[ "${res_after:-}" = "${res_before:-}" ]] || fail="stable pod-template resources changed on a no-op upgrade: '${res_before:-}' -> '${res_after:-}' (resource freeze violated — new engine defaults leaked onto a running stable)"
+  # The Deployment itself must not roll at all on a no-op upgrade: generation, the
+  # backing ReplicaSet and the serving Pod UIDs are all unchanged (a status-only
+  # registry adoption must not touch the pod template).
+  [[ "${gen_after:-}" = "${gen_before}" ]] || fail="stable Deployment generation changed ${gen_before} -> ${gen_after:-} (the Deployment was re-rendered)"
+  [[ "${rs_after:-}" = "${rs_before}" ]] || fail="stable ReplicaSet changed ${rs_before} -> ${rs_after:-} (the Deployment rolled)"
+  [[ "${uids_after:-}" = "${uids_before}" ]] || fail="stable serving Pod UIDs changed '${uids_before}' -> '${uids_after:-}' (Pods were recreated)"
 
   if [[ -n "${fail}" ]]; then
     echo "FAIL (upgrade ${from_tag} -> source, ${dm}): ${fail}"
     kc describe decisionmodel "${dm}" -n "${NS}" | tail -40
+    echo "--- rollout history for deployment/${dep} ---"
+    kc rollout history "deployment/${dep}" -n "${NS}" 2>&1 | tail -40 || true
     return 1
   fi
 
@@ -133,7 +186,24 @@ assert_not_rerolled() {
     kc get decisionmodel "${dm}" -n "${NS}" -o yaml | grep -A20 'stableRevision:' | head -25
     return 1
   fi
-  echo "PASS ${dm}: Ready, same stable (${stable_before}), no candidate, pod template + resources unchanged, runtimeVersion=${rtver} populated."
+
+  # Registry adoption (only once the CRD carries the field): after the upgrade the
+  # recorded status.stableRevision.registry must be non-empty, proving the first
+  # reconcile adopted the registry in place without any of the roll signals above
+  # tripping. Skipped on a pre-recording build so the script stays correct there.
+  local reg_after
+  reg_after="$(jp decisionmodel "${dm}" '{.status.stableRevision.registry}')"
+  if registry_field_present; then
+    if [[ -z "${reg_after}" ]]; then
+      echo "FAIL ${dm}: status.stableRevision.registry is empty after the upgrade (registry was not adopted)"
+      kc get decisionmodel "${dm}" -n "${NS}" -o yaml | grep -A20 'stableRevision:' | head -25
+      return 1
+    fi
+    echo "note ${dm}: registry adopted in place: ${reg_after}"
+  else
+    echo "note ${dm}: CRD has no status.stableRevision.registry; skipping the adoption check (pre-recording build)"
+  fi
+  echo "PASS ${dm}: Ready, same stable (${stable_before}), no candidate, Deployment not rolled (generation/ReplicaSet/Pods unchanged), runtimeVersion=${rtver} populated."
 }
 
 # assert_store_recovery <dm> — after the upgrade, delete the stable revision's model-
