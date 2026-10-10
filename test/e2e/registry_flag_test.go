@@ -150,6 +150,8 @@ spec:
 			"--allowed-registries="+mirrorHost+","+mirrorHost+".cluster.local",
 			"--allow-insecure-registries",
 		)
+		By("letting the manager-restart reconcile settle (the stable must stay Ready)")
+		flagAwaitDMReady()
 		flagAssertStableUntouched(stableS, genBefore, rsBefore, recordedReg)
 	})
 
@@ -193,6 +195,8 @@ spec:
 			"--allowed-registries="+mirrorHost+","+mirrorHost+".cluster.local",
 			"--allow-insecure-registries",
 		)
+		By("letting the manager-restart reconcile settle (the stable must stay Ready)")
+		flagAwaitDMReady()
 		flagAssertStableUntouched(stableS, genBefore, rsBefore, recordedReg)
 	})
 
@@ -237,7 +241,9 @@ spec:
 // registry flags replaced by exactly the ones given. Unlike patchManagerArgs (which
 // only appends), this can REMOVE --ollaya-registry: it first strips any existing
 // --ollaya-registry / --allowed-registries / --allow-insecure-registries, then
-// appends the supplied extras, and waits for the manager rollout.
+// appends the supplied extras, and waits for the manager rollout. It does NOT wait on
+// the DecisionModel (the first BeforeAll call runs before the DM exists); callers
+// that need the DM to settle after the roll call flagAwaitDMReady explicitly.
 func setManagerArgs(extra ...string) {
 	cur, err := utils.KubectlJSONPath(operatorNamespace, "deployment", "",
 		`{.items[?(@.metadata.labels.control-plane=="controller-manager")].spec.template.spec.containers[0].args[*]}`)
@@ -275,9 +281,13 @@ func setManagerArgs(extra ...string) {
 	_, err = utils.Kubectl("rollout", "status", "deployment/"+name,
 		"-n", operatorNamespace, "--timeout=2m")
 	Expect(err).NotTo(HaveOccurred(), "manager did not roll out after the args patch")
+}
 
-	// Let any reconcile the manager restart triggers settle so a later assert reflects
-	// the flag change only. A Ready stable must be back to Ready quickly (no roll).
+// flagAwaitDMReady waits for the registry-flag DecisionModel to be Ready. It is the
+// settle a caller performs AFTER setManagerArgs so a later assert reflects the flag
+// change only, not a reconcile flap the manager restart triggered. Call it only once
+// the DM exists (not in the first BeforeAll setManagerArgs, before the DM is created).
+func flagAwaitDMReady() {
 	Eventually(func() (string, error) {
 		return utils.KubectlJSONPath(registryFlagNS, "decisionmodel", registryFlagDM, "{.status.phase}")
 	}, 3*time.Minute, 5*time.Second).Should(Equal("Ready"))
