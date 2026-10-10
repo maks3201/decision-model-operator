@@ -64,8 +64,48 @@ jobs:
           # registry-outage need their own clusters (shards below / in test-e2e.yml);
           # scheduler, fleet and ha-switch run once on laya:en in their own jobs --
           # all excluded from the per-model matrix, which runs on a single node
-          # against non-laya models.
-          E2E_LABEL_FILTER: "!ha && !ha-switch && !chaos && !recreate && !scheduler && !fleet && !scheduler-edge && !registry-outage"
+          # against non-laya models. fault-matrix is laya-specific (gap 1 pulls
+          # laya:multilingual) and runs in its own job below.
+          E2E_LABEL_FILTER: "!ha && !ha-switch && !chaos && !recreate && !scheduler && !fleet && !scheduler-edge && !registry-outage && !fault-matrix"
+        run: make test-e2e
+
+  # Fault-matrix container (fault_matrix_test.go): a spec.model change during an
+  # in-flight stable store recovery, manager-Pod restarts across the promotion seam,
+  # and concurrent reconciles against a multi-replica stable. laya:en +
+  # laya:multilingual over the default registry (no mirror); single-node is enough.
+  # Selected by the "fault-matrix" label; nightly only. free_disk is on (two model
+  # stores on the kind node).
+  fault-matrix:
+    name: kind (kustomize fault-matrix, CPU, laya:en)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Free disk space
+        run: |
+          echo "disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+          echo "disk after:"; df -h /
+
+      - name: Run e2e
+        env:
+          E2E_INSTALL: kustomize
+          E2E_LABEL_FILTER: "fault-matrix"
+          KIND_CLUSTER: dmo-e2e-fault-matrix
         run: make test-e2e
 
   # Scheduler/storage edge cases (capacity-1 resource with a terminating Pod,
