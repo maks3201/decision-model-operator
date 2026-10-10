@@ -100,7 +100,7 @@ func (p *argProber) Reinspect(_ context.Context, _ *corev1.Pod, _ engine.Engine,
 	return p.answer(model)
 }
 
-// This suite reproduces the P0 measured on kind (B flap measurement): a Ready
+// This suite reproduces the P0 measured on kind: a Ready
 // single-replica DecisionModel whose spec.model is changed to a tag that does not
 // resolve must keep its SERVING stable Pod gated True and in the Service. The gate
 // must be decided from the stable's recorded identity (status.stableRevision),
@@ -204,7 +204,7 @@ var _ = Describe("the serving stable gate survives a failing candidate resolve",
 	// model-ready, the DM stays Ready, the stable Deployment is not rolled, and the
 	// prober is never asked about badModel (the broken live spec). It advances the
 	// clock past the regate interval first, so the already-True Pod is re-inspected
-	// (the window B measured on kind).
+	// (the window measured on kind).
 	assertStableGateSurvives := func(r *DecisionModelReconciler, pr *argProber, name, revA, badModel string) {
 		depBefore := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-" + revA}, depBefore)).To(Succeed())
@@ -322,7 +322,11 @@ var _ = Describe("the serving stable gate survives a failing candidate resolve",
 			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
 			Engines: map[string]engine.Engine{"ollaya": fake}, Prober: pr,
 			Recorder: events.NewFakeRecorder(64), Now: func() time.Time { return clk },
-			MaxConcurrentRollouts: 1,
+			// Drive "q" to Ready with the budget disabled so its first rollout is
+			// never queued behind another spec's in-flight rollout sharing the
+			// envtest apiserver (the budget List is cluster-wide). The budget is
+			// enabled below, only for the holder+queue phase this spec is about.
+			MaxConcurrentRollouts: 0,
 		}
 		rec := func(n string) {
 			_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: n}})
@@ -339,13 +343,31 @@ var _ = Describe("the serving stable gate survives a failing candidate resolve",
 		mk("q")
 		rec("q")
 		revQ := RevisionHash(getDM("q").Spec, defaultDigest, fakeImage)
-		markJobComplete("q", revQ)
+		// Reconcile until the prefetch Job exists, then complete it in the same
+		// Eventually so the test never reads it before the controller created it
+		// (CI flake #116: the Job can be created a reconcile after the candidate is
+		// first recorded). A transient NotFound just retries.
+		Eventually(func() error {
+			rec("q")
+			job := &batchv1.Job{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("q", revQ)}, job); err != nil {
+				return err
+			}
+			now := metav1.Now()
+			job.Status.StartTime, job.Status.CompletionTime = &now, &now
+			job.Status.Conditions = []batchv1.JobCondition{
+				{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue},
+				{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+			}
+			return k8sClient.Status().Update(ctx, job)
+		}, "5s", "20ms").Should(Succeed())
 		rec("q")
 		mkGatedPod("q", revQ, "q-a")
 		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { rec("q"); return getDM("q").Status.Phase },
 			"5s", "20ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
 
 		// A holder DM takes the single rollout slot (records a candidate).
+		r.MaxConcurrentRollouts = 1
 		mk("holder")
 		rec("holder")
 		pr.set("kev:en", engine.Loaded{Name: "kev:en", Digest: defaultDigest, Device: "cpu"})

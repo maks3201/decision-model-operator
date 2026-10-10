@@ -1065,12 +1065,37 @@ func strategyMatches(live, want appsv1.DeploymentStrategy) bool {
 
 // freezeFromLive copies the parts of a serving Pod template that are decided when
 // a revision is created from the live Deployment onto a freshly rendered PodSpec:
-// placement (nodeSelector, tolerations, affinity, runtimeClassName) and the
-// serving container's resources. They only change through a new revision. This is
-// what keeps an operator upgrade (the GPU toleration, the arch selector, new
-// engine resource defaults) from rolling every running stable in place, and what
-// keeps a pending or failed candidate's scheduling from leaking into the stable.
-// Containers are matched by name.
+// placement (nodeSelector, tolerations, affinity, runtimeClassName), the serving
+// container's resources, and the serving container's environment values. They
+// only change through a new revision. This is what keeps an operator upgrade (the
+// GPU toleration, the arch selector, new engine resource defaults) from rolling
+// every running stable in place, and what keeps a pending or failed candidate's
+// scheduling from leaking into the stable. Containers are matched by name.
+//
+// Environment: the serving env is rendered from the recorded revision EXCEPT for
+// values an engine derives from a manager flag rather than the revision — today
+// OLLAYA_REGISTRY, set from --ollaya-registry on serving Pods so `ollaya serve`
+// resolves the store under manifests/<registry host>/.... That host is fixed when
+// the model is prefetched, so it is a property of the stored revision, not of the
+// current flag; a flag change (operator restart against a different or temporarily
+// broken registry) must NOT re-render a running stable's template and roll its
+// replica onto a Pod that then cannot find the recorded model in the store
+// (the P0: a candidate-only spec.model change under a changed registry rolled the
+// stable). We cannot generically tell flag-derived env from revision-derived env
+// here, so for every env var the fresh render shares a NAME with the live
+// template we keep the LIVE entry verbatim: revision-derived vars (OLLAYA_DEVICE,
+// OLLAYA_THREADS, …) render byte-identically so this is a no-op for them, the
+// API-key var is a secretKeyRef whose entry is identical regardless of the key
+// value (rotation rolls via the template annotation, not the env), and the only
+// var that actually drifts — OLLAYA_REGISTRY — is pinned to what the stable was
+// built with. Names the fresh render adds or drops (e.g. adding/removing auth)
+// still take effect, so a genuine spec change to the stable rolls as before.
+//
+// Known limit: resetting --ollaya-registry back to the engine default while a
+// stable built under a non-default registry is running drops OLLAYA_REGISTRY from
+// the fresh render (no shared name to freeze) and rolls that stable; recording the
+// registry on the revision and rendering the serving env from it is the complete
+// fix (an engine-contract change).
 func freezeFromLive(podSpec *corev1.PodSpec, live *corev1.PodSpec) {
 	podSpec.NodeSelector = live.NodeSelector
 	podSpec.Tolerations = live.Tolerations
@@ -1080,7 +1105,31 @@ func freezeFromLive(podSpec *corev1.PodSpec, live *corev1.PodSpec) {
 		for j := range live.Containers {
 			if live.Containers[j].Name == podSpec.Containers[i].Name {
 				podSpec.Containers[i].Resources = *live.Containers[j].Resources.DeepCopy()
+				freezeEnvFromLive(&podSpec.Containers[i], &live.Containers[j])
 			}
+		}
+	}
+}
+
+// freezeEnvFromLive keeps the live entry for every env var the fresh render and
+// the live serving container share by NAME; env names only the fresh render has
+// (or only live has) are left to the fresh render, so adding or removing an env
+// var — e.g. toggling auth — still takes effect. See freezeFromLive for why: it
+// pins flag-derived values such as OLLAYA_REGISTRY to what the stable was built
+// with without the controller needing to know which vars are flag-derived.
+func freezeEnvFromLive(want, live *corev1.Container) {
+	liveEnv := make(map[string]corev1.EnvVar, len(live.Env))
+	for _, e := range live.Env {
+		liveEnv[e.Name] = e
+	}
+	for i := range want.Env {
+		// References (the API-key secretKeyRef) are spec inputs that may change in
+		// place (a different Secret or key); only literal values are frozen.
+		if want.Env[i].ValueFrom != nil {
+			continue
+		}
+		if le, ok := liveEnv[want.Env[i].Name]; ok && le.ValueFrom == nil {
+			want.Env[i] = *le.DeepCopy()
 		}
 	}
 }
