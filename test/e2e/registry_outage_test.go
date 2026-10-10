@@ -145,7 +145,7 @@ spec:
 			g.Expect(reason).To(Equal("ResolveFailed"),
 				"a DNS failure should be a transient ResolveFailed, not ModelNotFound")
 		}, 4*time.Minute, 5*time.Second).Should(Succeed())
-		assertStableKeepsServing(stableBefore)
+		assertStableKeepsServing(stableBefore, "Ready")
 
 		By("restoring the real registry host and model recovers Resolved=True, stable intact")
 		patchManagerArgs(
@@ -179,7 +179,7 @@ spec:
 			g.Expect(reason).To(Equal("ResolveFailed"),
 				"a TCP reset should be a transient ResolveFailed, not ModelNotFound")
 		}, 4*time.Minute, 5*time.Second).Should(Succeed())
-		assertStableKeepsServing(stableBefore)
+		assertStableKeepsServing(stableBefore, "Ready")
 
 		By("clearing the fault and restoring the model recovers Resolved=True")
 		clearMirrorFault()
@@ -214,7 +214,7 @@ spec:
 			g.Expect(phase).NotTo(BeElementOf("Failed", "RolledBack"),
 				"an outage during prefetch must keep the rollout waiting, not fail it")
 		}, 40*time.Second, 5*time.Second).Should(Succeed())
-		assertStableKeepsServing(stableBefore)
+		assertStableKeepsServing(stableBefore, "Caching")
 
 		By("clearing the fault lets the prefetch complete and the candidate promote")
 		clearMirrorFault()
@@ -292,23 +292,22 @@ func patchResourcesCPU(cpu string) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// assertStableKeepsServing asserts the DM keeps SERVING the given stable revision
-// through a transient candidate-side registry fault: the stable revision identity
-// is unchanged, the rollout never lands in a terminal Failed/RolledBack, and the
-// stable's Service keeps a ready endpoint. It deliberately tolerates a transient
 // assertStableKeepsServing asserts the strict property the registry-outage specs
 // exist for: a transient, candidate-side registry fault must not disturb the
-// already-serving stable at all. The stable does not need the registry, so during
-// the fault its phase stays Ready, its revision identity is unchanged, and its
-// Service keeps a ready endpoint. Callers MUST have let any manager-restart flap
-// settle (manager rolled out AND the DM back to Ready) BEFORE injecting the fault,
-// so a strict phase==Ready here reflects the registry fault only, not a restart
-// artifact (see the DNS spec).
-func assertStableKeepsServing(stable string) {
+// already-serving stable. The stable does not need the registry, so during the
+// fault its revision identity is unchanged and its Service keeps a ready endpoint.
+//
+// wantPhase is the phase the DM must hold throughout: "Ready" when the fault hits
+// before a candidate is admitted (Resolve fails, no rollout in progress), or the
+// rollout stage (e.g. "Caching") once a candidate is admitted, because the phase
+// reports the rollout stage. Callers MUST have let any manager-restart flap settle
+// (manager rolled out AND the DM back to Ready) BEFORE injecting the fault, so the
+// phase check reflects the registry fault only (see the DNS spec).
+func assertStableKeepsServing(stable, wantPhase string) {
 	Consistently(func(g Gomega) {
 		phase, _ := utils.KubectlJSONPath(registryOutageNS, "decisionmodel", registryOutageDM, "{.status.phase}")
-		g.Expect(phase).To(Equal("Ready"),
-			"a transient candidate-side registry outage must keep the serving stable Ready")
+		g.Expect(phase).To(Equal(wantPhase),
+			"a transient candidate-side registry outage must not move the DecisionModel off "+wantPhase)
 		stableNow, _ := utils.KubectlJSONPath(registryOutageNS, "decisionmodel", registryOutageDM,
 			"{.status.stableRevision.hash}")
 		g.Expect(stableNow).To(Equal(stable),
