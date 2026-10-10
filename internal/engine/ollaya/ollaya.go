@@ -1022,7 +1022,7 @@ func setAuth(req *http.Request, apiKey string) {
 const (
 	// DefaultRuntimeVersion is the Ollaya release this operator build defaults to
 	// when a DecisionModel pins no version and sets no explicit image.
-	DefaultRuntimeVersion = "0.12.0"
+	DefaultRuntimeVersion = "0.12.1"
 	// MinRuntimeVersion is the oldest release we have verified; older versions are
 	// rejected by ValidateRuntimeVersion.
 	MinRuntimeVersion = "0.7.3"
@@ -1050,7 +1050,7 @@ type runtimeImageDigest struct {
 // it unless unpinned runtime images are explicitly allowed.
 //
 // Digests captured with `docker buildx imagetools inspect ghcr.io/ollaya-dev/ollaya:<tag>`
-// (the top-level "Digest:" of the OCI image index), 2026-10-07:
+// (the top-level "Digest:" of the OCI image index), 2026-10-07 (0.12.1 added 2026-10-10):
 //
 //	0.7.3        index sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9  (linux/amd64 + linux/arm64)
 //	0.7.3-cuda   index sha256:b35eedf0c0464455240820a32f755f58d53e68e99c0007c75c8c60fb2309c8d6  (linux/amd64 only)
@@ -1060,6 +1060,8 @@ type runtimeImageDigest struct {
 //	0.11.0-cuda  index sha256:239045853b01fc919a33f5206b51c0e3a4d8a744bed3f94998a650589561baec  (linux/amd64 only)
 //	0.12.0       index sha256:f79e865fda7af45aa66617b85fe16b08688d27f83a3137a21c75d3b137d8cf39  (linux/amd64 + linux/arm64)
 //	0.12.0-cuda  index sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7  (linux/amd64 only)
+//	0.12.1       index sha256:3df3abed69968abd8957f07edb9658b82d23e483dd10d946e4b7b9af4359d38c  (linux/amd64 + linux/arm64)
+//	0.12.1-cuda  index sha256:65b5213ac30c68f93d6cd8554602d90ca85854f68e1e8339c41fce6e7644c470  (linux/amd64 only)
 var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.7.3": {
 		cpu:  "sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9",
@@ -1076,6 +1078,10 @@ var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.12.0": {
 		cpu:  "sha256:f79e865fda7af45aa66617b85fe16b08688d27f83a3137a21c75d3b137d8cf39",
 		cuda: "sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7",
+	},
+	"0.12.1": {
+		cpu:  "sha256:3df3abed69968abd8957f07edb9658b82d23e483dd10d946e4b7b9af4359d38c",
+		cuda: "sha256:65b5213ac30c68f93d6cd8554602d90ca85854f68e1e8339c41fce6e7644c470",
 	},
 }
 
