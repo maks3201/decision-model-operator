@@ -379,17 +379,16 @@ func main() {
 		Cache:                  cacheOptions,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "4aba9cc6.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// Step down voluntarily when the Manager's context is cancelled (SIGTERM on
+		// an upgrade/rollout). The binary ends immediately after mgr.Start returns —
+		// main() does no post-Start work and holds no deferred API cleanup — so
+		// releasing the lease early is safe. Without this, a new manager must wait
+		// out the full LeaseDuration (controller-runtime default 15s) before it can
+		// acquire leadership and run the first reconcile; releasing on cancel lets
+		// the successor acquire within a RetryPeriod (default 2s). Lease timing is
+		// left at the controller-runtime defaults (LeaseDuration 15s, RenewDeadline
+		// 10s, RetryPeriod 2s).
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
