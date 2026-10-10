@@ -121,6 +121,13 @@ func TestClassifyPrefetchFailure(t *testing.T) {
 				t.Errorf("classifyPrefetchFailure(%q, %d) = (%q, %v), want (%q, %v)",
 					tt.msg, tt.exit, reason, permanent, tt.wantReason, tt.wantPermanent)
 			}
+			// The exported engine method is the controller's actual entry point
+			// (engine.PrefetchFailureClassifier); it must return the same thing.
+			er, ep := New().ClassifyPrefetchFailure(tt.msg, tt.exit)
+			if er != tt.wantReason || ep != tt.wantPermanent {
+				t.Errorf("(*Engine).ClassifyPrefetchFailure(%q, %d) = (%q, %v), want (%q, %v)",
+					tt.msg, tt.exit, er, ep, tt.wantReason, tt.wantPermanent)
+			}
 		})
 	}
 }

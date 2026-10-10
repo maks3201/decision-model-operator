@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,9 +27,11 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -254,5 +257,187 @@ var _ = Describe("stable store lost then a spec change", func() {
 		// The candidate's own revision still exists (not blocked by the recovery).
 		Expect(getDM("sl2").Status.CandidateRevision).NotTo(BeNil())
 		Expect(getDM("sl2").Status.CandidateRevision.Hash).To(Equal(rev2))
+	})
+
+	// --- Visibility: the candidate-path recovery surfaces the stable store health
+	// on Degraded (the rollout phase stays the candidate's), deduped, and clears it
+	// once the store is serveable again.
+	degraded := func(name string) *metav1.Condition {
+		return meta.FindStatusCondition(getDM(name).Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	}
+	drainWarnings := func(r *DecisionModelReconciler, sub string) int {
+		fr := r.Recorder.(*events.FakeRecorder)
+		n := 0
+		for {
+			select {
+			case e := <-fr.Events:
+				if strings.Contains(e, sub) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	loseStoreThenChangeModel := func(r *DecisionModelReconciler, pr *revProber, name string) (string, string, string) {
+		rev1 := driveReady(r, name)
+		claim := storeNameRev(getDM(name), rev1)
+		deletePVCHard(claim)
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name + "-pod-" + rev1}})).To(Succeed())
+		// Delete the original (Complete) prefetch Job too: it predates the recreated
+		// PVC, so leaving it would make the kick keep deleting it as stale rather
+		// than reaching the recovering/no-Job state the recovery drives from.
+		bg := metav1.DeletePropagationBackground
+		if j := (&batchv1.Job{}); k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev1)}, j) == nil {
+			Expect(k8sClient.Delete(ctx, j, &client.DeleteOptions{PropagationPolicy: &bg})).To(Succeed())
+		}
+		Eventually(func() bool { return pvcExists(claim) }, "5s", "50ms").Should(BeFalse())
+		fake := r.Engines["ollaya"].(*fakeEngine)
+		fake.digest = digest2
+		pr.set(rev1, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) { d.Spec.Model = "kev:en" })).To(Succeed())
+		rev2 := RevisionHash(getDM(name).Spec, digest2, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: "kev:en", Digest: digest2, Device: "cpu"})
+		return rev1, rev2, claim
+	}
+
+	It("surfaces Degraded=StoreLost while rebuilding, deduped, then clears it when the store is refilled", func() {
+		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := newRec(pr)
+		rev1, _, claim := loseStoreThenChangeModel(r, pr, "vis1")
+
+		By("Degraded=StoreLost appears while the store is being rebuilt")
+		Eventually(func() string {
+			rec(r, "vis1")
+			if d := degraded("vis1"); d != nil {
+				return d.Reason
+			}
+			return ""
+		}, "10s", "50ms").Should(Equal(reasonStoreLost))
+		Expect(degraded("vis1").Status).To(Equal(metav1.ConditionTrue))
+		// The rollout phase stays the candidate's (not forced to a stable phase).
+		Expect(getDM("vis1").Status.CandidateRevision).NotTo(BeNil())
+
+		By("the StoreLost Warning is deduped across five reconciles")
+		_ = drainWarnings(r, "") // clear accumulated events
+		warnings := 0
+		for i := 0; i < 5; i++ {
+			rec(r, "vis1")
+			warnings += drainWarnings(r, eventStoreLost)
+		}
+		Expect(warnings).To(Equal(0), "StoreLost already set: no repeat Warning while rebuilding")
+
+		By("completing the recovery prefetch clears the Degraded condition")
+		Eventually(func() bool {
+			rec(r, "vis1")
+			if jobExists("vis1", rev1) {
+				markJob("vis1", rev1)
+				rec(r, "vis1")
+			}
+			d := degraded("vis1")
+			return d == nil || d.Reason != reasonStoreLost
+		}, "15s", "50ms").Should(BeTrue(), "once the store is serveable again the recovery Degraded is cleared")
+		Expect(getPVC(claim).Annotations).NotTo(HaveKey(storeRecoveringAnnotation))
+	})
+
+	It("surfaces Degraded=StorePrefetchFailed when the recovery prefetch Job fails", func() {
+		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		r := newRec(pr)
+		rev1, _, _ := loseStoreThenChangeModel(r, pr, "vis2")
+
+		By("driving to the recovery Job, then failing it")
+		Eventually(func() bool {
+			rec(r, "vis2")
+			return jobExists("vis2", rev1)
+		}, "10s", "50ms").Should(BeTrue())
+		failJob := func(name, rev string) {
+			Eventually(func() error {
+				job := &batchv1.Job{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName(name, rev)}, job); err != nil {
+					return err
+				}
+				if jobFailed(job) {
+					return nil
+				}
+				now := metav1.Now()
+				if job.Status.StartTime == nil {
+					job.Status.StartTime = &now
+				}
+				job.Status.Conditions = []batchv1.JobCondition{
+					{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue},
+					{Type: batchv1.JobFailed, Status: corev1.ConditionTrue},
+				}
+				return k8sClient.Status().Update(ctx, job)
+			}, "3s", "20ms").Should(Succeed())
+		}
+		failJob("vis2", rev1)
+
+		By("the candidate path surfaces Degraded=StorePrefetchFailed, deduped over five reconciles")
+		Eventually(func() string {
+			rec(r, "vis2")
+			if d := degraded("vis2"); d != nil {
+				return d.Reason
+			}
+			return ""
+		}, "10s", "50ms").Should(Equal(reasonStorePrefetchFailed))
+		_ = drainWarnings(r, "")
+		warnings := 0
+		for i := 0; i < 5; i++ {
+			rec(r, "vis2")
+			warnings += drainWarnings(r, eventStorePrefetchFail)
+		}
+		Expect(warnings).To(Equal(0), "StorePrefetchFailed already set: no repeat Warning")
+		Expect(getDM("vis2").Status.CandidateRevision).NotTo(BeNil(), "the rollout phase stays the candidate's")
+	})
+
+	It("surfaces Degraded=RegistryNotAllowed when the recovery guard refuses, deduped", func() {
+		pr := &revProber{fallback: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}}
+		// Allow-list refuses the recorded stable registry.
+		r := &DecisionModelReconciler{
+			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:                 map[string]engine.Engine{"ollaya": newFakeEngine()},
+			Prober:                  pr,
+			AllowedRegistries:       []string{"ollaya.dev"},
+			AllowInsecureRegistries: true,
+			Recorder:                events.NewFakeRecorder(256),
+			Now:                     func() time.Time { return clock },
+		}
+		rev1 := driveReady(r, "vis3")
+		claim := storeNameRev(getDM("vis3"), rev1)
+		By("record a now-disallowed registry on the stable, then lose its store and change the model")
+		Expect(updateDMStatus(ctx, namespace, "vis3", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.StableRevision.Registry = "https://disallowed.example.com"
+		})).To(Succeed())
+		deletePVCHard(claim)
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "vis3-pod-" + rev1}})).To(Succeed())
+		bg := metav1.DeletePropagationBackground
+		if j := (&batchv1.Job{}); k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: jobName("vis3", rev1)}, j) == nil {
+			Expect(k8sClient.Delete(ctx, j, &client.DeleteOptions{PropagationPolicy: &bg})).To(Succeed())
+		}
+		Eventually(func() bool { return pvcExists(claim) }, "5s", "50ms").Should(BeFalse())
+		fake := r.Engines["ollaya"].(*fakeEngine)
+		fake.digest = digest2
+		pr.set(rev1, engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"})
+		Expect(updateDM(ctx, namespace, "vis3", func(d *decisionmodelv1alpha1.DecisionModel) { d.Spec.Model = "kev:en" })).To(Succeed())
+		rev2 := RevisionHash(getDM("vis3").Spec, digest2, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: "kev:en", Digest: digest2, Device: "cpu"})
+
+		By("the candidate path surfaces Degraded=RegistryNotAllowed and creates no recovery Job")
+		Eventually(func() string {
+			rec(r, "vis3")
+			if d := degraded("vis3"); d != nil {
+				return d.Reason
+			}
+			return ""
+		}, "10s", "50ms").Should(Equal(reasonRegistryNotAllowed))
+		Expect(jobExists("vis3", rev1)).To(BeFalse(), "a disallowed recovery registry must not create a prefetch Job")
+		_ = drainWarnings(r, "")
+		warnings := 0
+		for i := 0; i < 5; i++ {
+			rec(r, "vis3")
+			warnings += drainWarnings(r, eventRegistryNotAllowed)
+		}
+		Expect(warnings).To(Equal(0), "RegistryNotAllowed already set: no repeat Warning")
+		Expect(getDM("vis3").Status.CandidateRevision).NotTo(BeNil())
 	})
 })
