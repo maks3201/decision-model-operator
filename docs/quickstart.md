@@ -159,8 +159,11 @@ kubectl apply -f dm.yaml
 kubectl get dm -w
 ```
 
-`dm` is the short name for `DecisionModel`. The columns show `MODEL`, `DEVICE`,
-`PHASE`, and `READY` (model-ready replicas).
+`dm` is the short name for `DecisionModel`. The default columns are `ACTIVE` (the
+serving model), `CANDIDATE` (a model rolling out, if any), `ACCURACY` (the last
+evaluation), `PHASE`, `REASON` (the `Ready` condition reason) and `AGE`. Add
+`-o wide` for `MODEL`, `DIGEST`, `DEVICE`, `READY` (model-ready replicas) and
+`PROMOTED`.
 
 ## What the phases mean
 
@@ -456,7 +459,8 @@ curl -sS -X POST http://127.0.0.1:11435/v1/systemone \
 ```
 
 The response contains one answer per question id. For a `choice` question you
-get `choice`, `confidence` and `probabilities`:
+get `choice`, `confidence` and `probabilities` (the full response also carries
+top-level `model` and `usage` fields, elided here):
 
 ```json
 {"answers": {"department": {"type": "choice", "choice": "billing",
