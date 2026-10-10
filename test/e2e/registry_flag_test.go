@@ -208,6 +208,16 @@ spec:
 	It("recovers the stable store from the recorded registry after the flag is removed", func() {
 		pvc := dm + "-store-" + stableS
 
+		// The previous spec promoted this stable; deleting its store inside the
+		// post-promotion stabilization window would make the controller correctly
+		// roll back to the prior revision (RolledBackAfterPromotion) instead of
+		// recovering the store. Wait for the window to close -- status.previousRevision
+		// cleared -- so this spec exercises store recovery, not a stabilization rollback.
+		By("waiting for the post-promotion stabilization window to close (previousRevision cleared)")
+		Eventually(func() (string, error) {
+			return utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.previousRevision}")
+		}, 10*time.Minute, 10*time.Second).Should(BeEmpty())
+
 		By("deleting the stable store PVC and its serving Pod to force a store recovery")
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", registryFlagNS, "--wait=false")
 		_, _ = utils.Kubectl("delete", "pods", "-l",
