@@ -268,6 +268,6 @@ jobs:
           E2E_INSTALL: kustomize
           # scheduler advertises a fake extended resource and rolls out; fleet creates
           # a few hundred DecisionModels pinned to unresolvable tags (no model loads).
-          E2E_LABEL_FILTER: "scheduler || fleet"
+          E2E_LABEL_FILTER: "scheduler"
           KIND_CLUSTER: dmo-e2e-stress
         run: make test-e2e

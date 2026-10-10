@@ -72,6 +72,11 @@ type Params struct {
 	// sets it only after the ConfigMap is persisted and verified; empty means
 	// "seed from Model.Manifest if present, else pull by tag and verify".
 	ManifestConfigMap *corev1.ConfigMapKeySelector
+	// Registry, if set, is the registry base URL this revision was resolved and
+	// prefetched against (the engine default when empty). Engines whose store
+	// layout depends on the registry host render serving Pods from it, so a later
+	// change of the operator's default registry never changes a running revision.
+	Registry string
 	// StoreSubPath isolates this revision's model store inside the PVC
 	// (mounted via volumeMount.subPath). The controller sets it to the revision
 	// hash, so a tag that moved upstream cannot overwrite the manifest a stable
