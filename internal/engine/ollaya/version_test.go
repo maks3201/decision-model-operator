@@ -31,7 +31,7 @@ func TestValidateRuntimeVersion(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty is default (valid)", "", false},
-		{"default version", "0.12.0", false},
+		{"default version", "0.12.1", false},
 		{"minimum version", "0.7.3", false},
 		{"newer version", "1.2.3", false},
 		{"patch above minimum", "0.7.4", false},
@@ -246,7 +246,7 @@ func TestRuntimeImagePinned(t *testing.T) {
 // (spikes 001/006/008) and must therefore render by digest, so a Pinned
 // candidate recorded under any of them is accepted once the controller enforces
 // pinning. They all lie within [MinRuntimeVersion, DefaultRuntimeVersion].
-var verifiedVersions = []string{"0.7.3", "0.10.0", "0.11.0", "0.12.0"}
+var verifiedVersions = []string{"0.7.3", "0.10.0", "0.11.0", "0.12.0", "0.12.1"}
 
 // TestVerifiedVersionsArePinned asserts that every verified version has both a
 // CPU and a CUDA index digest and that RuntimeImagePinned reports true for both
