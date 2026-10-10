@@ -75,6 +75,12 @@ func (r *DecisionModelReconciler) maintainStable(
 		return r.kickStableStoreRecovery(ctx, dm, eng, stable, claim)
 	}
 	stableParams := r.stableParams(ctx, dm, stable, claim)
+	// The stable store is serveable again: clear any Degraded this path set while
+	// the store was recovering (StoreLost / RegistryNotAllowed / StorePrefetchFailed)
+	// so a recovered stable does not keep advertising a stale recovery failure. Only
+	// the recovery-owned reasons are cleared; a Degraded the candidate flow owns
+	// (e.g. a cache-sharing issue) is left intact.
+	r.clearStoreRecoveryDegraded(dm)
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
 	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, keyChecksum, legacyChecksum, terminating); err != nil {
 		return err
@@ -97,16 +103,20 @@ func (r *DecisionModelReconciler) maintainStable(
 // the candidate path: when the recorded stable loses its store while a new
 // candidate is rolling out, the stable store must be recovered in parallel (its
 // PVC recreated and refilled) rather than left lost until the candidate promotes
-// or fails. It performs only idempotent side effects and returns an error:
-//   - PVC missing            -> recreate it (annotated recovering)
-//   - recovering, completed  -> clear the recovering annotation (store refilled)
-//   - recovering, no Job     -> (re)create the recovery prefetch Job
-//   - recovering, Job live   -> nothing (wait for it; re-driven next reconcile)
+// or fails. It performs idempotent side effects and surfaces the stable store's
+// health on the Degraded condition (deduped) so the recovery is visible while the
+// candidate keeps the rollout phase; it returns only an error:
+//   - PVC missing / recovering     -> Degraded=StoreLost (store being rebuilt)
+//   - recovery guard refused       -> Degraded=RegistryNotAllowed (no prefetch)
+//   - recovery prefetch Job failed -> Degraded=StorePrefetchFailed
+//   - recovering, completed        -> clear the recovering annotation (refilled)
 //
-// A foreign or terminating PVC, or a disallowed registry host, is left alone: the
-// caller continues the candidate rollout either way. The full bounded-retry /
-// stale-Job / failure-classification logic lives in recoverStableStore on the
-// stable path; this is only the forward kick so the lost store does not sit idle.
+// A foreign or terminating PVC is left alone (the stable path owns its condition).
+// The full bounded-retry / stale-Job / failure-classification logic lives in
+// recoverStableStore on the stable path; this is the forward kick so the lost
+// store does not sit idle, plus the visibility the candidate path would otherwise
+// hide. The caller clears the recovery Degraded once the store is serveable again
+// (maintainStable).
 func (r *DecisionModelReconciler) kickStableStoreRecovery(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -120,7 +130,9 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 	case apierrors.IsNotFound(err):
 		// Lost store: recreate the PVC carrying the recovering annotation. The next
 		// reconcile observes it and creates the prefetch Job (never Get a resource
-		// written in the same reconcile from the cache).
+		// written in the same reconcile from the cache). Surface it so the candidate
+		// rollout does not hide a rebuilding stable store.
+		r.degradeStoreLost(ctx, dm, claim)
 		return r.createRecoveryPVC(ctx, dm, stable, claim, legacy)
 	case err != nil:
 		return err
@@ -154,12 +166,21 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 			// (e.g. the original prefetch, before the store was lost and the PVC
 			// recreated): delete it so a fresh prefetch runs next reconcile, matching
 			// the stable path's stale-Complete handling.
+			r.degradeStoreLost(ctx, dm, claim)
 			bg := metav1.DeletePropagationBackground
 			return r.deleteIfOwned(ctx, dm, job, &client.DeleteOptions{PropagationPolicy: &bg})
 		}
-		// Ongoing or failed: leave the full handling (bounded retries, failure
-		// classification) to the stable path's recoverStableStore; re-driven next
-		// reconcile.
+		if jobFailed(job) {
+			// The recovery prefetch failed: surface StorePrefetchFailed so the
+			// candidate rollout does not hide a stable store that cannot refill. The
+			// bounded-retry teardown and permanent-reason classification stay on the
+			// stable path's recoverStableStore; here we only make the failure visible
+			// (deduped by reason).
+			r.degradeStorePrefetchFailed(ctx, dm, claim)
+			return nil
+		}
+		// Ongoing prefetch: the store is still being rebuilt.
+		r.degradeStoreLost(ctx, dm, claim)
 		return nil
 	case !apierrors.IsNotFound(jobErr):
 		return jobErr
@@ -167,11 +188,14 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 
 	// Recovering, no Job: create the recovery prefetch, but only if the recorded
 	// registry and (for an explicit-host name) the model-name host are still
-	// allowed — the same gate the stable path applies. A disallowed host is left to
-	// the stable path to surface Degraded; the candidate rollout is not blocked.
-	if gReason, _ := r.recoveryRegistryGuard(eng, stable); gReason != "" {
+	// allowed — the same gate the stable path applies. A disallowed host surfaces
+	// Degraded=RegistryNotAllowed (deduped) and creates no Job; the candidate
+	// rollout is not blocked.
+	if gReason, gMsg := r.recoveryRegistryGuard(eng, stable); gReason != "" {
+		r.degradeStoreRecoveryBlocked(ctx, dm, stable, gReason, gMsg)
 		return nil
 	}
+	r.degradeStoreLost(ctx, dm, claim)
 	recoveryParams := r.seedManifest(ctx, dm, r.stableParams(ctx, dm, stable, claim), stable.Hash, stable.Digest)
 	_, _, _, perr := r.ensurePrefetchJob(ctx, dm, eng, recoveryParams, stable.Hash)
 	return perr
@@ -590,6 +614,25 @@ func (r *DecisionModelReconciler) degradeStorePrefetchReason(
 		Reason:  reasonStorePrefetchFailed,
 		Message: msg,
 	})
+}
+
+// clearStoreRecoveryDegraded removes a Degraded condition this store-recovery code
+// owns (StoreLost / RegistryNotAllowed / StorePrefetchFailed) once the stable
+// store is serveable again, and clears the recovery attempt bookkeeping. It leaves
+// a Degraded owned by another concern (e.g. cache sharing, resource conflict)
+// intact. Used on the candidate maintenance path, where the recovery sets the
+// condition via kickStableStoreRecovery; the stable path has its own clear via
+// recoverStableStore/applyStableReadiness.
+func (r *DecisionModelReconciler) clearStoreRecoveryDegraded(dm *decisionmodelv1alpha1.DecisionModel) {
+	c := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		return
+	}
+	switch c.Reason {
+	case reasonStoreLost, reasonRegistryNotAllowed, reasonStorePrefetchFailed:
+		meta.RemoveStatusCondition(&dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+		clearStoreRecover(dm)
+	}
 }
 
 // degradeStoreLost sets Degraded=True/StoreLost and emits one Event.
