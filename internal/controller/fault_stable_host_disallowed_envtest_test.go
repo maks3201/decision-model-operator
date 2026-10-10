@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -165,7 +166,7 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
 	})
 
-	// Item 1: steady state. The stable's host leaves the allow-list; a plain
+	// steady state. The stable's host leaves the allow-list; a plain
 	// reconcile must keep the stable serving with no roll, surface the refusal on
 	// Resolved=False/RegistryNotAllowed, and emit EXACTLY ONE Warning across five
 	// reconciles (the Event is deduped by maintainStableAfterPreflight's `changed`
@@ -209,16 +210,12 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 		Expect(podGateTrue(name+"-stable-0")).To(BeTrue(), "the serving stable Pod stays model-ready")
 	})
 
-	// Item 2: the stable store is lost while H is disallowed. The intended
-	// behaviour (store recovery re-checks the recorded registry, the recorded-registry change) is that the
-	// recovery prefetch is NOT created, Degraded=RegistryNotAllowed with one
-	// Warning, and re-allowing H lets recovery proceed and the stable return Ready
-	// on the same hash.
-	//
-	// PENDING: store recovery does not yet check the stable model's own host
-	// against the allow-list; it recreates the PVC and a recovery prefetch Job and
-	// reports StoreLost. Un-pend when the recovery guard covers the model host.
-	PIt("refuses store recovery for a disallowed host and recovers once the host is re-allowed", func() {
+	// the stable store is lost while H is disallowed. Store recovery
+	// re-checks the recorded registry and the model's own host against the current
+	// allow-list: the recovery prefetch is NOT created, Degraded=RegistryNotAllowed
+	// with one deduped Warning, and re-allowing H lets recovery proceed and the
+	// stable return Ready on the same hash.
+	It("refuses store recovery for a disallowed host and recovers once the host is re-allowed", func() {
 		name := "lost"
 		rPermissive := newReconciler([]string{defaultAllowedRegistry, candHost})
 		stableRev := driveReady(rPermissive, name)
@@ -228,15 +225,31 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 		pvc := &corev1.PersistentVolumeClaim{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: storeNameRev(getDM(name), stableRev)}, pvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
+		// Strip the pvc-protection finalizer so the PVC actually disappears under
+		// envtest (no kubelet/GC to drop it); production reaches NotFound the same
+		// way once the last mounting Pod is gone.
+		cur := &corev1.PersistentVolumeClaim{}
+		if gerr := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: storeNameRev(getDM(name), stableRev)}, cur); gerr == nil && len(cur.Finalizers) > 0 {
+			cur.Finalizers = nil
+			Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+		}
 		pod := &corev1.Pod{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name + "-stable-0"}, pod)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		// The original prefetch Job (Complete, from driveReady) is part of the lost
+		// store: delete it so the assertion below checks that no NEW recovery Job is
+		// created while the host is disallowed.
+		oldJob := &batchv1.Job{}
+		if gerr := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM(name), stableRev)}, oldJob); gerr == nil {
+			bg := metav1.DeletePropagationBackground
+			Expect(k8sClient.Delete(ctx, oldJob, &client.DeleteOptions{PropagationPolicy: &bg})).To(Succeed())
+		}
 
 		By("recovery prefetch is NOT created and Degraded=RegistryNotAllowed with one Warning")
 		warnings := 0
 		for i := 0; i < 5; i++ {
 			rec(rStrict, name)
-			warnings += countEvents(rStrict, eventCandidateRejected)
+			warnings += countEvents(rStrict, "store recovery for revision")
 		}
 		job := &batchv1.Job{}
 		recoveryJobErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM(name), stableRev)}, job)
@@ -244,12 +257,17 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 		deg := cond(name, decisionmodelv1alpha1.ConditionDegraded)
 		Expect(deg).NotTo(BeNil())
 		Expect(deg.Reason).To(Equal(reasonRegistryNotAllowed))
-		Expect(warnings).To(Equal(1))
+		Expect(warnings).To(Equal(1), "the refusal Warning must not repeat every reconcile")
 
 		By("re-allowing H lets recovery proceed and the stable returns Ready on the same hash")
 		rBack := newReconciler([]string{defaultAllowedRegistry, candHost})
-		rec(rBack, name)
-		rev2 := getDM(name).Status.StableRevision.Hash
+		rev2 := stableRev
+		// Reconcile until the recovery prefetch Job exists (re-allow recreates the
+		// PVC on one pass, then the Job on the next), then complete it.
+		Eventually(func() bool {
+			rec(rBack, name)
+			return k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM(name), rev2)}, &batchv1.Job{}) == nil
+		}, "5s", "25ms").Should(BeTrue(), "re-allowing the host lets the recovery prefetch Job be created")
 		markPrefetchComplete(ctx, namespace, name, rev2)
 		rec(rBack, name)
 		createReadyPod(name, rev2, name+"-stable-1", "10.0.2.11")
@@ -260,7 +278,7 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(stableRev), "recovery keeps the same revision hash")
 	})
 
-	// Item 3: with H disallowed, spec.model is changed to an allowed host. The new
+	// with H disallowed, spec.model is changed to an allowed host. The new
 	// candidate proceeds normally (its host IS allowed), and promotion retires H:
 	// the new revision becomes the stable.
 	It("lets a spec.model change to an allowed host roll forward and retire the disallowed host", func() {
@@ -298,5 +316,59 @@ var _ = Describe("the allow-list drops the stable's own registry host", func() {
 			return ""
 		}, "6s", "25ms").Should(Equal(candRev), "promotion must retire the disallowed-host revision")
 		Expect(getDM(name).Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseReady))
+	})
+
+	// a host-less name recorded on a mirror. The stable name is "laya:en"
+	// (no explicit host); it was prefetched from mirror M (recorded on the
+	// revision). After an operator restart with the default --ollaya-registry flag
+	// but an allow-list of exactly [M], a lost-store recovery must PROCEED: the
+	// recorded registry M is allowed, and the model-name host check must NOT run
+	// for a host-less name (it would resolve to the default flag host, which is not
+	// in [M], and wrongly refuse). The recovery recreates the annotated PVC and a
+	// prefetch Job.
+	It("recovers a host-less stable recorded on a mirror that is still allowed", func() {
+		name := "mirror"
+		const mirrorURL = "https://mirror.internal:5000"
+		const mirrorHost = "mirror.internal:5000"
+		// Reconciler with the DEFAULT registry flag but an allow-list of only the
+		// mirror host; insecure allowed is irrelevant (https).
+		r := &DecisionModelReconciler{
+			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:           map[string]engine.Engine{"ollaya": newFakeEngine()},
+			Prober:            &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}},
+			AllowedRegistries: []string{mirrorHost},
+			Recorder:          events.NewFakeRecorder(128),
+		}
+		dm := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec:       decisionmodelv1alpha1.DecisionModelSpec{Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1)},
+		}
+		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
+		stable := &decisionmodelv1alpha1.RevisionStatus{
+			Hash: "r1", Engine: "ollaya", Model: "laya:en", Digest: defaultDigest, Device: "cpu",
+			Image: fakeImage, Registry: mirrorURL, // host-less name, pulled from the mirror
+		}
+		dm.Status.StableRevision = stable
+		claim := storeNameRev(dm, stable.Hash)
+
+		By("recovery recreates the annotated PVC and then a prefetch Job (mirror still allowed)")
+		// First pass: PVC missing -> recreate (annotated), handled.
+		handled, _, _, err := r.recoverStableStore(ctx, dm, r.Engines["ollaya"], stable, claim, false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(handled).To(BeTrue())
+		// Next pass: PVC present + recovering, no Job -> a prefetch Job is created
+		// (the recorded mirror host is allowed; the host-less name does not trigger
+		// the model-host check).
+		handled, _, _, err = r.recoverStableStore(ctx, dm, r.Engines["ollaya"], stable, claim, false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(handled).To(BeTrue())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(dm, "r1")}, &batchv1.Job{})).
+			To(Succeed(), "recovery must proceed for a host-less name whose recorded mirror is allowed")
+		deg := cond(name, decisionmodelv1alpha1.ConditionDegraded)
+		if deg != nil {
+			Expect(deg.Reason).NotTo(Equal(reasonRegistryNotAllowed),
+				"a host-less name on an allowed mirror must not be refused")
+		}
 	})
 })

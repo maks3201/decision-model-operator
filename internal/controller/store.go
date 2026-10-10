@@ -63,9 +63,16 @@ func (r *DecisionModelReconciler) maintainStable(
 		return err
 	}
 	if !serveable {
-		// Missing/recovering store: do not render the Deployment against it. The
-		// stable path will recover it after the rollout concludes.
-		return nil
+		// Missing/recovering store: do not render the Deployment against it, but DO
+		// drive the recovery forward in parallel with the candidate (recreate the
+		// annotated PVC, (re)create the recovery prefetch Job, clear the annotation
+		// once a fresh prefetch completed). This never blocks the candidate: it runs
+		// the side effects and returns, letting the caller continue the rollout. A
+		// terminating-but-mounted store is left to the stable path.
+		if terminating {
+			return nil
+		}
+		return r.kickStableStoreRecovery(ctx, dm, eng, stable, claim)
 	}
 	stableParams := r.stableParams(ctx, dm, stable, claim)
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
@@ -83,6 +90,91 @@ func (r *DecisionModelReconciler) maintainStable(
 		return probeErr
 	}
 	return nil
+}
+
+// kickStableStoreRecovery drives the stable revision's store recovery forward by
+// one step WITHOUT owning phase/Service or short-circuiting the caller. It is for
+// the candidate path: when the recorded stable loses its store while a new
+// candidate is rolling out, the stable store must be recovered in parallel (its
+// PVC recreated and refilled) rather than left lost until the candidate promotes
+// or fails. It performs only idempotent side effects and returns an error:
+//   - PVC missing            -> recreate it (annotated recovering)
+//   - recovering, completed  -> clear the recovering annotation (store refilled)
+//   - recovering, no Job     -> (re)create the recovery prefetch Job
+//   - recovering, Job live   -> nothing (wait for it; re-driven next reconcile)
+//
+// A foreign or terminating PVC, or a disallowed registry host, is left alone: the
+// caller continues the candidate rollout either way. The full bounded-retry /
+// stale-Job / failure-classification logic lives in recoverStableStore on the
+// stable path; this is only the forward kick so the lost store does not sit idle.
+func (r *DecisionModelReconciler) kickStableStoreRecovery(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eng engine.Engine,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	claim string,
+) error {
+	_, legacy := r.storeClaimForStable(ctx, dm, stable)
+	pvc := &corev1.PersistentVolumeClaim{}
+	switch err := r.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: claim}, pvc); {
+	case apierrors.IsNotFound(err):
+		// Lost store: recreate the PVC carrying the recovering annotation. The next
+		// reconcile observes it and creates the prefetch Job (never Get a resource
+		// written in the same reconcile from the cache).
+		return r.createRecoveryPVC(ctx, dm, stable, claim, legacy)
+	case err != nil:
+		return err
+	case !ownedBy(pvc, dm):
+		// A foreign PVC holds our name: the stable path's recovery owns the
+		// conflict condition; do nothing here.
+		return nil
+	case pvc.DeletionTimestamp != nil:
+		// Terminating but still present: leave it to the stable path.
+		return nil
+	case pvc.Annotations[storeRecoveringAnnotation] != annotationTrue:
+		// Present and not recovering: the store is healthy (serveable handled it);
+		// nothing to do.
+		return nil
+	}
+
+	// PVC present and recovering: inspect the recovery prefetch Job.
+	job := &batchv1.Job{}
+	jobErr := r.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: prefetchName(dm, stable.Hash)}, job)
+	switch {
+	case jobErr == nil:
+		if !ownedBy(job, dm) || job.DeletionTimestamp != nil {
+			return nil // foreign / being replaced: stable path owns it
+		}
+		if jobComplete(job) {
+			if !job.CreationTimestamp.Before(&pvc.CreationTimestamp) {
+				// A fresh Complete prefetch filled this volume: the store is refilled.
+				return r.clearStoreRecoveringAnnotation(ctx, pvc)
+			}
+			// A Complete Job that predates the recovering PVC filled an older volume
+			// (e.g. the original prefetch, before the store was lost and the PVC
+			// recreated): delete it so a fresh prefetch runs next reconcile, matching
+			// the stable path's stale-Complete handling.
+			bg := metav1.DeletePropagationBackground
+			return r.deleteIfOwned(ctx, dm, job, &client.DeleteOptions{PropagationPolicy: &bg})
+		}
+		// Ongoing or failed: leave the full handling (bounded retries, failure
+		// classification) to the stable path's recoverStableStore; re-driven next
+		// reconcile.
+		return nil
+	case !apierrors.IsNotFound(jobErr):
+		return jobErr
+	}
+
+	// Recovering, no Job: create the recovery prefetch, but only if the recorded
+	// registry and (for an explicit-host name) the model-name host are still
+	// allowed — the same gate the stable path applies. A disallowed host is left to
+	// the stable path to surface Degraded; the candidate rollout is not blocked.
+	if gReason, _ := r.recoveryRegistryGuard(eng, stable); gReason != "" {
+		return nil
+	}
+	recoveryParams := r.seedManifest(ctx, dm, r.stableParams(ctx, dm, stable, claim), stable.Hash, stable.Digest)
+	_, _, _, perr := r.ensurePrefetchJob(ctx, dm, eng, recoveryParams, stable.Hash)
+	return perr
 }
 
 // stableStoreServeable reports whether the stable store PVC named claim is
@@ -164,6 +256,21 @@ func (r *DecisionModelReconciler) recoverStableStore(
 
 	// --- 4. Recovering (PVC missing, or present with the recovering annotation):
 	// hold Degraded and keep the store being (re)filled. ---
+	// Policy gate FIRST, before any StoreLost churn: an operator who tightened
+	// --allowed-registries / --allow-insecure-registries after this revision was
+	// promoted must not have recovery pulls go to a now-disallowed host. The pull
+	// host comes from the registry recorded on the revision (for a host-less name)
+	// or from the model name itself (for an explicit-host name). Refuse on either
+	// -> no PVC recreate, no prefetch, Degraded(RegistryNotAllowed) with a Warning
+	// deduped across reconciles; the stable keeps serving if its Pods are still up.
+	// Running this before degradeStoreLost keeps the Degraded reason stable (no
+	// StoreLost<->RegistryNotAllowed flap), so the Warning fires exactly once.
+	if gReason, gMsg := r.recoveryRegistryGuard(eng, stable); gReason != "" {
+		r.degradeStoreRecoveryBlocked(ctx, dm, stable, gReason, gMsg)
+		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
+		return true, false, res, ferr
+	}
+
 	// Once recovery is exhausted, StorePrefetchFailed owns the Degraded condition;
 	// do not overwrite it with StoreLost on every reconcile (no status churn).
 	if !storeRecoverExhausted(dm) {
@@ -356,24 +463,9 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 		return res, ferr
 	}
 
-	// No Job present (PVC exists, recovery active): create a fresh prefetch.
-	// Guard the recorded registry against the CURRENT allow-list / insecure policy
-	// first: an operator who tightened --allowed-registries or --allow-insecure-
-	// registries after this revision was promoted must not have recovery pulls go
-	// to a now-disallowed mirror. Not allowed -> no Job, Degraded (RegistryNotAllowed)
-	// + a Warning; the stable keeps serving if its Pods are still up.
-	if reason, msg := r.checkRegistryURLAllowed(stable.Registry); reason != "" {
-		setStatusCondition(dm, metav1.Condition{
-			Type:    decisionmodelv1alpha1.ConditionDegraded,
-			Status:  metav1.ConditionTrue,
-			Reason:  reason,
-			Message: fmt.Sprintf("store recovery blocked: %s", msg),
-		})
-		r.event(ctx, dm, corev1.EventTypeWarning, eventRegistryNotAllowed,
-			"store recovery for revision %s blocked: %s", stable.Hash, msg)
-		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
-		return res, ferr
-	}
+	// No Job present (PVC exists, recovery active): create a fresh prefetch. The
+	// registry/host allow-list gate ran earlier in recoverStableStore (step 4), so
+	// by here the pull host is still allowed.
 	// Seed the recorded manifest; the Job verifies the result against the pinned
 	// digest, so a tag that moved since promotion fails with UpstreamTagMoved
 	// instead of serving other bytes. A missing manifest means pull-by-tag + verify.
@@ -517,6 +609,32 @@ func (r *DecisionModelReconciler) degradeStoreLost(
 		Reason:  reasonStoreLost,
 		Message: msg,
 	})
+}
+
+// degradeStoreRecoveryBlocked sets Degraded=True with the given registry/host
+// refusal reason and emits exactly one Warning per distinct reason+message: the
+// Event fires only when the Degraded signal changes, so a per-reconcile requeue
+// while the host stays disallowed does not repeat it.
+func (r *DecisionModelReconciler) degradeStoreRecoveryBlocked(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+	reason, detail string,
+) {
+	msg := fmt.Sprintf("store recovery blocked: %s", detail)
+	prev := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	changed := prev == nil || prev.Status != metav1.ConditionTrue ||
+		prev.Reason != reason || prev.Message != msg
+	setStatusCondition(dm, metav1.Condition{
+		Type:    decisionmodelv1alpha1.ConditionDegraded,
+		Status:  metav1.ConditionTrue,
+		Reason:  reason,
+		Message: msg,
+	})
+	if changed {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventRegistryNotAllowed,
+			"store recovery for revision %s blocked: %s", stable.Hash, detail)
+	}
 }
 
 // degradeStoreTerminating sets Degraded=True/StoreTerminating while the stable

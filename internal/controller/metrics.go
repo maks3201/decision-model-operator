@@ -130,7 +130,7 @@ var (
 
 	rolloutsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricRolloutsTotal,
-		Help: "Total rollout outcomes by result (promoted, rolled_back, failed).",
+		Help: "Total rollout outcomes by result (promoted, rolled_back, rolled_back_after_promotion, failed).",
 	}, []string{labelNamespace, labelName, labelResult})
 
 	phaseDurationSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
