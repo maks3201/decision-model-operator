@@ -219,6 +219,7 @@
             "degraded": { "type": "string", "minLength": 1 },
             "candidateTimeout": { "type": "string", "minLength": 1 },
             "rolloutQueued": { "type": "string", "minLength": 1 },
+            "storeRecoveryStuck": { "type": "string", "minLength": 1 },
             "operatorDown": { "type": "string", "minLength": 1 }
           }
         },

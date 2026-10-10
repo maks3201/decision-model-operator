@@ -123,6 +123,7 @@ prometheusRule:
     degraded: 10m
     candidateTimeout: 20m
     rolloutQueued: 30m
+    storeRecoveryStuck: 30m
     operatorDown: 5m
   # -- Evaluation-quality alert thresholds (`DecisionModelEvaluationPoor`). Decimals in `[0,1]`; set to your promotion target.
   thresholds:
