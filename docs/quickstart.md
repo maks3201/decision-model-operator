@@ -511,6 +511,27 @@ Reference a model by `name:tag`:
   as an SSRF guard; add your mirror there. `http://` registries need
   `--allow-insecure-registries` (dev only).
 
+- **Switching registries is per revision (migrations do not roll running stables):**
+  each revision records the registry it was resolved and prefetched against in
+  `status.stableRevision.registry` (the default `https://ollaya.dev` is recorded
+  explicitly). Changing or removing `--ollaya-registry` affects **only new
+  revisions** -- a running stable keeps its recorded registry and is **not**
+  re-rendered or rolled by the flag change. To move a fleet to a mirror: set the flag
+  (and allow-list the mirror), then trigger a new revision per DecisionModel (any
+  model-affecting change). See which DecisionModels still record the old registry
+  with:
+
+  ```sh
+  kubectl get dm -A \
+    -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,REGISTRY:.status.stableRevision.registry'
+  ```
+
+  Keep the **old** registry on `--allowed-registries` until every DecisionModel has
+  moved: a store recovery re-pulls from the registry recorded on the revision, and is
+  refused (`Degraded`, reason `RegistryNotAllowed`) if that registry is no longer
+  allowed. Full procedure: [Migrating a fleet to a different
+  registry](runbooks/registry-migration.md).
+
 - **Weight-download mirror (Hugging Face endpoint):** the prefetch Job contacts
   **two** distinct hosts: the **model registry** (default `ollaya.dev`, set via
   `--ollaya-registry`) for manifests and blob digests, and the **weight host**
