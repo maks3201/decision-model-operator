@@ -184,11 +184,24 @@ type RuntimeImagePinner interface {
 // PrefetchFailureClassifier is an optional capability: it maps a failed prefetch
 // Pod's termination message and exit code to a short reason and whether the
 // failure is permanent (retrying cannot help, e.g. the tag does not exist or the
-// downloaded digest does not match). Unknown failures must be reported as
-// transient.
+// downloaded digest does not match).
+//
+// Non-permanent failures carry one of two reasons. PrefetchReasonTransient is
+// reserved for failures the engine positively identified as a temporary
+// availability problem (DNS, connection refused/reset, timeout, HTTP 408/429/5xx
+// from the registry or weight host); the controller may retry those without a
+// bound. Everything else that is not permanent (unrecognised exit codes, auth
+// errors, out-of-space, OOM) must be reported as PrefetchReasonUnknown with
+// permanent=false; the controller retries those only within a bounded budget.
 type PrefetchFailureClassifier interface {
 	ClassifyPrefetchFailure(terminationMessage string, exitCode int32) (reason string, permanent bool)
 }
+
+// Non-permanent prefetch failure reasons (see PrefetchFailureClassifier).
+const (
+	PrefetchReasonTransient = "Transient"
+	PrefetchReasonUnknown   = "Unknown"
+)
 
 // DecideRequest is a TypeSafe /v1/systemone request. State and Questions are passed
 // through verbatim (any JSON), so the engine does not need to model the question schema.
