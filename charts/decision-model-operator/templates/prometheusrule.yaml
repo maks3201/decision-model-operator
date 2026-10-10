@@ -109,6 +109,27 @@ spec:
             description: "Not all desired replicas are model-ready, or the store is not shareable, for {{ $w.degraded }}."
             runbook_url: "{{ $rb }}/DecisionModelDegraded.md"
 
+        # The stable store is stuck in recovery: the Degraded condition carries a
+        # store/registry reason for the window. Unlike DecisionModelDegraded (which
+        # keys on the DM's phase and so does NOT fire during a rollout, when the
+        # phase is the candidate's), this keys on the condition itself, so it
+        # catches a stable-store recovery that stalls while a candidate rolls out.
+        # Needs decisionmodel_condition (type=Degraded). StorePrefetchFailed and
+        # RegistryNotAllowed are held states that need operator action; StoreLost
+        # should self-clear once the prefetch completes, so 30m of it is stuck.
+        - alert: DecisionModelStoreRecoveryStuck
+          expr: |
+            max by (namespace, name) (
+              decisionmodel_condition{type="Degraded",status="True",reason=~"StoreLost|StorePrefetchFailed|RegistryNotAllowed"}
+            ) == 1
+          for: {{ $w.storeRecoveryStuck }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "DecisionModel {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} stable store recovery stuck"
+            description: "The stable store has been Degraded ({{ "{{" }} $labels.reason {{ "}}" }}) for {{ $w.storeRecoveryStuck }}; the recovery prefetch is not completing."
+            runbook_url: "{{ $rb }}/DecisionModelStoreRecoveryStuck.md"
+
         # Pods pass Kubernetes readiness but load the wrong digest/device (silent
         # CPU fallback or a moved digest): the model-aware readiness signal.
         - alert: DecisionModelModelMismatch
