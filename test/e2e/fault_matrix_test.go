@@ -132,37 +132,62 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 	// Gap 11: manager-Pod restarts across the promotion seam. The Promoting phase is
 	// reserved and never observed (promotion is a single reconcile: persist
 	// status.stableRevision, then switch the Service), so rather than poll for
-	// "Promoting" we kill the manager Pod repeatedly throughout the
-	// evaluation->promotion window. The promotion must still complete exactly once:
+	// "Promoting" we restart the manager Pod a few times across the
+	// candidate->promotion window. The promotion must still complete exactly once:
 	// the Service ends on the new revision, there is no duplicate object per revision,
 	// and the old revision is collected (previousRevision clears).
+	//
+	// The restarts are bounded and spaced on purpose. The Starting phase deadline is
+	// wall-clock (startTimeout, internal/controller/decisionmodel_controller.go:54,
+	// enforced at :1710 via phaseExceeded, measured from phaseTransitionTime), so a
+	// nonstop kill storm would legitimately exhaust it and roll back -- that is correct
+	// controller behavior, not the property under test here. We instead model a handful
+	// of restarts and give the controller recovery time between them, and raise
+	// spec.rollout.timeouts.starting so the restarts themselves cannot time the Starting
+	// phase out. The invariant we assert is that restarts do not duplicate or skip the
+	// single promotion, not that the rollout survives an unbounded restart storm.
 	It("promotes exactly once across repeated manager restarts in the promotion window", func() {
 		const dm = "promote-seam"
-		fmApply(dm, "laya:en", 1)
+		// A generous Starting budget so the restarts below exercise the promotion seam
+		// without the kill/recover latency tripping the wall-clock start timeout.
+		fmApplyStartTimeout(dm, "laya:en", 1, "25m")
 		fmAwaitReady(dm, 8*time.Minute)
 		stableS := fmStable(dm)
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.previousRevision}")
 		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
 
-		By("forcing a candidate (CPU change) and killing the manager Pod in a loop until promotion")
+		By("forcing a candidate (CPU change) and restarting the manager a few times across the window")
 		fmPatchCPU(dm, "600m")
-		// Wait for the candidate to be admitted so the kills land across the
-		// evaluation/promotion window rather than before the candidate even exists.
+		// Wait for the candidate to be admitted so the restarts land across the
+		// candidate/promotion window rather than before the candidate even exists.
 		Eventually(func() string {
 			return candidateRevisionIn(faultMatrixNS, dm)
 		}, 5*time.Minute, 3*time.Second).ShouldNot(BeEmpty())
 
-		var newStable string
-		Eventually(func(g Gomega) {
-			// Each poll kills the manager, so a restart lands repeatedly in the
-			// candidate-serving / promotion window; the reconcile is level-triggered
-			// and persists before switching, so this must still converge.
+		// A bounded burst of restarts: kill, let the manager come back and reconcile for
+		// a while, repeat. Stop early if the promotion already completed. killOperatorPod
+		// blocks until the new manager Pod is Ready, so each iteration is a full
+		// crash+recover cycle landing somewhere in the candidate->promotion window.
+		const restarts = 5
+		for i := 0; i < restarts; i++ {
 			killOperatorPod()
 			phase, _ := utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.phase}")
+			Expect(phase).NotTo(BeElementOf("Failed", "RolledBack"),
+				"a bounded set of restarts in the promotion window must not fail the rollout")
+			if phase == "Ready" {
+				break
+			}
+			time.Sleep(30 * time.Second)
+		}
+
+		var newStable string
+		By("the rollout converges to Ready after the restarts stop")
+		Eventually(func(g Gomega) {
+			phase, _ := utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.phase}")
 			g.Expect(phase).NotTo(BeElementOf("Failed", "RolledBack"),
-				"repeated restarts in the promotion window must not fail the rollout")
-			g.Expect(phase).To(Equal("Ready"), "the rollout should eventually reach Ready despite restarts")
+				"the rollout must not fail once the restarts stop")
+			g.Expect(phase).To(Equal("Ready"), "the rollout should reach Ready after the restarts")
 			newStable, _ = utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
 			g.Expect(newStable).NotTo(Equal(stableS), "the candidate should have promoted")
 		}, 15*time.Minute, 15*time.Second).Should(Succeed())
@@ -252,6 +277,25 @@ spec:
   replicas: %d
   resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
 `, name, faultMatrixNS, model, testDevice, replicas))
+}
+
+// fmApplyStartTimeout applies a DM like fmApply but with an explicit
+// spec.rollout.timeouts.starting override, so a test that restarts the manager
+// across the Starting phase is not failed by the wall-clock start timeout.
+func fmApplyStartTimeout(name, model string, replicas int, starting string) {
+	applyYAML(fmt.Sprintf(`apiVersion: decisionmodel.io/v1alpha1
+kind: DecisionModel
+metadata: {name: %s, namespace: %s}
+spec:
+  engine: ollaya
+  model: %s
+  device: %s
+  replicas: %d
+  resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {memory: 4Gi}}
+  rollout:
+    timeouts:
+      starting: %s
+`, name, faultMatrixNS, model, testDevice, replicas, starting))
 }
 
 // fmAwaitReady waits for the DM to reach phase Ready.
