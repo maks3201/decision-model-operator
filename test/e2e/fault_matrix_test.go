@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -236,6 +237,12 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 			g.Expect(ready).To(Equal("3"), "all three replicas must be model-ready before the storm")
 		}, 12*time.Minute, 10*time.Second).Should(Succeed())
 
+		// Baseline the serving Pod UID set once the stable is fully model-ready. A
+		// correct storm (annotations are not in the revision hash) must not recreate
+		// any serving Pod, so this set must stay identical for the whole window.
+		uidsBefore := fmServingPodUIDs(dm)
+		Expect(uidsBefore).To(HaveLen(3), "expected three serving Pods before the storm, got %v", uidsBefore)
+
 		By("annotating the DM in a tight loop for 60s to force concurrent reconciles")
 		stop := make(chan struct{})
 		go func() {
@@ -253,16 +260,23 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 			}
 		}()
 
-		By("no gate flap and endpoints stay at 3 for the whole window")
+		By("no gate flap, serving Pods unchanged, and 3 ready EndpointSlice endpoints for the whole window")
 		Consistently(func(g Gomega) {
 			gates := fmGateStatuses(dm)
 			g.Expect(gates).To(HaveLen(3), "expected three serving Pods, got gates %v", gates)
 			for _, s := range gates {
 				g.Expect(s).To(Equal("True"), "every serving Pod's model-ready gate must stay True (got %v)", gates)
 			}
-			eps := fmEndpointCount(dm)
-			g.Expect(eps).To(Equal(3),
-				"the Service must keep exactly 3 distinct ready endpoints (got %d)", eps)
+			// Count ready endpoints from the authoritative EndpointSlices (ready
+			// condition true, de-duplicated by targetRef.uid), not the deprecated
+			// core/v1 Endpoints object -- that object lags under the startup Pod ramp
+			// and retains stale ready addresses, over-counting the real backend set.
+			eps := fmReadyEndpointUIDs(dm)
+			g.Expect(eps).To(HaveLen(3),
+				"the Service must have exactly 3 ready EndpointSlice endpoints (got %d: %v)", len(eps), eps)
+			// The serving Pods themselves must not be recreated by the storm.
+			g.Expect(fmServingPodUIDs(dm)).To(Equal(uidsBefore),
+				"the serving Pod UID set must be unchanged under the reconcile storm")
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 		close(stop)
 	})
@@ -372,19 +386,38 @@ func fmGateStatuses(name string) []string {
 	return strings.Fields(out)
 }
 
-// fmEndpointCount returns the number of DISTINCT ready endpoint addresses backing the
-// DM's Service. The legacy Endpoints object can, under reconcile churn, split ready
-// addresses across several subsets (so the raw flattened address list over-counts the
-// same Pod IPs); de-duplicating by IP yields the real ready-backend count, which for a
-// stable with N replicas must stay N.
-func fmEndpointCount(name string) int {
-	out, _ := utils.Kubectl("get", "endpoints", name, "-n", faultMatrixNS,
-		"-o", "jsonpath={.subsets[*].addresses[*].ip}")
+// fmReadyEndpointUIDs returns the set of READY endpoint target Pod UIDs backing the
+// DM's Service, read from the authoritative discovery.k8s.io EndpointSlices
+// (kubernetes.io/service-name=<svc>), keeping only endpoints whose ready condition is
+// true and de-duplicating by targetRef.uid. The deprecated core/v1 Endpoints object is
+// deliberately NOT used: a separate best-effort controller maintains it and, under the
+// startup Pod ramp of a multi-replica stable, it lags and retains stale ready
+// addresses, over-counting the real backend set. For an N-replica stable this set is N.
+func fmReadyEndpointUIDs(name string) []string {
+	out, _ := utils.Kubectl("get", "endpointslices", "-n", faultMatrixNS,
+		"-l", "kubernetes.io/service-name="+name,
+		"-o", "jsonpath={.items[*].endpoints[?(@.conditions.ready==true)].targetRef.uid}")
 	seen := map[string]struct{}{}
-	for _, ip := range strings.Fields(out) {
-		seen[ip] = struct{}{}
+	for _, uid := range strings.Fields(out) {
+		seen[uid] = struct{}{}
 	}
-	return len(seen)
+	uids := make([]string, 0, len(seen))
+	for uid := range seen {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+// fmServingPodUIDs returns the sorted set of serving Pod UIDs for the DM (excludes the
+// prefetch Pod via servingPodSelector). Used to prove the reconcile storm never
+// recreates a serving Pod.
+func fmServingPodUIDs(name string) []string {
+	out, _ := utils.Kubectl("get", "pods", "-l", servingPodSelector(name), "-n", faultMatrixNS,
+		"-o", "jsonpath={.items[*].metadata.uid}")
+	uids := strings.Fields(out)
+	sort.Strings(uids)
+	return uids
 }
 
 // fmDumpEndpoints prints the Service's Endpoints and EndpointSlices and every Pod's
