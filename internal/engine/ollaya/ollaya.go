@@ -107,6 +107,30 @@ func WithRegistryURL(url string) Option {
 	}
 }
 
+// ConfiguredRegistry returns the engine's configured registry base URL (what
+// --ollaya-registry set, trimmed; the engine default when unset). The controller
+// records this on a new revision (RevisionStatus.Registry) so the revision renders
+// from the registry it was prefetched against, regardless of a later flag change.
+// It always returns a concrete URL (never ""), so a revision on the default
+// registry records the default explicitly and is never later mistaken for
+// "unrecorded". Rendering stays byte-identical for the default because
+// registryIsDefault suppresses the OLLAYA_REGISTRY env. Resolve/prefetch for an
+// explicit-host model name still use the name's host; this is only consequential
+// for host-less names, where it is exactly the registry used.
+func (e *Engine) ConfiguredRegistry() string {
+	return e.registryURL
+}
+
+// DefaultRegistry returns the engine's built-in default registry base URL
+// (https://ollaya.dev), independent of --ollaya-registry. The controller adopts
+// it onto a legacy stable whose live serving Pod carries no OLLAYA_REGISTRY env:
+// such a stable was built on the default registry, so the default URL — not the
+// current flag — is the registry it runs with. Recorded explicitly so the stable
+// never later falls back to a changed flag.
+func (e *Engine) DefaultRegistry() string {
+	return defaultRegistryURL
+}
+
 // WithHFEndpoint sets the base URL Ollaya downloads model weights from (a
 // Hugging Face mirror or an enterprise endpoint); empty leaves the runtime
 // default (huggingface.co). When set, PrefetchJobSpec adds
@@ -433,12 +457,28 @@ func (p parsedName) manifestDiskPath(defaultHost string) string {
 	return fmt.Sprintf("manifests/%s/%s/%s/%s", host, ns, p.model, p.tag)
 }
 
-// defaultManifestHostDir returns the on-disk store host directory for a
-// host-less model name, derived from the engine's configured registry (the same
-// authority `ollaya pull` writes under when OLLAYA_REGISTRY is set).
-// For the default registry it is "ollaya.dev".
-func (e *Engine) defaultManifestHostDir() string {
-	h := manifestHostDir(e.registryURL)
+// effectiveRegistry is the registry a rendered revision uses: the one recorded
+// on the revision (p.Registry) when set, else the engine's configured registry
+// (--ollaya-registry). Rendering a revision from its recorded registry keeps a
+// running revision's store-layout host fixed when the operator's default registry
+// later changes, so a flag change never re-renders a running stable. Resolve
+// deliberately does NOT use this — it runs at candidate time against the current
+// flag, and the controller records that flag's value (ConfiguredRegistry) as
+// p.Registry on the revision.
+func (e *Engine) effectiveRegistry(p engine.Params) string {
+	if p.Registry != "" {
+		return strings.TrimRight(p.Registry, "/")
+	}
+	return e.registryURL
+}
+
+// manifestHostDirFor returns the on-disk store host directory for a host-less
+// model name under the revision's effective registry (p.Registry when set, else
+// the engine default). It must match the OLLAYA_REGISTRY the prefetch Job and the
+// serving Pod use, so the pull writes and the digest verification read the same
+// manifests/<host>/ path. For the default registry it is "ollaya.dev".
+func (e *Engine) manifestHostDirFor(p engine.Params) string {
+	h := manifestHostDir(e.effectiveRegistry(p))
 	if h == "" {
 		return defaultManifestHost
 	}
@@ -1393,16 +1433,22 @@ func (e *Engine) ServingPodSpec(p engine.Params) corev1.PodSpec {
 	if ake := apiKeyEnv(p); ake != nil {
 		env = append(env, *ake)
 	}
-	// When the engine registry is non-default, set OLLAYA_REGISTRY on serving Pods
-	// too: `ollaya serve` resolves a host-less name (e.g. "laya:en") against the
-	// store under manifests/<OLLAYA_REGISTRY host>/..., which is where the prefetch
-	// Job wrote it. Without it, serve would look under
+	// When the effective registry is non-default, set OLLAYA_REGISTRY on serving
+	// Pods too: `ollaya serve` resolves a host-less name (e.g. "laya:en") against
+	// the store under manifests/<OLLAYA_REGISTRY host>/..., which is where the
+	// prefetch Job wrote it. Without it, serve would look under
 	// manifests/ollaya.dev/... and /api/ps would never show the model, so the
 	// readiness gate could not pass on a mirror-pulled store. Proven in the image
 	// (serve with OLLAYA_REGISTRY=http://mirror:8080 loads a mirror-pulled
 	// laya:en, /api/ps shows it). Default registry renders byte-identically.
-	if !registryIsDefault(e.registryURL) {
-		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: e.registryURL})
+	//
+	// The registry is the one recorded on the revision (p.Registry) when set,
+	// else the engine's configured registry (today's --ollaya-registry). This
+	// pins a running revision's store-layout host to what it was prefetched
+	// against, so a later change of the operator's default registry never
+	// re-renders a running stable.
+	if reg := e.effectiveRegistry(p); !registryIsDefault(reg) {
+		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: reg})
 	}
 
 	// Liveness/startup on GET / (§7.1: always 200, even when an API key is set,
@@ -1830,7 +1876,7 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		// A non-empty sub-path that is not a revision hash: refuse.
 		script = invalidSubPathScript
 	default:
-		manifestPath = parsed.manifestDiskPath(e.defaultManifestHostDir())
+		manifestPath = parsed.manifestDiskPath(e.manifestHostDirFor(p))
 	}
 
 	env := []corev1.EnvVar{
@@ -1901,18 +1947,20 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		})
 	}
 
-	// Point `ollaya pull` at the same registry the resolver used. The Ollaya
-	// 0.7.3 and 0.10.0 CLI selects its registry for a bare (host-less) name from the
-	// OLLAYA_REGISTRY env var, falling back to ollaya.dev; an explicit host in
-	// the name always overrides it (verified against the image; evidence in the
-	// the spike). The
-	// resolver uses the same precedence (parsedName.registryBase). Without this,
-	// --ollaya-registry / OLLAYA_REGISTRY reached only the resolver, so the Job
-	// still pulled from ollaya.dev — a digest mismatch, and air-gapped mode did
-	// not work. We set it only when the engine
-	// registry is non-default so the default case renders byte-identically.
-	if !registryIsDefault(e.registryURL) {
-		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: e.registryURL})
+	// Point `ollaya pull` at the same registry the revision was recorded against.
+	// The Ollaya 0.7.3 and 0.10.0 CLI selects its registry for a bare (host-less)
+	// name from the OLLAYA_REGISTRY env var, falling back to ollaya.dev; an
+	// explicit host in the name always overrides it (verified against the image;
+	// evidence in the spike). The resolver uses the same precedence
+	// (parsedName.registryBase). Without this, --ollaya-registry / OLLAYA_REGISTRY
+	// reached only the resolver, so the Job still pulled from ollaya.dev — a digest
+	// mismatch, and air-gapped mode did not work. We set it only when the effective
+	// registry is non-default so the default case renders byte-identically. The
+	// effective registry is p.Registry when the revision recorded one, else the
+	// engine's configured registry, and MUST match the host the manifestPath above
+	// was computed under (both derive from effectiveRegistry).
+	if reg := e.effectiveRegistry(p); !registryIsDefault(reg) {
+		env = append(env, corev1.EnvVar{Name: "OLLAYA_REGISTRY", Value: reg})
 	}
 
 	// Hugging Face / weight mirror: the registry (OLLAYA_REGISTRY) serves manifests,

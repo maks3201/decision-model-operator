@@ -220,6 +220,7 @@ const (
 	eventStableRestored          = "StableRestored"
 	eventManifestRepaired        = "ManifestRepaired"
 	eventManifestInvalid         = "ManifestInvalid"
+	eventRegistryNotAllowed      = "RegistryNotAllowed"
 )
 
 // DecisionModelReconciler reconciles a DecisionModel object.
@@ -407,6 +408,17 @@ func (r *DecisionModelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// operator upgrade), so pass the real stable here.
 	candidate, rev, effVer, image, isStable := r.candidateIdentity(&dm, eng, digest, stable)
 	params := r.paramsForVersion(&dm, digest, image, rev, effVer)
+	// Render the candidate from the registry recorded when it was admitted, not the
+	// current flag: a flag change mid-rollout must not re-render the candidate's
+	// serving template / prefetch Job against a store prefetched under the old host
+	// (it would strand the candidate against its own store). The recorded value is
+	// authoritative only once admission is durable (hash matches); before that the
+	// fresh candidate carries the current flag, which is what gets recorded.
+	if cr := dm.Status.CandidateRevision; cr != nil && cr.Hash == rev && cr.Registry != "" {
+		params.Registry = cr.Registry
+	} else {
+		params.Registry = candidate.Registry
+	}
 
 	// If the runtime image is a mutable tag we only reach this point with
 	// --allow-unpinned-runtime-images set (preflightRuntimeImage refuses a new
@@ -940,6 +952,7 @@ func (r *DecisionModelReconciler) candidateIdentity(
 		// rendered from its own state, not a (possibly newer) spec.
 		Image:          image,
 		RuntimeVersion: recordedCandidateRuntimeVersion(eng, dm, effVer),
+		Registry:       recordedCandidateRegistry(eng),
 		Resources:      dm.Spec.Resources,
 		Placement:      placementRecord(dm.Spec.Scheduling),
 	}

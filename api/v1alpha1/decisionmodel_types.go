@@ -460,6 +460,18 @@ type RevisionStatus struct {
 	// +optional
 	RuntimeVersion string `json:"runtimeVersion,omitempty"`
 
+	// Registry is the model registry base URL this revision was resolved and
+	// prefetched against (the engine default is recorded explicitly, e.g.
+	// https://ollaya.dev). Engines whose store layout depends on the registry host
+	// render this revision's serving Pods and prefetch Job from it, so a later
+	// change of the operator's registry (--ollaya-registry) never re-renders a
+	// running revision and never rolls it, in either direction. Empty only on a
+	// revision recorded by an older operator; the controller adopts the registry it
+	// runs with (the live Pod's value, or the engine default) once on the first
+	// reconcile that renders it, without rolling.
+	// +optional
+	Registry string `json:"registry,omitempty"`
+
 	// ImagePinned records whether this revision's runtime image is pinned to an
 	// immutable digest. It is set to false only on a revision admitted with a
 	// mutable-tag runtime image because the operator runs with

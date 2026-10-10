@@ -357,6 +357,23 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	}
 
 	// No Job present (PVC exists, recovery active): create a fresh prefetch.
+	// Guard the recorded registry against the CURRENT allow-list / insecure policy
+	// first: an operator who tightened --allowed-registries or --allow-insecure-
+	// registries after this revision was promoted must not have recovery pulls go
+	// to a now-disallowed mirror. Not allowed -> no Job, Degraded (RegistryNotAllowed)
+	// + a Warning; the stable keeps serving if its Pods are still up.
+	if reason, msg := r.checkRegistryURLAllowed(stable.Registry); reason != "" {
+		setStatusCondition(dm, metav1.Condition{
+			Type:    decisionmodelv1alpha1.ConditionDegraded,
+			Status:  metav1.ConditionTrue,
+			Reason:  reason,
+			Message: fmt.Sprintf("store recovery blocked: %s", msg),
+		})
+		r.event(ctx, dm, corev1.EventTypeWarning, eventRegistryNotAllowed,
+			"store recovery for revision %s blocked: %s", stable.Hash, msg)
+		res, ferr := r.finish(ctx, dm, ctrl.Result{RequeueAfter: probeRequeue}, nil)
+		return res, ferr
+	}
 	// Seed the recorded manifest; the Job verifies the result against the pinned
 	// digest, so a tag that moved since promotion fails with UpstreamTagMoved
 	// instead of serving other bytes. A missing manifest means pull-by-tag + verify.
