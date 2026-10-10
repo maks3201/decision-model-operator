@@ -1080,9 +1080,9 @@ func strategyMatches(live, want appsv1.DeploymentStrategy) bool {
 // current flag; a flag change (operator restart against a different or temporarily
 // broken registry) must NOT re-render a running stable's template and roll its
 // replica onto a Pod that then cannot find the recorded model in the store
-// (the P0: a candidate-only spec.model change under a changed registry rolled the
-// stable). We cannot generically tell flag-derived env from revision-derived env
-// here, so for every env var the fresh render shares a NAME with the live
+// (a candidate-only spec.model change under a changed registry otherwise rolled
+// the stable). We cannot generically tell flag-derived env from revision-derived
+// env here, so for every env var the fresh render shares a NAME with the live
 // template we keep the LIVE entry verbatim: revision-derived vars (OLLAYA_DEVICE,
 // OLLAYA_THREADS, …) render byte-identically so this is a no-op for them, the
 // API-key var is a secretKeyRef whose entry is identical regardless of the key
@@ -1091,11 +1091,15 @@ func strategyMatches(live, want appsv1.DeploymentStrategy) bool {
 // built with. Names the fresh render adds or drops (e.g. adding/removing auth)
 // still take effect, so a genuine spec change to the stable rolls as before.
 //
-// Known limit: resetting --ollaya-registry back to the engine default while a
-// stable built under a non-default registry is running drops OLLAYA_REGISTRY from
-// the fresh render (no shared name to freeze) and rolls that stable; recording the
-// registry on the revision and rendering the serving env from it is the complete
-// fix (an engine-contract change).
+// Defence in depth: the complete fix for the registry drift is that a revision
+// records the registry it was built against (RevisionStatus.Registry), and the
+// engine renders OLLAYA_REGISTRY from it (Params.Registry); stableParams also
+// adopts a legacy stable's live registry onto its status. With that in place the
+// stable renders the correct registry on every path and would not drift even
+// without this freeze — so the freeze is kept only as a second guard (and for any
+// future flag-derived env a controller cannot classify), not as the sole fix. The
+// old "reset the flag to default rolls the stable" limit is resolved by the
+// recorded/adopted registry; see stableParams and ollaya.effectiveRegistry.
 func freezeFromLive(podSpec *corev1.PodSpec, live *corev1.PodSpec) {
 	podSpec.NodeSelector = live.NodeSelector
 	podSpec.Tolerations = live.Tolerations

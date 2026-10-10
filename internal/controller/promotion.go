@@ -288,6 +288,14 @@ func (r *DecisionModelReconciler) promote(
 	}
 	switching := prevStable == nil || prevStable.Hash != rev
 	candidate.Precision = precision
+	// Promote with the registry recorded when the candidate was admitted, not the
+	// current flag: the candidate's store was prefetched under that registry, so a
+	// flag change mid-rollout must not record a different registry on the new
+	// stable than the one its live Deployment runs with. Fall back to the fresh
+	// candidate value when nothing was recorded (legacy candidate).
+	if cr := dm.Status.CandidateRevision; cr != nil && cr.Hash == rev && cr.Registry != "" {
+		candidate.Registry = cr.Registry
+	}
 	dm.Status.StableRevision = candidate
 	dm.Status.CandidateRevision = nil
 	dm.Status.FailedRevision = nil // successful rollout clears any prior failure

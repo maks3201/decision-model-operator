@@ -96,6 +96,7 @@ func (r *DecisionModelReconciler) paramsForRevision(
 		Device:            deviceOrDefault(rev.Device),
 		Image:             rev.Image,
 		RuntimeVersion:    rev.RuntimeVersion,
+		Registry:          rev.Registry,
 		CacheClaimName:    claimName,
 		Resources:         rev.Resources,
 		StoreSubPath:      rev.Hash,
@@ -116,6 +117,17 @@ func (r *DecisionModelReconciler) paramsForRevision(
 // serving container so the stable Pod template is not rewritten from the current
 // spec (which may describe a different candidate). claimName is the store PVC the
 // stable revision mounts (per-revision or legacy shared).
+//
+// Registry adoption: a stable recorded before RevisionStatus.Registry existed has
+// an empty Registry. On the first reconcile that renders it, adopt the registry it
+// actually runs with onto the stable once — into the render AND the persisted
+// status: the live serving Pod's OLLAYA_REGISTRY when present, else the engine's
+// built-in default (the stable runs on the default registry). After adoption
+// Registry is non-empty, so later reconciles skip the live Get. This makes an
+// operator upgrade or a flag change never roll such a stable, in either direction
+// (default -> mirror and mirror -> default). New revisions record their registry
+// explicitly at admission, so Registry == "" only ever means "recorded by an
+// older operator, not yet adopted".
 func (r *DecisionModelReconciler) stableParams(
 	ctx context.Context,
 	dm *decisionmodelv1alpha1.DecisionModel,
@@ -123,9 +135,10 @@ func (r *DecisionModelReconciler) stableParams(
 	claimName string,
 ) engine.Params {
 	rev := stable.DeepCopy()
-	if rev.Image == "" || len(rev.Resources.Limits)+len(rev.Resources.Requests) == 0 {
-		// Legacy status: recover image/resources from the live Deployment's
-		// serving container rather than the (possibly newer) spec.
+	needImageOrResources := rev.Image == "" || len(rev.Resources.Limits)+len(rev.Resources.Requests) == 0
+	if needImageOrResources || rev.Registry == "" {
+		// Read the live Deployment's serving container to recover legacy
+		// image/resources and/or adopt the registry it is actually running with.
 		dep := &appsv1.Deployment{}
 		key := types.NamespacedName{Namespace: dm.Namespace, Name: revisionName(dm, stable.Hash)}
 		if err := r.Get(ctx, key, dep); err == nil {
@@ -136,10 +149,48 @@ func (r *DecisionModelReconciler) stableParams(
 				if len(rev.Resources.Limits)+len(rev.Resources.Requests) == 0 {
 					rev.Resources = cs[0].Resources
 				}
+				if rev.Registry == "" {
+					liveReg := envValueOf(cs[0].Env, ollayaRegistryEnv)
+					if liveReg == "" {
+						// No registry env on the live Pod: the stable runs on the
+						// engine default. Adopt the explicit default URL so Registry
+						// is no longer "" (never re-Get on later reconciles) and the
+						// stable can never fall back to a changed flag.
+						if eng, ok := r.Engines[engineOrDefault(dm.Spec.Engine)]; ok {
+							liveReg = engineDefaultRegistry(eng)
+						}
+					}
+					if liveReg != "" {
+						rev.Registry = liveReg
+						// Persist the adoption once onto the real stable so later
+						// renders use the recorded value and status reflects reality.
+						stable.Registry = liveReg
+					}
+				}
 			}
 		}
 	}
 	return r.paramsForRevision(dm, rev, claimName)
+}
+
+// ollayaRegistryEnv is the serving-container env var the ollaya engine uses to
+// select a non-default registry (see internal/engine/ollaya: OLLAYA_REGISTRY).
+// stableParams reads it off the live Deployment only to ADOPT a legacy stable's
+// registry onto its recorded status; the controller does not otherwise interpret
+// engine env. Today's only engine is ollaya; a second engine with a different
+// mechanism would record its registry via RevisionStatus.Registry at admission
+// (recordedCandidateRegistry) and never need this adoption.
+const ollayaRegistryEnv = "OLLAYA_REGISTRY"
+
+// envValueOf returns the plain value of the named env var, or "" if absent or
+// sourced from a ValueFrom (which has no literal value to adopt).
+func envValueOf(env []corev1.EnvVar, name string) string {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
 }
 
 // conflictIfNotOwned returns errResourceConflict (and records Degraded +

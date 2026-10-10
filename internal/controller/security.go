@@ -58,6 +58,47 @@ func (r *DecisionModelReconciler) allowedRegistries() []string {
 	return r.AllowedRegistries
 }
 
+// checkRegistryURLAllowed validates a recorded registry BASE URL (e.g.
+// "http://mirror:8080" or "https://ollaya.dev") against the current allow-list and
+// insecure policy — the same guard checkRegistryAllowed applies to a model's host,
+// but for a registry recorded on a revision rather than parsed from spec.model. It
+// is used before a store-recovery prefetch so an operator who later tightens
+// --allowed-registries / --allow-insecure-registries stops recovery pulls from a
+// now-disallowed mirror. An empty URL (default registry, nothing recorded) is
+// allowed. Returns a reason ("" when allowed) and a message.
+func (r *DecisionModelReconciler) checkRegistryURLAllowed(registryURL string) (reason, message string) {
+	registryURL = strings.TrimSpace(registryURL)
+	if registryURL == "" {
+		return "", "" // default registry; the model-host guard already covered it
+	}
+	insecure := strings.HasPrefix(strings.ToLower(registryURL), "http://")
+	// Host extraction: strip scheme, then any path, keep host[:port].
+	h := registryURL
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+3:]
+	}
+	if i := strings.IndexByte(h, '/'); i >= 0 {
+		h = h[:i]
+	}
+	hostBare := strings.ToLower(strings.TrimSpace(h))
+	allowed := false
+	for _, a := range r.allowedRegistries() {
+		if a == hostBare {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return reasonRegistryNotAllowed,
+			fmt.Sprintf("recorded registry %q is not in the allowed list %v", hostBare, r.allowedRegistries())
+	}
+	if insecure && !r.AllowInsecureRegistries {
+		return reasonRegistryNotAllowed,
+			fmt.Sprintf("insecure http registry %q not allowed (set --allow-insecure-registries)", hostBare)
+	}
+	return "", ""
+}
+
 // checkRegistryAllowed validates the model's registry host against the
 // allow-list and insecure policy, using the engine's own parser via the
 // engine.RegistryHoster contract. It fails closed: an engine without the

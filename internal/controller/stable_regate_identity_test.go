@@ -100,7 +100,7 @@ func (p *argProber) Reinspect(_ context.Context, _ *corev1.Pod, _ engine.Engine,
 	return p.answer(model)
 }
 
-// This suite reproduces the P0 measured on kind: a Ready
+// This suite reproduces the regression measured on kind: a Ready
 // single-replica DecisionModel whose spec.model is changed to a tag that does not
 // resolve must keep its SERVING stable Pod gated True and in the Service. The gate
 // must be decided from the stable's recorded identity (status.stableRevision),
@@ -199,7 +199,7 @@ var _ = Describe("the serving stable gate survives a failing candidate resolve",
 		return r, fake, pr, revA
 	}
 
-	// assertStableGateSurvives runs the common P0 assertions after a candidate
+	// assertStableGateSurvives runs the common assertions after a candidate
 	// failure is injected: the single stable Pod stays gated True and counted
 	// model-ready, the DM stays Ready, the stable Deployment is not rolled, and the
 	// prober is never asked about badModel (the broken live spec). It advances the

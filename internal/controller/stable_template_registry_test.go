@@ -42,7 +42,7 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine/ollaya"
 )
 
-// This suite is the envtest regression for a P0 reproduced on kind: with a
+// This suite is the envtest regression for a bug reproduced on kind: with a
 // non-default --ollaya-registry, a candidate-only spec.model change whose resolve
 // fails ROLLED the serving stable Deployment. The root cause is that the serving Pod template carries an
 // OLLAYA_REGISTRY env derived from the manager flag (e.registryURL), not from the
@@ -247,12 +247,11 @@ var _ = Describe("the serving stable template survives a registry flag change", 
 	})
 })
 
-// envValue returns the value of the named env var, or "" if absent.
+// envValue returns the value of the named env var, or "" if absent. It is a thin
+// alias of the production envValueOf so tests assert on the same lookup; the name
+// is a parameter (not hard-coded) to read at the call site.
+//
+//nolint:unparam // name documents the lookup at each call site; a second engine uses other env names
 func envValue(env []corev1.EnvVar, name string) string {
-	for _, e := range env {
-		if e.Name == name {
-			return e.Value
-		}
-	}
-	return ""
+	return envValueOf(env, name)
 }
