@@ -220,6 +220,16 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 	It("keeps a 3-replica stable gated and endpoints stable under concurrent reconciles", func() {
 		const dm = "concurrent-reconcile"
 		fmApply(dm, "laya:en", 3)
+		// Dump endpoints, EndpointSlices and Pod IP/phase/ready on failure. Registered
+		// before the storm so it runs even when an assertion aborts the It early.
+		DeferCleanup(func() {
+			if !CurrentSpecReport().Failed() {
+				return
+			}
+			fmDumpEndpoints(dm)
+			dumpDiag(faultMatrixNS, dm)
+			_, _ = utils.Kubectl("delete", "decisionmodel", dm, "-n", faultMatrixNS, "--ignore-not-found")
+		})
 		fmAwaitReady(dm, 12*time.Minute)
 		Eventually(func(g Gomega) {
 			ready, _ := utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.replicas.modelReady}")
@@ -255,9 +265,6 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 				"the Service must keep exactly 3 distinct ready endpoints (got %d)", eps)
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 		close(stop)
-
-		dumpDiag(faultMatrixNS, dm)
-		_, _ = utils.Kubectl("delete", "decisionmodel", dm, "-n", faultMatrixNS, "--ignore-not-found")
 	})
 })
 
@@ -378,6 +385,24 @@ func fmEndpointCount(name string) int {
 		seen[ip] = struct{}{}
 	}
 	return len(seen)
+}
+
+// fmDumpEndpoints prints the Service's Endpoints and EndpointSlices and every Pod's
+// IP/phase/ready, so a "distinct ready endpoints != replicas" failure can be traced to
+// stale addresses, extra Pods, or a churning Deployment. Diagnostics only; no asserts.
+func fmDumpEndpoints(name string) {
+	eps, _ := utils.Kubectl("get", "endpoints", name, "-n", faultMatrixNS, "-o", "yaml")
+	_, _ = fmt.Fprintf(GinkgoWriter, "endpoints/%s:\n%s\n", name, eps)
+	slices, _ := utils.Kubectl("get", "endpointslices", "-l", "kubernetes.io/service-name="+name,
+		"-n", faultMatrixNS, "-o", "yaml")
+	_, _ = fmt.Fprintf(GinkgoWriter, "endpointslices for %s:\n%s\n", name, slices)
+	pods, _ := utils.Kubectl("get", "pods", "-l", "decisionmodel.io/name="+name, "-n", faultMatrixNS,
+		"-o", "custom-columns=NAME:.metadata.name,IP:.status.podIP,PHASE:.status.phase,"+
+			"READY:.status.conditions[?(@.type=='Ready')].status,RS:.metadata.ownerReferences[0].name")
+	_, _ = fmt.Fprintf(GinkgoWriter, "pods for %s:\n%s\n", name, pods)
+	rs, _ := utils.Kubectl("get", "replicasets", "-l", "decisionmodel.io/name="+name, "-n", faultMatrixNS,
+		"-o", "custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas")
+	_, _ = fmt.Fprintf(GinkgoWriter, "replicasets for %s:\n%s\n", name, rs)
 }
 
 // candidateRevisionIn returns the DM's candidate revision hash in the given
