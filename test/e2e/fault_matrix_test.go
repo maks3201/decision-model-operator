@@ -281,21 +281,24 @@ func fmPatchCPU(name, cpu string) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// fmPrefetchJobCount counts prefetch Jobs for a revision (the recovery prefetch Job
-// carries the prefetch-revision label with the revision hash).
+// fmPrefetchJobCount counts prefetch Jobs for a revision. The prefetch Job's own
+// metadata carries the revision label (decisionmodel.io/revision via revisionLabels);
+// only its Pod template carries decisionmodel.io/prefetch-revision, so a Job selector
+// must use the revision label. `kubectl get jobs` only returns Jobs, so the serving
+// Deployment's identical revision label does not collide here.
 func fmPrefetchJobCount(name, rev string) int {
 	out, _ := utils.Kubectl("get", "jobs", "-n", faultMatrixNS,
-		"-l", "decisionmodel.io/name="+name+",decisionmodel.io/prefetch-revision="+rev,
+		"-l", "decisionmodel.io/name="+name+",decisionmodel.io/revision="+rev,
 		"-o", "jsonpath={.items[*].metadata.name}")
 	return len(strings.Fields(out))
 }
 
 // fmJobComplete reports whether a prefetch Job for the revision reached Complete.
 // A deleted (abandoned) Job returns false, which is what the recovery assertion
-// guards against.
+// guards against. Selects by the Job's revision label (see fmPrefetchJobCount).
 func fmJobComplete(name, rev string) bool {
 	out, _ := utils.Kubectl("get", "jobs", "-n", faultMatrixNS,
-		"-l", "decisionmodel.io/name="+name+",decisionmodel.io/prefetch-revision="+rev,
+		"-l", "decisionmodel.io/name="+name+",decisionmodel.io/revision="+rev,
 		"-o", "jsonpath={.items[*].status.conditions[?(@.type=='Complete')].status}")
 	return strings.Contains(out, "True")
 }
