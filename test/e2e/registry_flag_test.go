@@ -214,9 +214,12 @@ spec:
 		// recovering the store. Wait for the window to close -- status.previousRevision
 		// cleared -- so this spec exercises store recovery, not a stabilization rollback.
 		By("waiting for the post-promotion stabilization window to close (previousRevision cleared)")
+		// The window is 5m; previousRevision has usually cleared during the earlier
+		// steps already, so this poll normally returns at once. 5m matches the proven
+		// idiom in registry_outage_test.go and keeps the leg within its test budget.
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.previousRevision}")
-		}, 10*time.Minute, 10*time.Second).Should(BeEmpty())
+		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
 
 		By("deleting the stable store PVC and its serving Pod to force a store recovery")
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", registryFlagNS, "--wait=false")
