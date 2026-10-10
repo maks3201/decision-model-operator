@@ -191,15 +191,31 @@ assert_not_rerolled() {
   # recorded status.stableRevision.registry must be non-empty, proving the first
   # reconcile adopted the registry in place without any of the roll signals above
   # tripping. Skipped on a pre-recording build so the script stays correct there.
-  local reg_after
-  reg_after="$(jp decisionmodel "${dm}" '{.status.stableRevision.registry}')"
+  # Adoption happens on the first reconcile AFTER the new manager wins the leader
+  # lease, which can lag the Deployment becoming Available by seconds; phase was
+  # already Ready before the upgrade, so the roll-check loop above does not wait for
+  # it. Poll the field for up to 3 minutes (5 s steps) rather than reading it once.
+  local reg_after=""
   if registry_field_present; then
+    local adopt_epoch=""
+    for _ in $(seq 1 36); do
+      reg_after="$(jp decisionmodel "${dm}" '{.status.stableRevision.registry}')"
+      if [[ -n "${reg_after}" ]]; then adopt_epoch="$(date +%s)"; break; fi
+      sleep 5
+    done
     if [[ -z "${reg_after}" ]]; then
-      echo "FAIL ${dm}: status.stableRevision.registry is empty after the upgrade (registry was not adopted)"
+      echo "FAIL ${dm}: status.stableRevision.registry is empty 3m after the upgrade (registry was not adopted)"
       kc get decisionmodel "${dm}" -n "${NS}" -o yaml | grep -A20 'stableRevision:' | head -25
+      echo "--- manager logs mentioning ${dm} ---"
+      kc logs -l control-plane=controller-manager -n decision-model-operator-system \
+        --tail=-1 2>/dev/null | grep -- "${dm}" | tail -40 || true
       return 1
     fi
-    echo "note ${dm}: registry adopted in place: ${reg_after}"
+    local secs="?"
+    if [[ -n "${adopt_epoch}" ]] && [[ -n "${MGR_AVAILABLE_EPOCH:-}" ]]; then
+      secs="$(( adopt_epoch - MGR_AVAILABLE_EPOCH ))"
+    fi
+    echo "note ${dm}: registry adopted in place: ${reg_after} (${secs}s after manager Available)"
   else
     echo "note ${dm}: CRD has no status.stableRevision.registry; skipping the adoption check (pre-recording build)"
   fi
@@ -312,6 +328,9 @@ kc rollout status deployment -l control-plane=controller-manager \
   -n decision-model-operator-system --timeout=3m || \
   kc wait deployment.apps -l control-plane=controller-manager \
     --for=condition=Available -n decision-model-operator-system --timeout=3m
+# Timestamp the moment the new manager is Available; the registry-adoption poll in
+# assert_not_rerolled reports how long after this the first reconcile adopts in place.
+MGR_AVAILABLE_EPOCH="$(date +%s)"
 
 # --- assert neither DecisionModel was re-rolled -------------------------------
 note "asserting neither DecisionModel is re-rolled by the upgrade"
