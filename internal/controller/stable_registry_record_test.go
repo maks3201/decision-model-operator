@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	neturl "net/url"
 	"strings"
+	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -32,9 +33,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -97,6 +102,17 @@ var _ = Describe("recording the registry on a revision", func() {
 		eng := ollaya.New(ollaya.WithRegistryURL(registryURL))
 		return &DecisionModelReconciler{
 			Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:                 map[string]engine.Engine{"ollaya": eng},
+			Prober:                  &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: wantDigest, Device: "cpu"}},
+			AllowedRegistries:       []string{allowHost},
+			AllowInsecureRegistries: true,
+			Recorder:                events.NewFakeRecorder(128),
+		}
+	}
+	newReconcilerClient := func(registryURL, allowHost string, cl client.Client) *DecisionModelReconciler {
+		eng := ollaya.New(ollaya.WithRegistryURL(registryURL))
+		return &DecisionModelReconciler{
+			Client: cl, APIReader: cl, Scheme: k8sClient.Scheme(),
 			Engines:                 map[string]engine.Engine{"ollaya": eng},
 			Prober:                  &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: wantDigest, Device: "cpu"}},
 			AllowedRegistries:       []string{allowHost},
@@ -264,6 +280,83 @@ var _ = Describe("recording the registry on a revision", func() {
 		depAfter := stableDep("legacy", rev)
 		Expect(depAfter.Generation).To(Equal(genBefore), "adoption must not roll the stable")
 		Expect(depAfter.Spec.Template).To(Equal(*tmplBefore))
+	})
+
+	// Regression: a transient read of the live stable Deployment inside stableParams
+	// must not roll a legacy stable. stableParams reads that Deployment to recover a
+	// legacy stable's registry/image; it now surfaces a transient (non-NotFound) Get
+	// error so the caller requeues instead of rendering incomplete params. Without
+	// that fail-closed, incomplete params let ensureDeployment render the engine's
+	// CURRENT registry/image — on an operator upgrade whose configured registry
+	// changed, silently rolling the running legacy stable. This asserts the stable
+	// does NOT roll: the Pod template and Deployment generation are unchanged.
+	It("does not roll a legacy stable when the stableParams Deployment read fails transiently", func() {
+		rev := driveReady(newReconcilerFor(srv.URL, regHost), "roll", nil)
+		depBefore := stableDep("roll", rev)
+		genBefore := depBefore.Generation
+		tmplBefore := depBefore.Spec.Template.DeepCopy()
+		Expect(envValue(depBefore.Spec.Template.Spec.Containers[0].Env, "OLLAYA_REGISTRY")).To(Equal(srv.URL),
+			"the live stable carries the non-default registry it was built on")
+
+		By("clearing the recorded registry/image to look like a pre-field legacy stable")
+		Expect(updateDMStatus(ctx, namespace, "roll", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Status.StableRevision.Registry = ""
+			d.Status.StableRevision.Image = ""
+		})).To(Succeed())
+
+		// Interceptor: fail only the stableParams Deployment Get. Within one stable
+		// reconcile the Deployment is Got by storeClaimForStable first, then by
+		// stableParams, then by ensureDeployment; fail the SECOND Get (stableParams)
+		// so ensureDeployment's own read still succeeds and renders the incomplete
+		// params against the live template.
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		var armed atomic.Bool
+		var depGets atomic.Int32
+		depName := "roll-" + rev
+		// Within one stable reconcile the stable Deployment is Got several times
+		// (store precheck, storeClaimForStable, stableParams, ensureDeployment).
+		// stableParams is the 3rd of these; fail exactly that one so ensureDeployment's
+		// own (4th) read still succeeds and renders the incomplete params. depGets is
+		// asserted below so a change in the Get sequence fails loudly instead of
+		// silently missing stableParams.
+		const stableParamsGet = 3
+		ic := interceptor.NewClient(wc, interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isDep := obj.(*appsv1.Deployment); isDep && key.Name == depName && armed.Load() {
+					if depGets.Add(1) == stableParamsGet {
+						return apierrors.NewServerTimeout(
+							schema.GroupResource{Group: "apps", Resource: "deployments"}, "get", 1)
+					}
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		})
+		// Operator upgrade: the configured registry is now the built-in default
+		// (ollaya.dev), different from the non-default one the stable was built on.
+		// With a readable stableParams Get the live registry is adopted onto the
+		// recorded Registry and never rolls; with the read failing, p.Registry stays
+		// "" and the engine renders the default — which emits NO OLLAYA_REGISTRY env,
+		// so freezeFromLive has no same-name env to restore and the live
+		// OLLAYA_REGISTRY is dropped from the template (a silent roll).
+		const defaultReg = "https://ollaya.dev"
+		r := newReconcilerClient(defaultReg, "ollaya.dev", ic)
+
+		By("a reconcile with the transient stableParams read failure, under a changed registry flag")
+		armed.Store(true)
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "roll"}})
+		armed.Store(false)
+		Expect(depGets.Load()).To(BeNumerically(">=", int32(stableParamsGet)),
+			"the stableParams Deployment Get was reached and failed")
+
+		depAfter := stableDep("roll", rev)
+		// Desired (post-fix) behavior: a transient read must not drop/replace the
+		// registry env; the running legacy stable must not roll. On CURRENT code
+		// this fails (the env flips to the mirror), proving the bug.
+		Expect(envValue(depAfter.Spec.Template.Spec.Containers[0].Env, "OLLAYA_REGISTRY")).To(Equal(srv.URL),
+			"a transient stableParams read must not change the registry env (no silent roll)")
+		Expect(depAfter.Spec.Template).To(Equal(*tmplBefore), "the stable Pod template must be unchanged")
+		Expect(depAfter.Generation).To(Equal(genBefore), "the stable must not roll on a transient read")
 	})
 
 	It("rolls the stable in place when spec.auth.apiKeySecretRef switches to another Secret/key", func() {

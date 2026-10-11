@@ -84,7 +84,12 @@ func (r *DecisionModelReconciler) maintainStable(
 		}
 		return r.kickStableStoreRecovery(ctx, dm, eng, stable, claim)
 	}
-	stableParams := r.stableParams(ctx, dm, stable, claim)
+	stableParams, spErr := r.stableParams(ctx, dm, stable, claim)
+	if spErr != nil {
+		// Transient read of the live stable Deployment: do not render incomplete
+		// legacy params. Return the error so the caller requeues.
+		return spErr
+	}
 	// The stable store is serveable again: clear any Degraded this path set while
 	// the store was recovering (StoreLost / RegistryNotAllowed / StorePrefetchFailed)
 	// so a recovered stable does not keep advertising a stale recovery failure. Only
@@ -227,7 +232,11 @@ func (r *DecisionModelReconciler) kickStableStoreRecovery(
 		return nil
 	}
 	r.degradeStoreLost(ctx, dm, claim)
-	recoveryParams := r.seedManifest(ctx, dm, r.stableParams(ctx, dm, stable, claim), stable.Hash, stable.Digest)
+	sp, spErr := r.stableParams(ctx, dm, stable, claim)
+	if spErr != nil {
+		return spErr
+	}
+	recoveryParams := r.seedManifest(ctx, dm, sp, stable.Hash, stable.Digest)
 	_, _, _, perr := r.ensurePrefetchJob(ctx, dm, eng, recoveryParams, stable.Hash)
 	return perr
 }
@@ -562,7 +571,12 @@ func (r *DecisionModelReconciler) runRecoveryPrefetch(
 	// Seed the recorded manifest; the Job verifies the result against the pinned
 	// digest, so a tag that moved since promotion fails with UpstreamTagMoved
 	// instead of serving other bytes. A missing manifest means pull-by-tag + verify.
-	recoveryParams := r.seedManifest(ctx, dm, r.stableParams(ctx, dm, stable, claim), stable.Hash, stable.Digest)
+	sp, spErr := r.stableParams(ctx, dm, stable, claim)
+	if spErr != nil {
+		res, ferr := r.finish(ctx, dm, ctrl.Result{}, spErr)
+		return res, ferr
+	}
+	recoveryParams := r.seedManifest(ctx, dm, sp, stable.Hash, stable.Digest)
 	_, done, failed, perr := r.ensurePrefetchJob(ctx, dm, eng, recoveryParams, stable.Hash)
 	if perr != nil {
 		res, ferr := r.finish(ctx, dm, ctrl.Result{}, perr)

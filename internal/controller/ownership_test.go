@@ -155,6 +155,78 @@ var _ = Describe("ownership and store recovery", func() {
 		Expect(deg.Reason).To(Equal(reasonResourceConflict))
 	})
 
+	// A mutating admission webhook may add AppProtocol to the Service port. The
+	// controller owns name/protocol/port/targetPort only; it must treat an owned
+	// Service that matches those as a no-op and never strip AppProtocol (otherwise
+	// it rewrites the port every reconcile and the webhook re-adds it forever).
+	It("leaves an owned Service with a webhook-added AppProtocol untouched", func() {
+		createDM("svc-appproto")
+		dm := getDM("svc-appproto")
+		r := newReconciler(k8sClient, newFakeEngine(), &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}})
+		port := r.Engines["ollaya"].ServicePort()
+		appProto := "http"
+		owned := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "svc-appproto",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelName: "svc-appproto"},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:     corev1.ServiceTypeClusterIP,
+				Selector: revisionLabels(dm, "somehash"),
+				Ports: []corev1.ServicePort{{
+					Name: portNameHTTP, Protocol: corev1.ProtocolTCP, Port: port,
+					TargetPort: intstrFromInt32(port), AppProtocol: &appProto,
+				}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dm, owned, r.Scheme)).To(Succeed())
+		Expect(k8sClient.Create(ctx, owned)).To(Succeed())
+		rvBefore := owned.ResourceVersion
+
+		Expect(r.ensureService(ctx, dm, r.Engines["ollaya"], "somehash")).To(Succeed())
+
+		got := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "svc-appproto"}, got)).To(Succeed())
+		Expect(got.ResourceVersion).To(Equal(rvBefore), "no Update when only a webhook-owned field (AppProtocol) differs")
+		Expect(got.Spec.Ports[0].AppProtocol).NotTo(BeNil())
+		Expect(*got.Spec.Ports[0].AppProtocol).To(Equal("http"), "AppProtocol preserved")
+	})
+
+	// An owned-field drift (here a wrong targetPort) is still repaired, in place,
+	// without stripping a webhook-added AppProtocol.
+	It("repairs an owned Service port field while preserving AppProtocol", func() {
+		createDM("svc-repair")
+		dm := getDM("svc-repair")
+		r := newReconciler(k8sClient, newFakeEngine(), &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: defaultDigest, Device: "cpu"}})
+		port := r.Engines["ollaya"].ServicePort()
+		appProto := "http"
+		drifted := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "svc-repair",
+				Labels: map[string]string{decisionmodelv1alpha1.LabelName: "svc-repair"},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:     corev1.ServiceTypeClusterIP,
+				Selector: revisionLabels(dm, "somehash"),
+				Ports: []corev1.ServicePort{{
+					Name: portNameHTTP, Protocol: corev1.ProtocolTCP, Port: port,
+					TargetPort:  intstrFromInt32(port + 1), // owned-field drift
+					AppProtocol: &appProto,
+				}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(dm, drifted, r.Scheme)).To(Succeed())
+		Expect(k8sClient.Create(ctx, drifted)).To(Succeed())
+
+		Expect(r.ensureService(ctx, dm, r.Engines["ollaya"], "somehash")).To(Succeed())
+
+		got := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "svc-repair"}, got)).To(Succeed())
+		Expect(got.Spec.Ports[0].TargetPort).To(Equal(intstrFromInt32(port)), "owned targetPort repaired")
+		Expect(got.Spec.Ports[0].AppProtocol).NotTo(BeNil())
+		Expect(*got.Spec.Ports[0].AppProtocol).To(Equal("http"), "repair preserves the webhook field")
+	})
+
 	// gcLegacyStore never deletes a <dm>-store PVC the DM does not own.
 	It("never deletes a foreign <dm>-store legacy PVC", func() {
 		createDM("conflict-store")

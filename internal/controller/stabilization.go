@@ -367,6 +367,19 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	msg := fmt.Sprintf("new stable %s (revision %s) unhealthy during the stabilization window (%s); rolling back to %s",
 		modelRef(failed), failed.Hash, detail, prev.Hash)
 
+	// Capture the strategy the rollout actually ran under from the previous
+	// revision record BEFORE it is cleared below. Reading dm.Status.PreviousRevision
+	// after the nil (via rollbackStrategy) would fall back to the live spec, which
+	// can have been flipped mid-rollout — the exact case this guards: a Recreate
+	// rollout whose live strategy became BlueGreen must still stage the rollback,
+	// never instant-switch the Service to a previous revision scaled to 0.
+	rollStrategy := prev.Strategy
+	if rollStrategy == "" {
+		// A previousRevision recorded by an older operator had no strategy; fall
+		// back to the live spec (its best available signal).
+		rollStrategy = rolloutStrategy(dm)
+	}
+
 	failedAt := metav1.NewTime(r.now())
 	rolledBack := failed.DeepCopy()
 	rolledBack.Reason = reasonPostPromotionUnhealthy
@@ -412,7 +425,7 @@ func (r *DecisionModelReconciler) rollbackToPrevious(
 	// 0, free the GPU, bring the target up, switch the Service only when it is
 	// model-ready) via a durable marker; the stable path drives the remaining
 	// steps restart-safely. Do NOT switch the Service here.
-	if rollbackStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate {
+	if rollStrategy == decisionmodelv1alpha1.RolloutRecreate {
 		startedAt := metav1.NewTime(r.now())
 		dm.Status.RecreateRollback = &decisionmodelv1alpha1.RecreateRollbackStatus{
 			Failed: failed.Hash, Target: prev.Hash, StartedAt: &startedAt,

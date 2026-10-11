@@ -189,7 +189,8 @@ var _ = Describe("per-revision manifest persistence", func() {
 		// surfaced as UpstreamTagMoved (see prefetch_failure / store_recovery specs).
 		// The seed still matters as the recorded intent and for engines/registries
 		// that honour it.
-		base := r.stableParams(ctx, getDM("lost"), stable, "lost-store-"+rev)
+		base, baseErr := r.stableParams(ctx, getDM("lost"), stable, "lost-store-"+rev)
+		Expect(baseErr).NotTo(HaveOccurred())
 		seeded := r.seedManifest(ctx, getDM("lost"), base, stable.Hash, stable.Digest)
 		Expect(seeded.Model.Manifest).To(Equal(manifestBody),
 			"recovery seeds the recorded manifest, not the moved tag's bytes")
