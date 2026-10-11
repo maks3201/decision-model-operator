@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,6 +35,11 @@ import (
 // projectImage is the operator image built from the current source, loaded into
 // the kind cluster and deployed by the suite.
 const projectImage = "example.com/decision-model-operator:v0.0.1-e2e"
+
+// stabilizationWait bounds the wait for status.previousRevision to clear after a
+// promotion. The controller keeps the previous revision for its 5 minute
+// stabilization window, so the wait must be longer than the window itself.
+const stabilizationWait = 8 * time.Minute
 
 // testDevice selects the DecisionModel device under test. Default "cpu" keeps the
 // CPU CI identical; the GPU workflow sets E2E_DEVICE=cuda.
