@@ -40,6 +40,29 @@ func rolloutStrategy(dm *decisionmodelv1alpha1.DecisionModel) decisionmodelv1alp
 	return decisionmodelv1alpha1.RolloutBlueGreen
 }
 
+// promotionStrategy is the strategy a just-completing rollout ACTUALLY ran under,
+// derived from durable evidence rather than the live spec. spec.rollout.strategy
+// is mutable and excluded from the revision hash, so a Recreate rollout can stop
+// the old stable and then have its live strategy flipped to BlueGreen before
+// promotion; recording the live value would then make a stabilization-window
+// rollback take the BlueGreen path and switch the Service to a previous
+// Deployment that is still scaled to 0 (single-GPU Recreate).
+//
+// It keys on status.stableStoppedForRevision: a persisted stop intent naming this
+// candidate commits the rollout to Recreate (see maybeRecreateStop — the intent is
+// sticky, so a crash after the intent write followed by a flip to BlueGreen still
+// resumes and completes the scale-down before the candidate starts, never leaving
+// the previous revision running). So the intent is a safe, durable proxy for "this
+// rollout ran Recreate"; anything else is BlueGreen (a running previous revision
+// can be switched to instantly). The marker is cleared on promotion/rollback, so
+// it never leaks into the next candidate.
+func promotionStrategy(dm *decisionmodelv1alpha1.DecisionModel, candidateHash string) decisionmodelv1alpha1.RolloutStrategy {
+	if dm.Status.StableStoppedForRevision == candidateHash && candidateHash != "" {
+		return decisionmodelv1alpha1.RolloutRecreate
+	}
+	return decisionmodelv1alpha1.RolloutBlueGreen
+}
+
 // rollbackStrategy is the strategy a stabilization-window rollback must stage
 // with: the one recorded on the previous revision at promotion time, not the live
 // spec (spec.rollout.strategy can change mid-rollout and is not part of the
@@ -106,7 +129,18 @@ func (r *DecisionModelReconciler) maybeRecreateStop(
 	eng engine.Engine,
 	candidate *decisionmodelv1alpha1.RevisionStatus,
 ) (handled bool, res ctrl.Result, err error) {
-	if rolloutStrategy(dm) != decisionmodelv1alpha1.RolloutRecreate || dm.Status.StableRevision == nil {
+	// A non-empty stop marker means the stable is ALREADY held at zero for a
+	// Recreate rollout. Any replacement candidate must finish through Recreate too
+	// — it must not start BlueGreen against a stopped prior stable (which a
+	// stabilization rollback could then try to Service-switch to while it is at
+	// zero). recreateStopStable (unchanged) is the durable handoff: called for the
+	// current candidate while the marker still names a superseded one, it persists
+	// StableStoppedForRevision=<this candidate> before proceeding, so promotion
+	// records Recreate for whichever candidate actually promotes. A live strategy
+	// change applies to a FUTURE rollout started from a running stable, not to one
+	// whose capacity has already been released.
+	recreate := rolloutStrategy(dm) == decisionmodelv1alpha1.RolloutRecreate || stableStopped(dm)
+	if !recreate || dm.Status.StableRevision == nil {
 		return false, ctrl.Result{}, nil
 	}
 	return r.recreateStopStable(ctx, dm, eng, dm.Status.StableRevision, candidate)
@@ -387,7 +421,10 @@ func (r *DecisionModelReconciler) reconcileRecreateRollback(
 	// at its replicas, since desiredReplicasForRevision no longer holds it at 0 —
 	// it is the stable again and the stop marker is cleared) and probe it.
 	claim, _ := r.storeClaimForStable(ctx, dm, target)
-	params := r.stableParams(ctx, dm, target, claim)
+	params, spErr := r.stableParams(ctx, dm, target, claim)
+	if spErr != nil {
+		return r.finish(ctx, dm, ctrl.Result{}, spErr)
+	}
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
 	if err := r.ensureDeployment(ctx, dm, eng, params, target.Hash, true, keyChecksum, legacyChecksum, false); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
