@@ -279,7 +279,7 @@ cluster-scoped and is installed by a cluster admin.
 ## 8. Resources and scheduling
 
 - `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.12.1-cuda` image. GPU behaviour verified on EKS
-  (g4dn.xlarge, T4, Bottlerocket, 0.7.3-cuda; not yet re-verified on 0.12.x-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
+  (g4dn.xlarge, T4, Bottlerocket; re-verified on 0.12.1-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
   (only the exact `cuda:<n>` form; anything else fails the gate). A blue-green rollout needs a
   second GPU for the candidate; on a single GPU set `rollout.strategy: Recreate` so the stable is
   stopped before the candidate starts (documented downtime, no second GPU — see §5). Models are
