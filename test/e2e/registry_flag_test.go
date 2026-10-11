@@ -163,12 +163,18 @@ spec:
 		By("bumping the CPU request to force a new revision (resolved + prefetched via the mirror)")
 		flagPatchCPU("600m")
 
+		// Wait for the stable hash to change, not just for phase Ready: right after the
+		// patch the phase still reads Ready from the old stable until the next reconcile.
 		var newStable string
-		Eventually(func() (string, error) {
-			return utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.phase}")
-		}, 12*time.Minute, 10*time.Second).Should(Equal("Ready"), "the candidate did not promote")
-		newStable = flagMustStable()
-		Expect(newStable).NotTo(Equal(stableS), "a CPU change must create and promote a new revision")
+		Eventually(func(g Gomega) {
+			phase, err := utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.phase}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(phase).To(Equal("Ready"))
+			h, err := utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(h).NotTo(Equal(stableS), "a CPU change must create and promote a new revision")
+			newStable = h
+		}, 12*time.Minute, 10*time.Second).Should(Succeed(), "the candidate did not promote")
 
 		gotReg, err := utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm,
 			"{.status.stableRevision.registry}")
