@@ -103,16 +103,20 @@ func TestClassifyPrefetchFailure(t *testing.T) {
 		{"upstream tag moved from message", "reason: UpstreamTagMoved\n", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from message", "reason: ModelNotFound\n", 3, PrefetchReasonModelNotFound, true},
 		{"transient from message", "reason: Transient\n", 1, PrefetchReasonTransient, false},
+		{"unknown from message", "reason: Unknown\n", 2, PrefetchReasonUnknown, false},
 		{"seed unavailable from message", "reason: SeedUnavailable\n", 6, PrefetchReasonSeedUnavailable, true},
 		{"digest mismatch from exit code only", "", 4, PrefetchReasonDigestMismatch, true},
 		{"upstream tag moved from exit code only", "", 5, PrefetchReasonUpstreamTagMoved, true},
 		{"model not found from exit code only", "", 3, PrefetchReasonModelNotFound, true},
 		{"seed unavailable from exit code only", "", 6, PrefetchReasonSeedUnavailable, true},
 		{"transient from exit code only", "", 1, PrefetchReasonTransient, false},
-		{"unknown exit code is transient", "", 2, PrefetchReasonTransient, false},
-		{"empty is transient", "", 0, PrefetchReasonTransient, false},
+		{"unknown from exit code 2", "", 2, PrefetchReasonUnknown, false},
+		{"OOM (137) is unknown, not transient", "", 137, PrefetchReasonUnknown, false},
+		{"SIGKILL/other unrecognised exit is unknown", "", 143, PrefetchReasonUnknown, false},
+		{"empty/zero exit with no message is unknown", "", 0, PrefetchReasonUnknown, false},
 		{"message wins over mismatched exit code", "reason: ModelNotFound\n", 1, PrefetchReasonModelNotFound, true},
 		{"garbage message falls back to exit code", "boom\n", 4, PrefetchReasonDigestMismatch, true},
+		{"garbage message + unknown exit is unknown", "boom\n", 2, PrefetchReasonUnknown, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

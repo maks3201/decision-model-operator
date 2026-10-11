@@ -66,7 +66,7 @@ func TestRevHashREWidths(t *testing.T) {
 
 // TestPrefetchJobSpec16HexUsesPullScript is the regression guard: a 16-hex
 // StoreSubPath must render the normal pull script (ollaya pull), NOT the
-// refuse-and-exit-1 script. Before the fix this rendered invalidSubPathScript
+// refuse-and-exit script. Before the fix this rendered invalidSubPathScript
 // and the Job failed every attempt.
 func TestPrefetchJobSpec16HexUsesPullScript(t *testing.T) {
 	for _, h := range []string{hash10, hash16} {

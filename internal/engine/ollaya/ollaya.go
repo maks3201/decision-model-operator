@@ -1584,7 +1584,8 @@ func prefetchResources() corev1.ResourceRequirements {
 // failure (exit 1) is retried by the Job up to backoffLimit. These values are
 // also what classifyPrefetchFailure maps back to a reason.
 const (
-	prefetchExitTransient       = 1 // network / 5xx / timeout: retry
+	prefetchExitTransient       = 1 // positively-identified availability error (DNS, conn refused/reset, timeout, 408/429/5xx): retry
+	prefetchExitUnknown         = 2 // not positively transient and not permanent (auth, out-of-space, OOM, unrecognised): do not silently retry forever
 	prefetchExitModelNotFound   = 3 // manifest 404 / tag not found: permanent
 	prefetchExitDigestMismatch  = 4 // pulled digest != expected: permanent
 	prefetchExitTagMoved        = 5 // pulled a valid but different manifest: tag moved upstream, permanent
@@ -1592,6 +1593,7 @@ const (
 
 	// String forms for embedding in the shell script (const concatenation).
 	prefetchExitTransientStr       = "1"
+	prefetchExitUnknownStr         = "2"
 	prefetchExitModelNotFoundStr   = "3"
 	prefetchExitDigestMismatchStr  = "4"
 	prefetchExitTagMovedStr        = "5"
@@ -1605,7 +1607,18 @@ const (
 	PrefetchReasonModelNotFound    = "ModelNotFound"
 	PrefetchReasonDigestMismatch   = "DigestMismatch"
 	PrefetchReasonUpstreamTagMoved = "UpstreamTagMoved"
-	PrefetchReasonTransient        = "Transient"
+	// PrefetchReasonTransient is a POSITIVELY-identified availability error that
+	// retrying is expected to fix: DNS failure, connection refused/reset, timeout,
+	// or HTTP 408/429/5xx from the registry or the weight host. Its value matches
+	// engine.PrefetchReasonTransient (the contract); alias it to the engine
+	// constant once that ships.
+	PrefetchReasonTransient = engine.PrefetchReasonTransient
+	// PrefetchReasonUnknown is a non-permanent failure that is NOT positively
+	// transient and whose automatic retry may not help without operator action:
+	// auth (401/403), out-of-space, permission denied, OOM (exit 137), or any
+	// unrecognised error/exit. It is reported (not silently retried as transient)
+	// so a stuck cause surfaces. Its value matches engine.PrefetchReasonUnknown.
+	PrefetchReasonUnknown = engine.PrefetchReasonUnknown
 	// PrefetchReasonSeedUnavailable means the manifest seed the controller
 	// mounted (ManifestConfigMap) is missing or unreadable in the prefetch
 	// container. It is a configuration/setup fault, not a registry serving
@@ -1625,8 +1638,8 @@ const (
 //
 // ollaya pull returns exit 1 for BOTH a missing tag and a network error (verified
 // in the image), so a missing tag is told apart by the message
-// ("not found in registry"); anything else that fails the pull is treated as
-// transient and retried. A successful pull whose manifest digest differs from the
+// ("not found in registry"); transport errors, timeouts and HTTP 408/429/5xx
+// are Transient; anything else that fails the pull is Unknown (bounded retry). A successful pull whose manifest digest differs from the
 // recorded one is split further: a well-formed manifest means the tag moved
 // upstream (UpstreamTagMoved, exit 5), an ill-formed one means corruption
 // (DigestMismatch, exit 4); both are permanent.
@@ -1709,10 +1722,28 @@ fi
 pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
   echo "$pull_err" >&2
   case "$pull_err" in
+    # Permanent: the registry has no such tag.
     *"not found in registry"*|*"not found"*)
       fail ` + PrefetchReasonModelNotFound + ` ` + prefetchExitModelNotFoundStr + ` ;;
-    *)
+    # Positively-identified availability errors (retry): transport failures
+    # (DNS, connection refused/reset, timeout -> "error sending request for url")
+    # and retryable HTTP statuses 408/429/5xx. Strings verified against
+    # ollaya 0.12.1 (see the engine's string table).
+    *"error sending request for url"*|*"operation timed out"*|*"timed out"*|\
+    *"HTTP status server error ("*|\
+    *"HTTP status client error (408 "*|*"HTTP status client error (429 "*)
       fail ` + PrefetchReasonTransient + ` ` + prefetchExitTransientStr + ` ;;
+    # Not positively transient and not permanent: auth (401/403), out of space,
+    # permission denied -> Unknown. Retrying the same request will not help
+    # without operator action (fix credentials / free disk / fix permissions),
+    # but it is not a "permanent" model error, so it is surfaced as Unknown
+    # rather than silently retried as transient.
+    *"HTTP status client error (401 "*|*"HTTP status client error (403 "*|\
+    *"no space left on device"*|*"permission denied"*)
+      fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
+    # Anything else: Unknown (never a blind Transient catch-all).
+    *)
+      fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
   esac
 }
 if [ -z "${EXPECT_DIGEST:-}" ]; then
@@ -1768,13 +1799,13 @@ fi
 // unparsableNameScript is used when the model name does not parse: it never
 // runs ollaya pull, prints the reason and exits 1 (review E4).
 const unparsableNameScript = `echo "ollaya: refusing to prefetch: model name did not parse in the operator" >&2
-exit 1
+exit 2
 `
 
 // invalidSubPathScript is used when a non-empty StoreSubPath is not a valid
 // revision hash: the Job refuses rather than pulling into an unexpected path.
 const invalidSubPathScript = `echo "ollaya: refusing to prefetch: store sub-path is not a valid revision hash" >&2
-exit 1
+exit 2
 `
 
 // storeRootMount is where the Job mounts the PVC root (no subPath) so it can
@@ -1810,9 +1841,10 @@ func prefetchPodFailurePolicy() *batchv1.PodFailurePolicy {
 // retrying). The controller calls it to surface the reason in the PrefetchFailed
 // condition/Event. The termination message is matched first ("reason: <X>",
 // written by the script); the exit code is the fallback when the message is
-// absent (e.g. the container was killed before writing it). An unrecognised
-// failure is treated as transient so the operator does not permanently fail a
-// revision on an unknown error.
+// absent (e.g. the container was OOM-killed before writing it). A failure that is
+// neither positively transient nor permanent is PrefetchReasonUnknown (NOT a
+// blind transient): an unrecognised exit code and OOM (137) classify as Unknown
+// so a stuck non-availability cause surfaces instead of looping as transient.
 func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason string, permanent bool) {
 	switch {
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonUpstreamTagMoved):
@@ -1825,6 +1857,8 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 		return PrefetchReasonModelNotFound, true
 	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonTransient):
 		return PrefetchReasonTransient, false
+	case strings.Contains(terminationMessage, "reason: "+PrefetchReasonUnknown):
+		return PrefetchReasonUnknown, false
 	}
 	switch exitCode {
 	case prefetchExitTagMoved:
@@ -1835,8 +1869,14 @@ func classifyPrefetchFailure(terminationMessage string, exitCode int32) (reason 
 		return PrefetchReasonModelNotFound, true
 	case prefetchExitSeedUnavailable:
 		return PrefetchReasonSeedUnavailable, true
-	default:
+	case prefetchExitTransient:
 		return PrefetchReasonTransient, false
+	case prefetchExitUnknown:
+		return PrefetchReasonUnknown, false
+	default:
+		// Unrecognised exit code (includes OOM 137, SIGKILL 137/143, and any code
+		// the script did not set): not positively transient and not permanent.
+		return PrefetchReasonUnknown, false
 	}
 }
 
