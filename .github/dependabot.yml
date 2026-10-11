@@ -27,6 +27,14 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # Keep every github/codeql-action/* step (init, analyze, upload-sarif) on
+      # the same version in one PR. When init and analyze drift apart, CodeQL
+      # fails with "Loaded a configuration file for version X, but running
+      # version Y".
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
 
   # Base images in the Dockerfile.
   - package-ecosystem: docker

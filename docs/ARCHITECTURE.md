@@ -159,7 +159,17 @@ Rollout strategy (`rollout.strategy`, default `BlueGreen`):
   Recreate — the stopped stable cannot be measured as a baseline — with a note in
   `status.evaluation.reason` and a Warning; the absolute gates still apply. Recreate cannot be
   combined with `promotion: Manual` (rejected by CEL: production would be down while a human
-  approves). Changing the strategy is not a revision-hash change.
+  approves). Changing the strategy is not a revision-hash change: once a Recreate rollout has
+  stopped the stable (`status.stableStoppedForRevision` set), that rollout **finishes as Recreate**
+  even if `spec.rollout.strategy` is edited mid-flight — the stopped revision is held at 0 replicas
+  by `desiredReplicasForRevision`, and a stabilization-window rollback uses the strategy recorded on
+  the previous revision, not the live spec. A strategy edit only takes effect on the **next**
+  rollout.
+  - **Stable stuck Terminating is bounded.** The candidate's Pods are not created until the stopped
+    stable's Pods are gone; if they are stuck `Terminating`, the DecisionModel would otherwise sit
+    in `Caching` with production stopped forever. The wait reuses the caching deadline (measured
+    from `phaseTransitionTime`): past it the candidate fails with `CacheTimeout` and the stable is
+    scaled back up.
   - **Recreate rollback downtime.** After a Recreate promotion the old stable becomes the
     `previousRevision` and stays scaled to 0 for the whole stabilization window (it was stopped
     for the rollout and must not take the single GPU back). If the new stable turns unhealthy in
@@ -180,7 +190,16 @@ Rollout strategy (`rollout.strategy`, default `BlueGreen`):
 In-place rules:
 - A running stable is rendered from its recorded identity; its placement and resources are frozen
   from the live Deployment, so an operator upgrade (new default resources, GPU toleration, arch
-  pin) does not roll it. Stables recorded by an older operator are adopted without a roll.
+  pin) does not roll it. Stables recorded by an older operator are adopted without a roll. If a
+  legacy stable's recorded identity is incomplete and its live Deployment **cannot be read** (a
+  transient API/cache error, as opposed to a genuine not-found), the controller requeues and
+  renders nothing rather than substituting the engine's current defaults — rendering then would
+  silently roll the running legacy stable onto new defaults.
+- The serving `Service` reconcile enforces only the port fields the operator owns — name, protocol,
+  service port and target port — and the `ClusterIP` type and selector. Fields a mutating admission
+  webhook adds (for example `appProtocol`) are preserved; comparing the full struct would treat the
+  webhook's addition as drift and rewrite the port every reconcile, which the webhook re-adds — an
+  endless Service-update fight.
 - Every serving Deployment has an explicit strategy: RWO store → `Recreate`; shareable store +
   `cuda` → `RollingUpdate{maxSurge: 0, maxUnavailable: 1}`; otherwise 25%/25%. For `replicas: 1`
   any in-place change is a short outage; that is the price of no Multi-Attach / GPU deadlock.
