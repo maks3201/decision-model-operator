@@ -771,8 +771,10 @@ func (r *DecisionModelReconciler) degradeStoreRecoveryBlocked(
 
 // degradeStoreTerminating sets Degraded=True/StoreTerminating while the stable
 // store PVC is being deleted but is still mounted by the stable Pods.
-// The operator does not stop the stable automatically (a PVC delete cannot be
-// undone); the user must delete the Pods to let recovery proceed. The Event fires
+// While a model-ready stable Pod still serves from it the operator keeps serving
+// (a PVC delete cannot be undone) and the user decides when to delete the Pods;
+// with no model-ready Pod left the stable is scaled to 0 so the PVC can finalize
+// (StoreFinalizeStoppedForRevision). The Event fires
 // only on the transition into StoreTerminating and the condition carries a fixed
 // message, so repeated reconciles on the regate interval cause no status churn.
 func (r *DecisionModelReconciler) degradeStoreTerminating(
