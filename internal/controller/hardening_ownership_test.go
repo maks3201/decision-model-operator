@@ -329,7 +329,7 @@ var _ = Describe("baseline fail-closed", func() {
 
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden"},
-			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"},
+			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"},
 		}
 		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 

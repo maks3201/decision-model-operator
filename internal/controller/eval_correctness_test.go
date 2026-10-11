@@ -102,7 +102,7 @@ var _ = Describe("eval blip does not promote", func() {
 		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
 		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden"},
-			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"},
+			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"},
 		})).To(Succeed())
 		dm := &decisionmodelv1alpha1.DecisionModel{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "blip"},
@@ -153,8 +153,8 @@ var _ = Describe("eval blip does not promote", func() {
 		// Two cases; the runtime rejects on the first Decide (line 1).
 		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-rej"},
-			Data: map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n" +
-				`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"},
+			Data: map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n" +
+				`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"},
 		})).To(Succeed())
 		dm := &decisionmodelv1alpha1.DecisionModel{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rej"},
@@ -194,7 +194,7 @@ var _ = Describe("eval blip does not promote", func() {
 		eng.rejectErr.Store(false)
 		cm := &corev1.ConfigMap{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "golden-rej"}, cm)).To(Succeed())
-		cm.Data["cases.jsonl"] = `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"
+		cm.Data["cases.jsonl"] = `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"
 		Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
 			rec(r, "rej")

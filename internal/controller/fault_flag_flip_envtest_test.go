@@ -148,7 +148,7 @@ var _ = Describe("a security flag tightened mid-rollout refuses the candidate an
 	goldenCM := func(name string) {
 		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n"},
+			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"},
 		})).To(Succeed())
 	}
 

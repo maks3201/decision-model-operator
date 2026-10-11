@@ -571,7 +571,7 @@ var _ = Describe("security guards", func() {
 	It("A3: dataset Secret via the deprecated api-key label works with a Warning", func() {
 		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
 		r := newR(eng)
-		dataset := []byte(`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n")
+		dataset := []byte(`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n")
 		Expect(k8sClient.Create(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: "ds-dep",

@@ -171,7 +171,7 @@ var _ = Describe("restart resilience", func() {
 			if i < correct {
 				exp = "billing"
 			}
-			line := `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"` + exp + `"}}` + "\n"
+			line := `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"` + exp + `"}}` + "\n"
 			b = append(b, []byte(line)...)
 		}
 		return string(b)
