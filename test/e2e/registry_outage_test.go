@@ -240,7 +240,7 @@ spec:
 		// collected (status.previousRevision cleared) before injecting the fault.
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(registryOutageNS, "decisionmodel", dm, "{.status.previousRevision}")
-		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
+		}, stabilizationWait, 5*time.Second).Should(BeEmpty())
 
 		By("faulting the registry, then deleting the stable store PVC and its Pod to force recovery")
 		setMirrorFault("503")

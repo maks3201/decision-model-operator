@@ -79,7 +79,7 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 		By("waiting for the post-promotion stabilization window to close (previousRevision clears)")
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.previousRevision}")
-		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
+		}, stabilizationWait, 5*time.Second).Should(BeEmpty())
 
 		By("deleting the stable store PVC and its Pod to force a store recovery")
 		_, _ = utils.Kubectl("delete", "pvc", dm+"-store-"+stableS, "-n", faultMatrixNS, "--wait=false")
@@ -156,7 +156,7 @@ var _ = Describe("Fault matrix: recovery, promote, concurrency", Label("fault-ma
 		stableS := fmStable(dm)
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(faultMatrixNS, "decisionmodel", dm, "{.status.previousRevision}")
-		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
+		}, stabilizationWait, 5*time.Second).Should(BeEmpty())
 
 		By("forcing a candidate (CPU change) and restarting the manager a few times across the window")
 		fmPatchCPU(dm, "600m")

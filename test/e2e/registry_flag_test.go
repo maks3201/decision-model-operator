@@ -225,7 +225,7 @@ spec:
 		// idiom in registry_outage_test.go and keeps the leg within its test budget.
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(registryFlagNS, "decisionmodel", dm, "{.status.previousRevision}")
-		}, 5*time.Minute, 5*time.Second).Should(BeEmpty())
+		}, stabilizationWait, 5*time.Second).Should(BeEmpty())
 
 		By("deleting the stable store PVC and its serving Pod to force a store recovery")
 		_, _ = utils.Kubectl("delete", "pvc", pvc, "-n", registryFlagNS, "--wait=false")
