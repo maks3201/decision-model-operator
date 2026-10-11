@@ -301,6 +301,76 @@ var _ = Describe("Recreate rollout strategy", func() {
 		Expect(getDM("rf").Status.StableRevision.Hash).To(Equal(rev1))
 	})
 
+	It("bounds the stable stop: a stable Pod stuck Terminating past the caching deadline fails the candidate and restores the stable", func() {
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		clock := newSafeClock()
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "rstuck"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "rstuck")
+
+		// Candidate rev2 for a new model; drive to Cached + stable stopped.
+		Expect(updateDM(ctx, namespace, "rstuck", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM("rstuck").Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, "rstuck")
+		markJob("rstuck", rev2)
+		rec(r, "rstuck") // Cached -> stable stopped
+		Expect(getDM("rstuck").Status.StableStoppedForRevision).To(Equal(rev2))
+		Expect(depReplicas("rstuck", rev1)).To(Equal(int32(0)))
+
+		// The stable Pod will not disappear: give it a finalizer and delete it so it
+		// stays Terminating (DeletionTimestamp set, object still present). The stop
+		// gate counts a Terminating Pod as still holding the GPU, so it is NOT gone
+		// and the candidate Deployment is never created — the stop loop would spin
+		// at probeRequeue forever without a timeout.
+		pod := &corev1.Pod{}
+		podKey := types.NamespacedName{Namespace: namespace, Name: "rstuck-pod-" + rev1}
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		pod.Finalizers = []string{"decisionmodel.io/test-hold"}
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		Expect(pod.DeletionTimestamp).NotTo(BeNil(), "stable Pod is Terminating but still present")
+
+		// A reconcile before the deadline keeps waiting (no candidate, no failure).
+		rec(r, "rstuck")
+		Expect(getDM("rstuck").Status.FailedRevision).To(BeNil(), "no timeout before the deadline")
+		Expect(depExists("rstuck", rev2)).To(BeFalse(), "candidate Deployment not created while the stable is still stopping")
+
+		// Advance past the caching deadline: the candidate fails with CacheTimeout
+		// and the stable restore path runs (stop marker cleared, stable scaled back).
+		clock.add(cachingTimeout(getDM("rstuck")) + time.Minute)
+		Eventually(func() string {
+			rec(r, "rstuck")
+			if fr := getDM("rstuck").Status.FailedRevision; fr != nil {
+				return fr.Reason
+			}
+			return ""
+		}, "5s", "50ms").Should(Equal(reasonCacheTimeout), "stuck stop times out with CacheTimeout")
+		Expect(getDM("rstuck").Status.FailedRevision.Hash).To(Equal(rev2))
+		Expect(getDM("rstuck").Status.StableStoppedForRevision).To(BeEmpty(), "stop marker cleared on timeout")
+
+		// Release the stuck Pod so the stable can come back, then confirm restore.
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		pod.Finalizers = nil
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+		Eventually(func() int32 {
+			rec(r, "rstuck")
+			return depReplicas("rstuck", rev1)
+		}, "5s", "50ms").Should(Equal(int32(1)), "stable restored to its replicas after the timeout")
+		Expect(getDM("rstuck").Status.StableRevision.Hash).To(Equal(rev1))
+	})
+
 	It("leaves BlueGreen unchanged: the stable keeps serving during the candidate rollout", func() {
 		pr := stableProber()
 		eng := newFakeEngine()
