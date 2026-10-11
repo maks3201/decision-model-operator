@@ -370,6 +370,8 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		}
 
 		By("the store PVC is Terminating (finalizer kept) and the only serving Pod is gone")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM("unstick"), rev)},
+			&batchv1.Job{})).To(Succeed(), "the revision's finished prefetch Job is present before the store is deleted")
 		pvc := &corev1.PersistentVolumeClaim{}
 		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
@@ -392,6 +394,13 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(degradedReason(dm)).To(Equal(reasonStoreTerminating), "Degraded stays StoreTerminating while scaled to 0")
 		deg := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
 		Expect(deg.Message).To(ContainSubstring("scaled the stable Deployment to 0"))
+		// pvc-protection counts a Completed Pod that lists the PVC, so the finished
+		// prefetch Job of the revision must go too, or the PVC never finalizes.
+		Eventually(func() bool {
+			rec()
+			return apierrors.IsNotFound(k8sClient.Get(ctx,
+				types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM("unstick"), rev)}, &batchv1.Job{}))
+		}, "5s", "50ms").Should(BeTrue(), "the finished prefetch Job no longer holds the Terminating store")
 
 		By("the PVC finalizes (nothing mounts it now); recovery recreates it (annotated) and clears the marker")
 		Expect(k8sClient.Get(ctx, pvcKey, pvc)).To(Succeed())

@@ -62,6 +62,11 @@ func (r *DecisionModelReconciler) maintainStable(
 	if err != nil {
 		return err
 	}
+	if terminating {
+		if err := r.releaseTerminatingStore(ctx, dm, stable.Hash); err != nil {
+			return err
+		}
+	}
 	if !serveable {
 		// Missing/recovering store: do not render the Deployment against it, but DO
 		// drive the recovery forward in parallel with the candidate (recreate the
@@ -770,7 +775,7 @@ func (r *DecisionModelReconciler) degradeStoreRecoveryBlocked(
 }
 
 // degradeStoreTerminating sets Degraded=True/StoreTerminating while the stable
-// store PVC is being deleted but is still mounted by the stable Pods.
+// store PVC is being deleted but is still in use by Pods that mount it.
 // While a model-ready stable Pod still serves from it the operator keeps serving
 // (a PVC delete cannot be undone) and the user decides when to delete the Pods;
 // with no model-ready Pod left the stable is scaled to 0 so the PVC can finalize
@@ -782,8 +787,8 @@ func (r *DecisionModelReconciler) degradeStoreTerminating(
 	dm *decisionmodelv1alpha1.DecisionModel,
 	claim string,
 ) {
-	msg := fmt.Sprintf("the stable store PVC %q is being deleted; it is still mounted by the stable Pods "+
-		"— delete them to let recovery proceed", claim)
+	msg := fmt.Sprintf("the stable store PVC %q is being deleted; it is still in use by Pods that mount it "+
+		"— the operator removes its finished prefetch Job, delete the serving Pods to let recovery proceed", claim)
 	deg := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
 	already := deg != nil && deg.Status == metav1.ConditionTrue && deg.Reason == reasonStoreTerminating
 	if !already {
@@ -1444,4 +1449,30 @@ func (r *DecisionModelReconciler) storeAccessModes(
 		return dm.Spec.Cache.AccessModes
 	}
 	return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+}
+
+// releaseTerminatingStore deletes the finished prefetch Job of revision rev while
+// its store PVC is Terminating. Kubernetes pvc-protection keeps a PVC as long as
+// any scheduled Pod lists it as a volume, a Completed one included, so a retained
+// prefetch Pod would hold a deleted store forever even after the serving Pods are
+// gone. A finished Job is never needed again: recovery creates a fresh one for
+// the recreated PVC. A Job that is still running is left alone.
+func (r *DecisionModelReconciler) releaseTerminatingStore(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) error {
+	job := &batchv1.Job{}
+	key := types.NamespacedName{Namespace: dm.Namespace, Name: prefetchName(dm, rev)}
+	if err := r.Get(ctx, key, job); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !ownedBy(job, dm) || job.DeletionTimestamp != nil || (!jobComplete(job) && !jobFailed(job)) {
+		return nil
+	}
+	bg := metav1.DeletePropagationBackground
+	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &bg}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
