@@ -159,6 +159,19 @@ func (r *DecisionModelReconciler) recreateStopStable(
 		return true, ctrl.Result{}, err
 	}
 	if !gone {
+		// Bound the wait for the stable Pods to disappear. The DecisionModel is
+		// still in Caching here (the candidate Deployment is not created until the
+		// GPU is free), so a stable Pod stuck Terminating would otherwise keep it in
+		// Caching with production stopped and no candidate forever. Reuse the Caching
+		// deadline (measured from phaseTransitionTime) and the existing rollback:
+		// past it, fail the candidate with CacheTimeout and scale the stable back up
+		// (rollbackOrFail runs the Recreate stable-restore path). The timeout check
+		// comes before the requeue so a Terminating-Pod deadlock cannot loop forever.
+		if r.phaseExceeded(dm, cachingTimeout(dm)) {
+			res, rerr := r.rollbackOrFail(ctx, dm, candidate, reasonCacheTimeout,
+				"stable did not stop within the caching deadline (Pods still terminating)")
+			return true, res, rerr
+		}
 		return true, ctrl.Result{RequeueAfter: probeRequeue}, nil
 	}
 	return false, ctrl.Result{}, nil
