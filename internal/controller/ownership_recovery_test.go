@@ -341,6 +341,18 @@ var _ = Describe("ownership through the cache and stable-store recovery", func()
 		Expect(pvc.UID).To(Equal(uid))
 		Expect(pvc.DeletionTimestamp).NotTo(BeNil())
 
+		// Even while a ready Pod keeps serving, the revision's finished prefetch
+		// Job must be released: pvc-protection counts its Completed Pod as a PVC
+		// user, so leaving it would hold the Terminating store once the serving
+		// Pods eventually go. Replicas are unchanged (asserted above).
+		Eventually(func() bool {
+			_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "term"}})
+			return apierrors.IsNotFound(k8sClient.Get(ctx,
+				types.NamespacedName{Namespace: namespace, Name: prefetchName(getDM("term"), rev)}, &batchv1.Job{}))
+		}, "5s", "50ms").Should(BeTrue(), "the finished prefetch Job is deleted even with a serving Pod present")
+		Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+		Expect(dep.Spec.Replicas).To(Equal(int32Ptr(1)), "a serving stable's replicas are unchanged")
+
 		// Once the PVC is actually gone, recovery takes over (annotated recreate).
 		pvc.Finalizers = nil
 		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
