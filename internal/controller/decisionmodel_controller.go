@@ -1344,6 +1344,11 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	if recovering {
 		return rres, rerr
 	}
+	if storeTerminating {
+		if err := r.releaseTerminatingStore(ctx, dm, stable.Hash); err != nil {
+			return r.finish(ctx, dm, ctrl.Result{}, err)
+		}
+	}
 
 	stableParams := r.stableParams(ctx, dm, stable, claim)
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
