@@ -72,6 +72,11 @@ func (r *DecisionModelReconciler) maintainStable(
 		if terminating {
 			return nil
 		}
+		// PVC gone (finalized / never existed): the store-finalize scale-to-0 marker,
+		// if set, must clear so the stable scales back once recovery completes.
+		if dm.Status.StoreFinalizeStoppedForRevision == stable.Hash {
+			dm.Status.StoreFinalizeStoppedForRevision = ""
+		}
 		return r.kickStableStoreRecovery(ctx, dm, eng, stable, claim)
 	}
 	stableParams := r.stableParams(ctx, dm, stable, claim)
@@ -89,11 +94,20 @@ func (r *DecisionModelReconciler) maintainStable(
 		return err
 	}
 	// Regate the stable Pods: a stable Pod that lost the model during
-	// the rollout must flip its gate False. The readiness count is not used here;
-	// the candidate flow owns phase/Ready.
-	_, _, probeErr := r.probePods(ctx, dm, eng, stable, apiKey)
+	// the rollout must flip its gate False. The candidate flow owns phase/Ready;
+	// the ready count is used only to decide the store-finalize scale-to-0 below.
+	ready, _, probeErr := r.probePods(ctx, dm, eng, stable, apiKey)
 	if errors.Is(probeErr, errPodListFailed) {
 		return probeErr
+	}
+	// Same store-finalize unstick as the stable path: if the store is Terminating
+	// and no stable Pod is model-ready, mark the stable for scale-to-0 (rendered by
+	// desiredReplicasForRevision) so the PVC can finalize; clear it otherwise. The
+	// candidate flow persists dm.Status.
+	if terminating && probeErr == nil && ready == 0 {
+		dm.Status.StoreFinalizeStoppedForRevision = stable.Hash
+	} else if dm.Status.StoreFinalizeStoppedForRevision == stable.Hash && (!terminating || ready > 0) {
+		dm.Status.StoreFinalizeStoppedForRevision = ""
 	}
 	return nil
 }
@@ -277,6 +291,14 @@ func (r *DecisionModelReconciler) recoverStableStore(
 	st, handled, res, err := r.inspectRecoveryState(ctx, dm, stable, claim)
 	if handled {
 		return true, false, res, err
+	}
+
+	// The store PVC is no longer Terminating (gone -> recovering, or healthy): clear
+	// any store-finalize scale-to-0 marker so the stable scales back to its replicas
+	// once recovery completes. Keeping it set while terminating is handled by the
+	// stable path (it sets the marker when no Pod is model-ready).
+	if !st.terminating && dm.Status.StoreFinalizeStoppedForRevision == stable.Hash {
+		dm.Status.StoreFinalizeStoppedForRevision = ""
 	}
 
 	// --- 3. Healthy (serve)? A present PVC that is not marked recovering is
@@ -749,8 +771,10 @@ func (r *DecisionModelReconciler) degradeStoreRecoveryBlocked(
 
 // degradeStoreTerminating sets Degraded=True/StoreTerminating while the stable
 // store PVC is being deleted but is still mounted by the stable Pods.
-// The operator does not stop the stable automatically (a PVC delete cannot be
-// undone); the user must delete the Pods to let recovery proceed. The Event fires
+// While a model-ready stable Pod still serves from it the operator keeps serving
+// (a PVC delete cannot be undone) and the user decides when to delete the Pods;
+// with no model-ready Pod left the stable is scaled to 0 so the PVC can finalize
+// (StoreFinalizeStoppedForRevision). The Event fires
 // only on the transition into StoreTerminating and the condition carries a fixed
 // message, so repeated reconciles on the regate interval cause no status churn.
 func (r *DecisionModelReconciler) degradeStoreTerminating(

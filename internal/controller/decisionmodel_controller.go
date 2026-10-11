@@ -1388,6 +1388,36 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 	// just like a cache-sharing Degraded.
 	r.applyStableReadiness(ctx, dm, ready, desiredReplicas(dm), cacheDegraded || storeTerminating)
 
+	// Unstick a Terminating store PVC that nothing serves from. pvc-protection
+	// holds a PVC with a deletionTimestamp as long as a Pod mounts it; a Deployment
+	// that keeps recreating a Pod on that PVC deadlocks the deletion forever. When
+	// the store is Terminating AND no stable Pod is model-ready (ready == 0 on a
+	// successful probe — nothing left to serve), record a durable scale-to-0 marker
+	// so desiredReplicasForRevision renders the stable Deployment at 0 next
+	// reconcile; the PVC then finalizes and normal recovery recreates + prefetches
+	// it and the stable scales back. With a model-ready Pod still up (ready > 0)
+	// keep serving — never scale a serving stable to 0. The marker is cleared by
+	// recoverStableStore as soon as the PVC is no longer Terminating.
+	if storeTerminating && probeErr == nil && ready == 0 {
+		if dm.Status.StoreFinalizeStoppedForRevision != stable.Hash {
+			dm.Status.StoreFinalizeStoppedForRevision = stable.Hash
+		}
+		// Keep the Degraded reason StoreTerminating, with a message saying the
+		// stable was scaled to 0 to let the store finalize (overrides the
+		// NoModelReadyPods applyStableReadiness just set for ready == 0).
+		setStatusCondition(dm, metav1.Condition{
+			Type:   decisionmodelv1alpha1.ConditionDegraded,
+			Status: metav1.ConditionTrue,
+			Reason: reasonStoreTerminating,
+			Message: fmt.Sprintf("the stable store PVC %q is Terminating and no Pod is model-ready; "+
+				"scaled the stable Deployment to 0 so the PVC can finalize, then recovery will rebuild it", claim),
+		})
+	} else if dm.Status.StoreFinalizeStoppedForRevision == stable.Hash && (!storeTerminating || ready > 0) {
+		// A Pod became model-ready again, or the store is no longer Terminating:
+		// drop the scale-to-0 marker so the stable scales back.
+		dm.Status.StoreFinalizeStoppedForRevision = ""
+	}
+
 	// Post-promotion stabilization window: while the previous revision is still
 	// kept, watch the new stable; roll back to the previous revision if it turns
 	// unhealthy, or announce Stabilized and let GC collect the previous once the
