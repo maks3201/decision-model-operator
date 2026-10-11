@@ -223,12 +223,28 @@ assert_not_rerolled() {
 }
 
 # assert_store_recovery <dm> — after the upgrade, delete the stable revision's model-
-# store PVC and prove the operator rebuilds the store (from the owned manifest ConfigMap)
-# without rolling the stable: the DM returns to Ready on the SAME stable hash and a store
-# PVC for that revision exists again. This exercises the post-upgrade store-recovery path
-# the new controller owns, on a stable created by the OLD release.
+# store PVC and prove the operator REBUILDS the store (from the owned manifest ConfigMap)
+# without rolling the stable. This exercises the post-upgrade store-recovery path the new
+# controller owns, on a stable created by the OLD release.
+#
+# A rebuild -- not just "a PVC with that name still exists" -- is proven by four facts:
+#   1. the store PVC has a NEW UID (the controller recreated it; the deleted one is gone),
+#   2. that new PVC is Bound and NOT Terminating (no stuck finalizer),
+#   3. the recovery prefetch Job for the stable hash is a FRESH object (UID changed) and
+#      Complete -- i.e. it ran AFTER the delete and refilled the new volume,
+#   4. the DM is Ready on the SAME stable hash (no roll, no new revision).
+#
+# The old check passed as soon as ANY PVC of that name existed, so a store PVC wedged in
+# Terminating (the original, still mounted by the running serving Pod) satisfied it even
+# though nothing was rebuilt. To force a real rebuild we also delete the stable serving
+# Pods (as the nightly store-recovery specs do) so the RWO PVC can finalize.
+#
+# NOTE: this is expected to FAIL until the controller scales the stable to 0 so a
+# Terminating RWO store PVC can finish deleting before recovery (the pending store-recovery
+# controller fix). It is intentionally strict and must not be relaxed to pass before that
+# lands.
 assert_store_recovery() {
-  local dm="$1" stable dep pvc stable_now
+  local dm="$1" stable pvc old_pvc_uid old_job_uid
   stable="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
   pvc="${dm}-store-${stable}"
   # Some older stables use the shared (non-per-revision) store name; skip gracefully
@@ -238,24 +254,50 @@ assert_store_recovery() {
     echo "SKIP ${dm}: no per-revision store PVC ${pvc} (shared-store migration path); store recovery not asserted here"
     return 0
   fi
-  echo "deleting store PVC ${pvc} to exercise post-upgrade store recovery"
+
+  # Record the identities we require to CHANGE: a genuine rebuild recreates both the
+  # store PVC and the recovery prefetch Job (new UIDs). jp returns empty if the Job does
+  # not currently exist, which is fine -- any non-empty UID afterwards is then "new".
+  old_pvc_uid="$(jp pvc "${pvc}" '{.metadata.uid}')"
+  old_job_uid="$(jp job "${dm}-pf-${stable}" '{.metadata.uid}')"
+
+  echo "deleting store PVC ${pvc} AND the stable serving Pods to force a real store rebuild"
   kc delete pvc "${pvc}" -n "${NS}" --wait=false >/dev/null 2>&1 || true
-  local ok=""
+  # Delete the serving Pods that mount the RWO store so the PVC can finalize; mirror the
+  # nightly specs (force, zero grace).
+  kc delete pods -n "${NS}" \
+    -l "decisionmodel.io/name=${dm},decisionmodel.io/revision=${stable}" \
+    --grace-period=0 --force >/dev/null 2>&1 || true
+
+  local ok="" stable_now phase pvc_uid pvc_term pvc_phase job_uid job_complete
   for _ in $(seq 1 96); do
     stable_now="$(jp decisionmodel "${dm}" '{.status.stableRevision.hash}')"
-    local phase; phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
+    phase="$(jp decisionmodel "${dm}" '{.status.phase}')"
+    pvc_uid="$(jp pvc "${pvc}" '{.metadata.uid}')"
+    pvc_term="$(jp pvc "${pvc}" '{.metadata.deletionTimestamp}')"
+    pvc_phase="$(jp pvc "${pvc}" '{.status.phase}')"
+    job_uid="$(jp job "${dm}-pf-${stable}" '{.metadata.uid}')"
+    job_complete="$(jp job "${dm}-pf-${stable}" '{.status.conditions[?(@.type=="Complete")].status}')"
     if [[ "${phase}" = "Ready" ]] && [[ "${stable_now}" = "${stable}" ]] && \
-       kc get pvc "${pvc}" -n "${NS}" >/dev/null 2>&1; then
+       [[ -n "${pvc_uid}" ]] && [[ "${pvc_uid}" != "${old_pvc_uid}" ]] && \
+       [[ -z "${pvc_term}" ]] && [[ "${pvc_phase}" = "Bound" ]] && \
+       [[ -n "${job_uid}" ]] && [[ "${job_uid}" != "${old_job_uid}" ]] && \
+       [[ "${job_complete}" = "True" ]]; then
       ok="yes"; break
     fi
     sleep 5
   done
+
   if [[ "${ok}" != "yes" ]]; then
-    echo "FAIL ${dm}: store not recovered after the upgrade (phase=$(jp decisionmodel "${dm}" '{.status.phase}'), stable ${stable} -> ${stable_now:-}, PVC ${pvc})"
+    echo "FAIL ${dm}: store not rebuilt after the upgrade"
+    echo "  phase=${phase:-} stable ${stable} -> ${stable_now:-}"
+    echo "  PVC ${pvc}: uid ${old_pvc_uid:-<none>} -> ${pvc_uid:-<none>} phase=${pvc_phase:-} terminating=${pvc_term:+yes}"
+    echo "  Job ${dm}-pf-${stable}: uid ${old_job_uid:-<none>} -> ${job_uid:-<none>} complete=${job_complete:-}"
+    kc get pvc,pod,job -n "${NS}" -l "decisionmodel.io/name=${dm}" -o wide || true
     kc describe decisionmodel "${dm}" -n "${NS}" | tail -40
     return 1
   fi
-  echo "PASS ${dm}: store PVC ${pvc} rebuilt, same stable (${stable}), Ready — post-upgrade store recovery works."
+  echo "PASS ${dm}: store PVC ${pvc} rebuilt (uid ${old_pvc_uid} -> ${pvc_uid}, Bound), recovery prefetch Job recreated and Complete, same stable (${stable}), Ready -- post-upgrade store rebuild works."
 }
 
 # --- bring up the cluster + runtime image (reuses hack/kind-up.sh) ------------
