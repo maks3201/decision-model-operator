@@ -161,7 +161,7 @@ var _ = Describe("manual promotion", func() {
 			eng = &deciderFakeEngine{fakeEngine: fake, choice: "billing"}
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: datasetName},
-				Data:       map[string]string{"cases.jsonl": strings.Repeat(`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}`+"\n", 10)},
+				Data:       map[string]string{"cases.jsonl": strings.Repeat(`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}`+"\n", 10)},
 			}
 			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 		}
@@ -664,7 +664,7 @@ var _ = Describe("manual promotion", func() {
 				return err
 			}
 			cm.Data["cases.jsonl"] = strings.Repeat(
-				`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}`+"\n", 12)
+				`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}`+"\n", 12)
 			return k8sClient.Update(ctx, cm)
 		}()).To(Succeed())
 		annotate(name, oldID)

@@ -92,10 +92,10 @@ var _ = Describe("macro-F1 evaluation gate", func() {
 	imbalanced := func(billing, other int) string {
 		var b strings.Builder
 		for i := 0; i < billing; i++ {
-			b.WriteString(`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}` + "\n")
+			b.WriteString(`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n")
 		}
 		for i := 0; i < other; i++ {
-			b.WriteString(`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"other"}}` + "\n")
+			b.WriteString(`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"other"}}` + "\n")
 		}
 		return b.String()
 	}
@@ -210,7 +210,7 @@ var _ = Describe("macro-F1 evaluation gate", func() {
 		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
 		// Every case answers q1 ("billing") correctly and also expects q2 ("refund"),
 		// which the fake never returns -> missing -> a miss for class "refund".
-		line := `{"state":{},"questions":{"q1":{"type":"choice"},"q2":{"type":"choice"}},"expected":{"q1":"billing","q2":"refund"}}` + "\n"
+		line := `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}},"q2":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing","q2":"refund"}}` + "\n"
 		data := ""
 		for i := 0; i < 10; i++ {
 			data += line

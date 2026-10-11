@@ -67,6 +67,9 @@ type deciderFakeEngine struct {
 	// runtime rejected the case as invalid). Atomic so a test can clear it after a
 	// dataset "fix".
 	rejectErr atomic.Bool
+	// decideCalls counts Decide invocations so a test can assert the runtime was
+	// never called (e.g. a dataset rejected at parse time must not reach Decide).
+	decideCalls atomic.Int64
 }
 
 func (d *deciderFakeEngine) Decide(
@@ -74,6 +77,7 @@ func (d *deciderFakeEngine) Decide(
 	_, _ string,
 	req engine.DecideRequest,
 ) (engine.DecideResponse, error) {
+	d.decideCalls.Add(1)
 	if d.rejectErr.Load() {
 		return engine.DecideResponse{}, fmt.Errorf("%w: 422 bad case schema", engine.ErrRequestRejected)
 	}
@@ -258,7 +262,7 @@ var _ = Describe("Eval-gated rollout", func() {
 			if i < correct {
 				exp = "billing"
 			}
-			line := `{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"` + exp + `"}}` + "\n"
+			line := `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"` + exp + `"}}` + "\n"
 			b = append(b, []byte(line)...)
 		}
 		return string(b)
@@ -385,6 +389,34 @@ var _ = Describe("Eval-gated rollout", func() {
 		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
 		Expect(deg).NotTo(BeNil())
 		Expect(deg.Reason).To(Equal(reasonDatasetInvalid))
+	})
+
+	// A case whose question uses the "options" form the runtime does not accept is
+	// rejected at PARSE time (permanent DatasetInvalid naming the line and question
+	// id), not sent to the runtime and parked on a 422. The runtime is never called.
+	It("rejects the options question shape at parse time without calling the runtime", func() {
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing"}
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		// Line 1 is valid; line 2 uses "options" (no "criteria") -> rejected.
+		datasetCM("golden-opt",
+			`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o"}}},"expected":{"q1":"billing"}}`+"\n"+
+				`{"state":{},"questions":{"q2":{"type":"choice","options":["a","b"]}},"expected":{"q2":"a"}}`+"\n")
+		createEvalDM("evopt", "golden-opt", nil)
+
+		driveToEvaluating(r, "evopt")
+
+		dm := getDM("evopt")
+		Expect(dm.Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseFailed))
+		Expect(dm.Status.StableRevision).To(BeNil())
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Reason).To(Equal(reasonDatasetInvalid))
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("line 2"), "names the offending line")
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("q2"), "names the offending question id")
+		Expect(dm.Status.FailedRevision.Message).To(ContainSubstring("criteria"), "hints at the required shape")
+		deg := meta_Find(dm, decisionmodelv1alpha1.ConditionDegraded)
+		Expect(deg).NotTo(BeNil())
+		Expect(deg.Reason).To(Equal(reasonDatasetInvalid))
+		Expect(eng.decideCalls.Load()).To(BeZero(), "a parse-time rejection must not call the runtime")
 	})
 
 	It("times out a slow evaluation", func() {

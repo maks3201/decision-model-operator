@@ -722,7 +722,7 @@ var _ = Describe("robustness", func() {
 				Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
 					ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden"},
 					Data: map[string]string{"cases.jsonl": strings.Repeat(
-						`{"state":{},"questions":{"q1":{"type":"choice"}},"expected":{"q1":"billing"}}`+"\n", 3)},
+						`{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}`+"\n", 3)},
 				})).To(Succeed())
 				newDM(name, func(dm *decisionmodelv1alpha1.DecisionModel) {
 					dm.Spec.Rollout = &decisionmodelv1alpha1.RolloutSpec{

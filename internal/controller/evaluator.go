@@ -91,6 +91,13 @@ func parseDataset(raw []byte, maxCases int) ([]evalCase, error) {
 		if len(c.Expected) == 0 {
 			return nil, fmt.Errorf("line %d: no expected answers", line)
 		}
+		// Reject a case whose questions do not match a shape the runtime accepts
+		// (e.g. "options" instead of "criteria") at parse time: this surfaces as a
+		// permanent DatasetInvalid naming the line and question id, instead of a
+		// runtime 422 that parks the evaluation until the Evaluating timeout.
+		if verr := eval.ValidateQuestions(c.Questions); verr != nil {
+			return nil, fmt.Errorf("line %d: %w", line, verr)
+		}
 		c.Line = line
 		cases = append(cases, c)
 		if maxCases > 0 && len(cases) >= maxCases {
