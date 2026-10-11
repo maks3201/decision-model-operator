@@ -750,8 +750,8 @@ func TestPrefetchJobUnparsableNameRefuses(t *testing.T) {
 	if contains(c.Args[0], "ollaya pull") {
 		t.Errorf("unparsable name must NOT run ollaya pull, got:\n%s", c.Args[0])
 	}
-	if !contains(c.Args[0], "exit 1") {
-		t.Errorf("unparsable name script must exit 1, got:\n%s", c.Args[0])
+	if !contains(c.Args[0], "exit "+prefetchExitUnknownStr) {
+		t.Errorf("unparsable name script must exit Unknown (bounded retry), got:\n%s", c.Args[0])
 	}
 	if envMap(c.Env)["MANIFEST_PATH"].Value != "" {
 		t.Errorf("MANIFEST_PATH must be empty for an unparsable name")
@@ -858,8 +858,8 @@ func TestPrefetchJobInvalidSubPathRefuses(t *testing.T) {
 	if contains(c.Args[0], "ollaya pull") {
 		t.Errorf("invalid sub-path must NOT run ollaya pull, got:\n%s", c.Args[0])
 	}
-	if !contains(c.Args[0], "exit 1") {
-		t.Errorf("invalid sub-path script must exit 1, got:\n%s", c.Args[0])
+	if !contains(c.Args[0], "exit "+prefetchExitUnknownStr) {
+		t.Errorf("invalid sub-path script must exit Unknown (bounded retry), got:\n%s", c.Args[0])
 	}
 }
 
