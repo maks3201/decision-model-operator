@@ -228,6 +228,16 @@ spec:
 			Expect(serviceRevision(swNS, dm)).To(Equal(stableBefore),
 				"precondition: Service is on the current stable before recovery")
 
+			By("waiting for the post-promotion stabilization window to close")
+			// The previous spec promoted this stable ~30s earlier. Deleting its store
+			// inside the stabilization window races the post-promotion debounce and can
+			// trigger a correct rollback (PostPromotionUnhealthy) instead of recovery;
+			// wait until status.previousRevision clears so this spec exercises store
+			// recovery of a settled stable (same idiom as registry_outage_test.go).
+			Eventually(func() (string, error) {
+				return utils.KubectlJSONPath(swNS, "decisionmodel", dm, "{.status.previousRevision}")
+			}, stabilizationWait, 5*time.Second).Should(BeEmpty())
+
 			By("deleting the live stable store PVC and its serving Pod to force store recovery")
 			// Store recovery: with the store PVC gone the operator re-creates it and
 			// re-runs the prefetch Job to rebuild the model store to the recorded
