@@ -40,6 +40,10 @@ const (
 	eventPromotionApproved  = "PromotionApproved"
 	eventDeprecatedApproval = "DeprecatedApproval"
 	eventStaleApproval      = "StaleApproval"
+	// eventManualIgnoredStopped is emitted once when a Manual promotion policy is
+	// ignored for a candidate because the stable is stopped for a Recreate rollout:
+	// promoting restores serving instead of parking with the stable at 0 replicas.
+	eventManualIgnoredStopped = "ManualPromotionIgnored"
 )
 
 // manualPromotion reports whether the effective promotion policy holds a
@@ -133,6 +137,26 @@ func (r *DecisionModelReconciler) promoteOrAwait(
 	skipApproval bool,
 ) (ctrl.Result, error) {
 	if !manualPromotion(dm) || dm.Status.StableRevision == nil {
+		return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
+	}
+
+	// A Manual hold must not apply to a candidate whose rollout has already
+	// committed to Recreate (the stable is scaled to 0, status.stableStoppedForRevision
+	// set). CEL forbids Recreate + Manual precisely because production is down
+	// while a human approves, but a rollout that started Automatic/EvaluationGated
+	// under Recreate can have its live spec flipped to BlueGreen + Manual after the
+	// stable was already stopped — which would then park the candidate in
+	// AwaitingPromotion with the stable at 0 and no timeout, i.e. the exact outage
+	// CEL exists to prevent. While the stable is stopped, the effective policy for
+	// THIS candidate is therefore not Manual: promote it (evaluation gates, applied
+	// earlier, still hold). The Manual request applies to the next rollout, once a
+	// running stable is restored. The Warning is buffered and only emitted on the
+	// successful promotion write (which clears the stop marker), so it fires exactly
+	// once and this branch is not re-entered afterwards.
+	if stableStopped(dm) {
+		r.event(ctx, dm, corev1.EventTypeWarning, eventManualIgnoredStopped,
+			"ignoring manual promotion for candidate %s: the stable is stopped for a Recreate rollout, so promotion proceeds automatically to restore serving; the manual policy applies to the next rollout",
+			modelRef(candidate))
 		return r.promote(ctx, dm, eng, candidate, precision, cacheDegraded)
 	}
 

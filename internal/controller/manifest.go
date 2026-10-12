@@ -320,6 +320,49 @@ func (r *DecisionModelReconciler) persistCandidateManifest(
 	return r.ensureManifestConfigMap(ctx, dm, rev, digest)
 }
 
+// rollbackSpeculativeManifest deletes the manifest ConfigMap written for a
+// candidate revision whose admission status write did NOT become durable
+// (conflict / error / not-persisted). The manifest is written persist-then-act
+// BEFORE the candidateRevision status write (so a recorded digest never outlives
+// its bytes). When that write fails the revision is not recorded anywhere durable
+// — it has no store PVC yet (allocation happens after admission) and the
+// abandoned-revs reconcile-state record is discarded with the early return — so a
+// later spec change that admits a different candidate would never collect it and
+// the ConfigMap would leak until the DM is deleted. Deleting it here closes that
+// window at the root: the next successful admission simply rewrites it from the
+// freshly resolved bytes.
+//
+// It is a no-op if, after the lost race, the revision actually DID become durable
+// as the candidate (a concurrent reconcile admitted it): the live object is the
+// source of truth, so a manifest backing a real candidate is never removed. The
+// delete is by name, owner-checked and idempotent (no ConfigMap list).
+func (r *DecisionModelReconciler) rollbackSpeculativeManifest(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	rev string,
+) {
+	// If a concurrent writer admitted this exact revision, its manifest is now
+	// backing a durable candidate — leave it. Checked through the uncached
+	// APIReader so a just-written candidateRevision is seen. When the live object
+	// cannot be read, keep the ConfigMap: a leaked manifest is harmless, deleting
+	// one that backs a durable candidate only degrades its prefetch seed.
+	rdr, err := r.reader()
+	if err != nil {
+		return
+	}
+	live := &decisionmodelv1alpha1.DecisionModel{}
+	if gerr := rdr.Get(ctx, types.NamespacedName{Namespace: dm.Namespace, Name: dm.Name}, live); gerr != nil {
+		return
+	}
+	if cr := live.Status.CandidateRevision; cr != nil && cr.Hash == rev {
+		return
+	}
+	// Best-effort: a failure here is not worth overriding the admission outcome
+	// being returned to the caller; the next reconcile's admission rewrites or the
+	// abandon/GC path collects it once a store PVC exists.
+	_ = r.deleteManifestConfigMapIfOwned(ctx, dm, rev)
+}
+
 // deleteManifestConfigMapIfOwned deletes a revision's manifest ConfigMap by name
 // when it exists and is owned by this DM. It reads through the uncached APIReader
 // (configmaps are get-only, not cached), so GC never needs a ConfigMap informer.
