@@ -90,40 +90,65 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 
 	unhealthy, immediate, detail := r.newStableUnhealthy(ctx, dm, stable, ready)
 
-	// Tell an intentional in-place rollout of the stable (replicas scale-up,
-	// API-key rotation, scheduling change, manual restart) from a model-health
-	// failure. A non-immediate quorum shortfall during a rollout is expected while
-	// new Pods start and load the model, so it must NOT start/advance the rollback
-	// debounce. Immediate failures (gate DigestMismatch/DeviceMismatch,
-	// CrashLoopBackOff) still roll back regardless. A rollout that blows its
-	// progressDeadline (Progressing=False, ProgressDeadlineExceeded) is itself a
-	// failure and rolls back.
+	// Tell an expected not-ready-yet state from a model-health failure. A
+	// non-immediate quorum shortfall must NOT start/advance the rollback debounce
+	// while the new stable is legitimately still coming up:
+	//   - an intentional in-place rollout (replicas scale-up, API-key rotation,
+	//     scheduling change, manual restart) — Deployment mid-rollout;
+	//   - the stable store is recovering (a lost/Terminating store is being rebuilt
+	//     by the recovery flow), bounded by the recovery budget; or
+	//   - every short Pod is still in its model-load phase (container running, not
+	//     CrashLoopBackOff, no gate mismatch, started less than startingTimeout ago)
+	//     — a fresh/restarted Pod loading the model after a recovery or restart.
+	// Immediate failures (gate DigestMismatch/DeviceMismatch, CrashLoopBackOff)
+	// still roll back regardless; a rollout that blows its progressDeadline
+	// (Progressing=False, ProgressDeadlineExceeded) is itself a failure and rolls back.
 	rollout := r.stableRolloutState(ctx, dm, stable)
-	rollingShortfall := unhealthy && !immediate && rollout == rolloutInProgress
 	if unhealthy && !immediate && rollout == rolloutDeadlineExceeded {
 		immediate = true
 		detail = fmt.Sprintf("%s; the stable rollout exceeded its progress deadline", detail)
 	}
+	// graceReason/graceMsg are set when a non-immediate shortfall is being tolerated
+	// (window extended, Stabilizing=True, no debounce). Empty when the shortfall is
+	// a genuine health failure that must debounce toward a rollback.
+	graceReason, graceMsg := "", ""
+	if unhealthy && !immediate {
+		switch {
+		case rollout == rolloutInProgress:
+			graceReason = reasonStableRolling
+			graceMsg = fmt.Sprintf("stable rollout in progress (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
+		case r.stableStoreRecovering(dm, stable):
+			graceReason = reasonStoreRecovering
+			graceMsg = fmt.Sprintf("stable store is being rebuilt (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
+		case r.newStableLoading(ctx, dm, stable):
+			graceReason = reasonModelLoading
+			graceMsg = fmt.Sprintf("new stable Pods are loading the model (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
+		}
+	}
+	graceShortfall := graceReason != ""
 
-	if unhealthy && !rollingShortfall && (immediate || r.unhealthyDebounceElapsed(dm)) {
+	if unhealthy && !graceShortfall && (immediate || r.unhealthyDebounceElapsed(dm)) {
 		return r.rollbackToPrevious(ctx, dm, eng, stable, p, detail)
 	}
 
 	if elapsed >= window {
 		// Window elapsed.
-		if rollingShortfall {
-			// The stable is below quorum only because it is mid-rollout, not
-			// because the model is unhealthy. Do NOT roll back and do NOT announce
-			// Stabilized (which would let GC collect the rollback target while the
-			// new stable is not yet proven healthy). Extend the window: keep the
-			// previous revision and requeue. A stuck rollout is still bounded —
-			// progressDeadline turns it into rolloutDeadlineExceeded above, which
-			// rolls back.
-			r.markStableRolling(dm, window, detail)
+		if graceShortfall {
+			// The stable is below quorum only because it is still coming up (rollout
+			// in progress, store recovering, or model loading), not because the model
+			// is unhealthy. Do NOT roll back and do NOT announce Stabilized (which
+			// would let GC collect the rollback target while the new stable is not yet
+			// proven healthy). Extend the window: keep the previous revision and
+			// requeue. Each cause is independently bounded — the rollout by its
+			// progressDeadline (rolloutDeadlineExceeded above), store recovery by the
+			// recovery budget (StorePrefetchFailed), and the load phase by
+			// startingTimeout (after which newStableLoading returns false and the
+			// shortfall debounces to a rollback).
+			r.markStableGrace(dm, graceReason, graceMsg)
 			return stabilizationResult{}
 		}
 		if unhealthy {
-			// Unhealthy at the boundary for a non-rollout reason (e.g. a quorum
+			// Unhealthy at the boundary for a non-grace reason (e.g. a quorum
 			// shortfall with no rollout in flight): the window has no more time to
 			// give the new stable, so roll back now rather than serve below quorum.
 			return r.rollbackToPrevious(ctx, dm, eng, stable, p, detail)
@@ -140,13 +165,13 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 		return stabilizationResult{}
 	}
 
-	// Still in the window. Record Stabilizing: True (watching, or StableRolling
-	// while a rollout masks the shortfall) when healthy-enough; False
+	// Still in the window. Record Stabilizing: True (watching, or a grace reason
+	// while the new stable is still coming up) when healthy-enough; False
 	// (PostPromotionUnhealthy) when a genuine shortfall is debouncing toward a
 	// rollback — its LastTransitionTime is the idempotent debounce clock.
 	switch {
-	case rollingShortfall:
-		r.markStableRolling(dm, window, detail)
+	case graceShortfall:
+		r.markStableGrace(dm, graceReason, graceMsg)
 	case unhealthy:
 		setStatusCondition(dm, metav1.Condition{
 			Type:    decisionmodelv1alpha1.ConditionStabilizing,
@@ -165,19 +190,101 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 	return stabilizationResult{}
 }
 
-// markStableRolling sets Stabilizing=True/StableRolling, explaining that the
-// quorum shortfall is being ignored because the stable Deployment is mid-rollout.
-// It clears any prior PostPromotionUnhealthy debounce so a rollout that starts
-// after a brief dip does not inherit a stale clock.
-func (r *DecisionModelReconciler) markStableRolling(
-	dm *decisionmodelv1alpha1.DecisionModel, window time.Duration, detail string,
+// markStableGrace sets Stabilizing=True with a grace reason/message, explaining
+// that the quorum shortfall is being tolerated because the new stable is still
+// legitimately coming up (rollout in progress, store recovering, or model
+// loading). It clears any prior PostPromotionUnhealthy debounce so a shortfall
+// that turns out to be a grace state does not inherit a stale clock.
+func (r *DecisionModelReconciler) markStableGrace(
+	dm *decisionmodelv1alpha1.DecisionModel, reason, msg string,
 ) {
 	setStatusCondition(dm, metav1.Condition{
 		Type:    decisionmodelv1alpha1.ConditionStabilizing,
 		Status:  metav1.ConditionTrue,
-		Reason:  reasonStableRolling,
-		Message: fmt.Sprintf("stable rollout in progress (%s); not counting the quorum shortfall as a failure during the %s window", detail, window),
+		Reason:  reason,
+		Message: msg,
 	})
+}
+
+// stableStoreRecovering reports whether the stable revision's store is currently
+// being rebuilt (a lost/Terminating store the recovery flow is refilling), so a
+// quorum shortfall during the stabilization window must not be counted as a
+// model-health failure. It reads only durable status, so a restart gives the same
+// answer. It is TRUE while the store is actively recovering — a store-finalize
+// scale-to-0 for this revision, or Degraded=StoreLost (the store is being
+// recreated and re-prefetched) — and FALSE once recovery has given up
+// (StorePrefetchFailed) or is blocked by policy (RegistryNotAllowed): those are
+// terminal/won't-self-heal, so the shortfall should debounce to a rollback. The
+// recovery budget bounds the StoreLost retries, so this cannot extend the window
+// forever.
+func (r *DecisionModelReconciler) stableStoreRecovering(
+	dm *decisionmodelv1alpha1.DecisionModel,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+) bool {
+	if dm.Status.StoreFinalizeStoppedForRevision == stable.Hash && stable.Hash != "" {
+		return true
+	}
+	c := meta.FindStatusCondition(dm.Status.Conditions, decisionmodelv1alpha1.ConditionDegraded)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		return false
+	}
+	// StoreTerminating alone is not counted: a store still mounted by a ready Pod
+	// has no upper bound, so a partial shortfall there debounces to a rollback. A
+	// Terminating store with no ready Pod is covered by the scale-to-0 marker above.
+	return c.Reason == reasonStoreLost
+}
+
+// newStableLoading reports whether EVERY not-model-ready Pod of the new stable is
+// still in its model-load phase: the container is running (or waiting for a
+// non-CrashLoop reason), there is no gate digest/device mismatch, and the Pod
+// started less than startingTimeout ago. A Pod that is past startingTimeout, in
+// CrashLoopBackOff, or carries a gate mismatch is NOT loading — it is a failure,
+// so this returns false and the shortfall debounces toward a rollback. With no
+// readable Pods it returns false (no evidence of a legitimate load; fall through
+// to the normal shortfall handling). The age is measured from the Pod's StartTime
+// (falling back to CreationTimestamp), both durable, so a restart is consistent.
+func (r *DecisionModelReconciler) newStableLoading(
+	ctx context.Context,
+	dm *decisionmodelv1alpha1.DecisionModel,
+	stable *decisionmodelv1alpha1.RevisionStatus,
+) bool {
+	pods, err := r.revisionPods(ctx, dm, stable.Hash)
+	if err != nil || len(pods) == 0 {
+		return false
+	}
+	limit := startingTimeout(dm)
+	sawLoading := false
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if gateTrue(pod) {
+			continue // already contributing to the ready count
+		}
+		// Any definitive failure signal disqualifies the whole set: do not keep
+		// extending the window for a Pod that is crash-looping or loaded the wrong
+		// model.
+		if gateMismatchReason(pod) != "" || crashLoopingContainer(pod) {
+			return false
+		}
+		// Past the load budget: no longer "loading", treat as a normal shortfall.
+		started := podStartTime(pod)
+		if r.now().Sub(started) >= limit {
+			return false
+		}
+		sawLoading = true
+	}
+	return sawLoading
+}
+
+// podStartTime returns the Pod's StartTime, falling back to its CreationTimestamp
+// when the kubelet has not set StartTime yet (e.g. a very fresh Pod).
+func podStartTime(pod *corev1.Pod) time.Time {
+	if pod.Status.StartTime != nil {
+		return pod.Status.StartTime.Time
+	}
+	return pod.CreationTimestamp.Time
 }
 
 // rolloutState classifies the stable Deployment's rollout progress.
