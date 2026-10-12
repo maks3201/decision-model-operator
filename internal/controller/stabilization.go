@@ -111,16 +111,29 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 	// graceReason/graceMsg are set when a non-immediate shortfall is being tolerated
 	// (window extended, Stabilizing=True, no debounce). Empty when the shortfall is
 	// a genuine health failure that must debounce toward a rollback.
+	//
+	// The two non-rollout graces (StoreRecovering, ModelLoading) are additionally
+	// bounded by the PROMOTION, not just by per-Pod signals: they apply only while
+	// the new stable is within startingTimeout of being promoted
+	// (promotedAt + startingTimeout). Without this a churning new stable — Pods
+	// evicted/preempted/deleted and recreated with fresh StartTimes — would keep
+	// newStableLoading true forever (every Pod is young), so a stable held below
+	// quorum would never roll back while the healthy previous revision waits. The
+	// per-Pod checks (gate mismatch / CrashLoop disqualify; a Pod older than
+	// startingTimeout is not loading) still apply; this promotion bound is in
+	// addition, so Pod churn cannot extend the grace. StableRolling is not bounded
+	// here — it has its own bound (the Deployment progress deadline, which turns
+	// into rolloutDeadlineExceeded above).
 	graceReason, graceMsg := "", ""
 	if unhealthy && !immediate {
 		switch {
 		case rollout == rolloutInProgress:
 			graceReason = reasonStableRolling
 			graceMsg = fmt.Sprintf("stable rollout in progress (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
-		case r.stableStoreRecovering(dm, stable):
+		case r.recoveryOrLoadGraceAllowed(dm, p) && r.stableStoreRecovering(dm, stable):
 			graceReason = reasonStoreRecovering
 			graceMsg = fmt.Sprintf("stable store is being rebuilt (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
-		case r.newStableLoading(ctx, dm, stable):
+		case r.recoveryOrLoadGraceAllowed(dm, p) && r.newStableLoading(ctx, dm, stable):
 			graceReason = reasonModelLoading
 			graceMsg = fmt.Sprintf("new stable Pods are loading the model (%s); not counting the quorum shortfall as a failure during the %s window", detail, window)
 		}
@@ -140,10 +153,10 @@ func (r *DecisionModelReconciler) reconcileStabilization(
 			// would let GC collect the rollback target while the new stable is not yet
 			// proven healthy). Extend the window: keep the previous revision and
 			// requeue. Each cause is independently bounded — the rollout by its
-			// progressDeadline (rolloutDeadlineExceeded above), store recovery by the
-			// recovery budget (StorePrefetchFailed), and the load phase by
-			// startingTimeout (after which newStableLoading returns false and the
-			// shortfall debounces to a rollback).
+			// progressDeadline (rolloutDeadlineExceeded above), and both the store
+			// recovery and the model-load graces by promotedAt + startingTimeout
+			// (recoveryOrLoadGraceAllowed), after which the shortfall debounces to a
+			// rollback regardless of per-Pod age (so Pod churn cannot extend it).
 			r.markStableGrace(dm, graceReason, graceMsg)
 			return stabilizationResult{}
 		}
@@ -285,6 +298,22 @@ func podStartTime(pod *corev1.Pod) time.Time {
 		return pod.Status.StartTime.Time
 	}
 	return pod.CreationTimestamp.Time
+}
+
+// recoveryOrLoadGraceAllowed reports whether a StoreRecovering/ModelLoading grace
+// may still extend the stabilization window, bounded by the PROMOTION time: the
+// grace applies only while the new stable is within startingTimeout of having
+// been promoted (previousRevision.promotedAt + startingTimeout). This caps the
+// grace independently of per-Pod age, so a churning new stable (Pods repeatedly
+// evicted/preempted/deleted and recreated with fresh StartTimes) cannot keep the
+// grace alive forever and starve a rollback to the healthy previous revision.
+// With no promotedAt (older status) the grace is allowed, falling back to the
+// per-Pod / recovery-budget bounds.
+func (r *DecisionModelReconciler) recoveryOrLoadGraceAllowed(dm *decisionmodelv1alpha1.DecisionModel, p *decisionmodelv1alpha1.PreviousRevisionStatus) bool {
+	if p == nil || p.PromotedAt == nil {
+		return true
+	}
+	return r.now().Sub(p.PromotedAt.Time) < startingTimeout(dm)
 }
 
 // rolloutState classifies the stable Deployment's rollout progress.
