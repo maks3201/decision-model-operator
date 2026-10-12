@@ -244,6 +244,14 @@ while waiting; the first revision is never held.
 - **Failure**: rollback if a stable revision exists, otherwise `Failed`. The failed revision is
   recorded in `status.failedRevision` and not retried automatically. Retry with the
   `decisionmodel.io/retry` annotation.
+- **Stabilization**: after a promotion the previous revision is kept for the stabilization window;
+  if the new stable drops below its model-ready quorum for longer than a 30 s debounce, traffic goes
+  back to the previous revision. A shortfall does not count while the new stable is still coming up:
+  its Deployment is mid-rollout (`StableRolling`), its lost store is being rebuilt (`StoreRecovering`),
+  or every not-ready Pod is still loading the model, younger than the Starting timeout
+  (`ModelLoading`). Each case is bounded (progress deadline, store recovery budget, Starting
+  timeout), so an infrastructure fault does not fail a healthy revision, and a genuinely unhealthy
+  one still rolls back. A gate digest/device mismatch or CrashLoopBackOff rolls back at once.
 
 Other phases: `AwaitingPromotion` (manual promotion, §5) and `Degraded` (not all stable replicas
 are model-ready, or a referenced Secret is not allowed). The `Degraded` *condition* additionally
