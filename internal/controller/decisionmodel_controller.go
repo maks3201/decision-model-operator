@@ -176,11 +176,14 @@ const (
 	reasonStableRolling = "StableRolling"
 	// reasonStoreRecovering marks the Stabilizing condition True while a quorum
 	// shortfall is tolerated because the stable store is being rebuilt (lost/
-	// Terminating store recovery), bounded by the recovery budget.
+	// Terminating store recovery), bounded by the recovery budget and by
+	// promotedAt + startingTimeout (so Pod churn cannot extend it indefinitely).
 	reasonStoreRecovering = "StoreRecovering"
 	// reasonModelLoading marks the Stabilizing condition True while a quorum
 	// shortfall is tolerated because the new stable Pods are still loading the
-	// model (started less than startingTimeout ago, no crash/gate mismatch).
+	// model (started less than startingTimeout ago, no crash/gate mismatch),
+	// bounded by promotedAt + startingTimeout so repeatedly replaced Pods cannot
+	// keep the grace alive forever.
 	reasonModelLoading = "ModelLoading"
 )
 
