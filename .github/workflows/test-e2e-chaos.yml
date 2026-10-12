@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -56,3 +56,34 @@ jobs:
           E2E_MIRROR: "1"
           E2E_LABEL_FILTER: chaos
         run: make test-e2e
+
+  notify-failure:
+    name: open an issue on a failed scheduled run
+    needs: [test-e2e-chaos]
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or comment on a nightly-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          failed="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --paginate -q '.jobs[] | select(.conclusion=="failure") | "- \(.name)"' || true)"
+          [ -n "${failed}" ] || failed="- (no job marked failed; see the run)"
+          title="Nightly failed: ${WORKFLOW}"
+          body="$(printf 'Scheduled run failed.\n\nRun: %s\n\nFailed jobs:\n%s\n' "${RUN_URL}" "${failed}")"
+          existing="$(gh issue list --label nightly-failure --state open \
+            --search "${title} in:title" --json number,title \
+            -q ".[] | select(.title == \"${title}\") | .number" | head -n1)"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh label create nightly-failure --color b60205 \
+              --description "A scheduled E2E workflow failed" --force >/dev/null 2>&1 || true
+            gh issue create --title "${title}" --label nightly-failure --body "${body}"
+          fi
