@@ -251,6 +251,13 @@ helm upgrade dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
   --namespace decision-model-operator-system
 ```
 
+### High availability
+
+Run more than one manager with `replicaCount > 1` **and** `leaderElection: true`
+(the default): leader election keeps exactly one replica active while the others
+stand by. The chart refuses to render `replicaCount > 1` with `leaderElection:
+false`, because every replica would then reconcile the same objects at once.
+
 ### CRD upgrade caveat
 
 Helm installs the CRD in `crds/` on first install but **never upgrades or

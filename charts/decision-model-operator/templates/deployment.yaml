@@ -1,3 +1,12 @@
+{{- /*
+  Two active managers reconcile the same DecisionModels at once (duplicate Jobs,
+  conflicting status writes). Leader election is what keeps exactly one active, so
+  more than one replica without it is a misconfiguration — fail the render with a
+  clear message instead of shipping it.
+*/ -}}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection) -}}
+{{- fail "replicaCount > 1 requires leaderElection: true (otherwise every replica is an active controller reconciling the same objects); set leaderElection: true for HA, or keep replicaCount: 1" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
