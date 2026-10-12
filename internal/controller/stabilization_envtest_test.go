@@ -506,6 +506,167 @@ var _ = Describe("post-promotion stabilization window", func() {
 		Expect(getDM("s-doneunready").Status.FailedRevision.Hash).To(Equal(rev2))
 	})
 
+	// Option B: a model-load phase that outlasts the debounce must not be failed.
+	// loadingPod creates a Pod for a revision that is NOT model-ready (gate False),
+	// its container running (not CrashLoop), started `age` ago.
+	loadingPod := func(name, rev string, age time.Duration) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: name + "-pod-" + rev,
+				Labels: map[string]string{decisionmodelv1alpha1.LabelName: name, decisionmodelv1alpha1.LabelRevision: rev},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ollaya", Image: fakeImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status.PodIP = "10.0.0.91"
+		started := metav1.NewTime(clock.Add(-age))
+		pod.Status.StartTime = &started
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "ollaya", Ready: false,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}},
+		}}
+		pod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionFalse},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+			{Type: corev1.PodConditionType(decisionmodelv1alpha1.ModelReadyGate), Status: corev1.ConditionFalse},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	}
+
+	It("does not roll back while the new stable Pod is still loading the model past the debounce", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-loading", nil) // settled rev2
+
+		// Replace the model-ready Pod with one still loading (gate False), started
+		// just now. The Deployment stays settled (NewReplicaSetAvailable).
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-loading-pod-" + rev2}})).To(Succeed())
+		loadingPod("s-loading", rev2, 10*time.Second)
+
+		// Advance well past the 30s debounce but still within the load budget
+		// (startingTimeout defaults to 10m). It must NOT roll back; Stabilizing is
+		// ModelLoading and the previous revision is kept.
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		for i := 0; i < 5; i++ {
+			Expect(rec(r, "s-loading")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		}
+		dm := getDM("s-loading")
+		Expect(dm.Status.FailedRevision).To(BeNil(), "a loading model is not a failure")
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev2), "stable unchanged")
+		Expect(dm.Status.PreviousRevision).NotTo(BeNil(), "rollback target kept while loading")
+		st := meta_Find(dm, decisionmodelv1alpha1.ConditionStabilizing)
+		Expect(st).NotTo(BeNil())
+		Expect(st.Reason).To(Equal(reasonModelLoading))
+
+		// The model finishes loading: gate flips True, window then closes normally.
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-loading-pod-" + rev2}})).To(Succeed())
+		gatedPod("s-loading", rev2)
+		clock = clock.Add(10 * time.Minute) // past the window, healthy
+		Eventually(func() bool { rec(r, "s-loading"); return depExists("s-loading", rev1) }, "10s", "50ms").
+			Should(BeFalse(), "previous collected once the window closes healthy")
+		Expect(getDM("s-loading").Status.FailedRevision).To(BeNil())
+		Expect(getDM("s-loading").Status.StableRevision.Hash).To(Equal(rev2))
+	})
+
+	It("rolls back a Pod stuck loading past the startingTimeout", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-stuckload", nil)
+
+		// A loading Pod that started longer ago than startingTimeout: no longer a
+		// grace — it debounces and rolls back as a normal shortfall.
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-stuckload-pod-" + rev2}})).To(Succeed())
+		loadingPod("s-stuckload", rev2, startingTimeout(getDM("s-stuckload"))+time.Minute)
+
+		rec(r, "s-stuckload") // marks PostPromotionUnhealthy (debounce starts)
+		Expect(meta_Find(getDM("s-stuckload"), decisionmodelv1alpha1.ConditionStabilizing).Reason).
+			To(Equal(reasonPostPromotionUnhealthy), "past the load budget it is a normal shortfall")
+		clock = clock.Add(postPromotionDebounce + time.Second)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-stuckload") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(serviceRev("s-stuckload")).To(Equal(rev1))
+		Expect(getDM("s-stuckload").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	It("rolls back immediately on a gate mismatch even while a Pod is young (loading window)", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-loadmismatch", nil)
+
+		// The new stable's model is wrong (digest mismatch): the prober makes the
+		// re-gate flip to a DigestMismatch. A young Pod does not grant a grace here —
+		// a definitive wrong-model rolls back at once, no debounce.
+		prober.set(rev2, engine.Loaded{Name: "kev:en", Digest: "deadbeef", Device: "cpu"})
+		// Advance a little (well inside the window) so the regate is due and flips
+		// the gate False with DigestMismatch, as the existing gate-mismatch test does.
+		clock = clock.Add(2 * time.Minute)
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase { return rec(r, "s-loadmismatch") }, "10s", "50ms").
+			Should(Equal(decisionmodelv1alpha1.PhaseRolledBack), "a gate mismatch rolls back at once regardless of the load window")
+		Expect(serviceRev("s-loadmismatch")).To(Equal(rev1))
+		Expect(getDM("s-loadmismatch").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	It("does not roll back while the stable store is recovering, past the debounce", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-storegrace", nil)
+
+		// The new stable's store PVC is deleted (Terminating in envtest) and its Pod
+		// goes away: the stable path marks StoreTerminating and, with no model-ready
+		// Pod, records the store-finalize scale-to-0 marker. stableStoreRecovering
+		// then reports true, so the quorum shortfall is graced (StoreRecovering),
+		// NOT counted toward the rollback debounce.
+		Expect(k8sClient.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-storegrace-store-" + rev2}})).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-storegrace-pod-" + rev2}})).To(Succeed())
+
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		for i := 0; i < 6; i++ {
+			Expect(rec(r, "s-storegrace")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack),
+				"a recovering store must not count as a stabilization failure")
+		}
+		dm := getDM("s-storegrace")
+		Expect(dm.Status.FailedRevision).To(BeNil(), "a recovering store is not a failure")
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev2))
+		Expect(dm.Status.PreviousRevision).NotTo(BeNil(), "rollback target kept while recovering")
+		st := meta_Find(dm, decisionmodelv1alpha1.ConditionStabilizing)
+		Expect(st).NotTo(BeNil())
+		// Either grace reason proves the shortfall is tolerated: the scale-to-0 for
+		// the Terminating store bumps the Deployment generation (StableRolling) and
+		// the finalize marker also sets StoreRecovering; both extend the window.
+		Expect(st.Reason).To(BeElementOf(reasonStoreRecovering, reasonStableRolling))
+		Expect(st.Status).To(Equal(metav1.ConditionTrue))
+		_ = rev1
+	})
+
+	It("is restart-safe: a fresh reconciler makes the same no-rollback decision while loading", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-loadrestart", nil)
+
+		Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: "s-loadrestart-pod-" + rev2}})).To(Succeed())
+		loadingPod("s-loadrestart", rev2, 20*time.Second)
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		Expect(rec(r, "s-loadrestart")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+
+		// Fresh reconciler (restart: empty RAM). The decision comes from Pod
+		// StartTime + status, so it must still NOT roll back.
+		r2 := newRec(prober)
+		for i := 0; i < 3; i++ {
+			Expect(rec(r2, "s-loadrestart")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		}
+		dm := getDM("s-loadrestart")
+		Expect(dm.Status.FailedRevision).To(BeNil())
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev2))
+		Expect(meta_Find(dm, decisionmodelv1alpha1.ConditionStabilizing).Reason).To(Equal(reasonModelLoading))
+		_ = rev1
+	})
+
 	// A scale-up whose new Pods never become ready must not hold forever: the
 	// rollout eventually trips ProgressDeadlineExceeded and rolls back.
 	It("rolls back a scale-up whose new Pods never become ready (deadline)", func() {

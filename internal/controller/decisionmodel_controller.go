@@ -174,6 +174,14 @@ const (
 	// intentional in-place change: replicas scale-up, API-key rotation, scheduling
 	// or a manual restart), not a model-health failure.
 	reasonStableRolling = "StableRolling"
+	// reasonStoreRecovering marks the Stabilizing condition True while a quorum
+	// shortfall is tolerated because the stable store is being rebuilt (lost/
+	// Terminating store recovery), bounded by the recovery budget.
+	reasonStoreRecovering = "StoreRecovering"
+	// reasonModelLoading marks the Stabilizing condition True while a quorum
+	// shortfall is tolerated because the new stable Pods are still loading the
+	// model (started less than startingTimeout ago, no crash/gate mismatch).
+	reasonModelLoading = "ModelLoading"
 )
 
 // maxStoreRecoverAttempts bounds how many times a lost-store recovery recreates a
