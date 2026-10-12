@@ -851,6 +851,18 @@ func (r *DecisionModelReconciler) reconcileFailedRevision(
 	if stable != nil && stableStopped(dm) {
 		return r.clearStopMarkerThenRequeue(ctx, dm)
 	}
+	// Abandon any in-flight candidate's manifest ConfigMap: when a different
+	// candidate was admitted (its <dm>-manifest-<rev> written) and the spec then
+	// reverted to this failed revision, clearing CandidateRevision below would
+	// otherwise strand that ConfigMap — GC finds manifest ConfigMaps only by name
+	// (get-only RBAC, no list), from a stale store PVC or from the abandoned-revs
+	// recorded here. A candidate that never got a store PVC (admitted, re-specced
+	// before its PVC was created) has no PVC for GC to key off, so record its hash
+	// now. gcRevisions (run below on both the stable and no-stable branch) then
+	// deletes it by name.
+	if c := dm.Status.CandidateRevision; c != nil && c.Hash != "" && c.Hash != dm.Status.FailedRevision.Hash {
+		markManifestAbandoned(ctx, c.Hash)
+	}
 	dm.Status.CandidateRevision = nil
 	// A revision that never cached/evaluated should not advertise those
 	// conditions; drop stale "prefetching"/eval conditions.
