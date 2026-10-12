@@ -19,10 +19,17 @@ Check which phase it is stuck in and the matching condition reason (`Resolved`,
   reason `NotFound` / a transient registry error).
 - `Caching`: the prefetch Job is failing or pending (no PVC bound, image pull error,
   download slow). `kubectl get jobs,pods -n <ns> -l decisionmodel.io/name=<name>`.
+  Under `rollout.strategy: Recreate` the phase also stays `Caching` while the operator
+  waits for the stopped stable's Pods to terminate before starting the candidate; if a
+  stable Pod is stuck `Terminating` the candidate fails with `CacheTimeout` once the
+  caching deadline passes and the stable is scaled back up.
 - `Starting`: serving Pods never pass the model-ready gate — bad image, digest or
   device mismatch, or a GPU that was never allocated. See DecisionModelModelMismatch.
 - `Evaluating`: the golden dataset is large/slow or the candidate Pod is unhealthy.
 - `Promoting`: Service selector switch blocked by an admission webhook or RBAC.
+  (The operator reconciles only the port name/protocol/port/targetPort and the
+  `ClusterIP` type and selector, so a webhook that adds its own Service fields — e.g.
+  `appProtocol` — does not cause a reconcile fight.)
 
 ## Fix
 Resolve the underlying cause (fix the tag/registry, free capacity for the PVC/Job,
