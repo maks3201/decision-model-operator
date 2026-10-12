@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -1295,7 +1296,120 @@ var _ = Describe("Recreate rollout strategy", func() {
 		}),
 	)
 
-	// Item 5 + 9: honest Ready. A Recreate rollback on a replicas=2 target switches
+	// A Manual promotion policy must not park a candidate for human approval while
+	// the stable is stopped for a Recreate rollout: production would stay down with
+	// no timeout. The rollout starts Recreate + Automatic (CEL forbids Recreate +
+	// Manual), reaches "stable stopped", then has its live spec flipped to
+	// BlueGreen + Manual (same candidate, strategy is not part of the revision
+	// hash). The stopped candidate must still promote automatically, emit the
+	// ignore-Warning exactly once, and never be left parked with the stable at 0.
+	It("promotes a stopped candidate automatically despite a BlueGreen+Manual flip, and warns once", func() {
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		name := "manual-stopped-" + itoa(nsCounter)
+		rev1, rev2 := driveToStopped(r, pr, name)
+
+		// Flip the live spec to BlueGreen + Manual while the stable is at 0 and the
+		// candidate (rev2) is already stopped. The candidate hash is unchanged
+		// (strategy/promotion are excluded from the revision hash), so the SAME
+		// candidate continues.
+		Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+			d.Spec.Rollout.Promotion = decisionmodelv1alpha1.PromotionManual
+		})).To(Succeed())
+		Expect(RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)).To(Equal(rev2),
+			"the strategy/promotion flip must not change the candidate revision")
+
+		// The candidate becomes model-ready. Without the fix it would park in
+		// AwaitingPromotion with the stable at 0; with the fix it promotes.
+		gatedPod(name, rev2, "10.0.11."+itoa(nsCounter))
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, name)
+			return getDM(name).Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady),
+			"a candidate stopped for Recreate must not wait for approval; it promotes to restore serving")
+
+		dm := getDM(name)
+		Expect(dm.Status.StableRevision.Hash).To(Equal(rev2), "candidate promoted without the promote annotation")
+		Expect(dm.Status.StableStoppedForRevision).To(BeEmpty(), "stop marker cleared on promotion")
+		Expect(dm.Annotations).NotTo(HaveKey(decisionmodelv1alpha1.AnnotationPromote), "no approval was ever set")
+		Expect(getDM(name).Status.Phase).NotTo(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion))
+
+		// The ignore-Warning was emitted exactly once (not every reconcile), and the
+		// stable was never left scaled to 0 awaiting approval.
+		fr := r.Recorder.(*events.FakeRecorder)
+		warnings := 0
+		drained := false
+		for !drained {
+			select {
+			case e := <-fr.Events:
+				if strings.Contains(e, eventManualIgnoredStopped) {
+					warnings++
+				}
+			default:
+				drained = true
+			}
+		}
+		Expect(warnings).To(Equal(1), "the ignore-Warning fires exactly once")
+
+		// Steady state: extra reconciles stay Ready and emit no further Warning.
+		rec(r, name)
+		rec(r, name)
+		for {
+			select {
+			case e := <-fr.Events:
+				Expect(strings.Contains(e, eventManualIgnoredStopped)).To(BeFalse(),
+					"no further ignore-Warning once promoted")
+			default:
+				Expect(getDM(name).Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseReady))
+				Expect(getDM(name).Status.StableRevision.Hash).To(Equal(rev2))
+				_ = rev1
+				return
+			}
+		}
+	})
+
+	// Control: BlueGreen + Manual with a RUNNING stable still parks the candidate
+	// in AwaitingPromotion. The fix only bypasses the hold when the stable is
+	// stopped; the normal manual path is unchanged.
+	It("still parks a BlueGreen+Manual candidate for approval when the stable is running", func() {
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		name := "manual-running-" + itoa(nsCounter)
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{
+					Strategy:  decisionmodelv1alpha1.RolloutBlueGreen,
+					Promotion: decisionmodelv1alpha1.PromotionManual,
+				},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, name)
+
+		// New model -> BlueGreen candidate; the stable keeps running throughout.
+		Expect(updateDM(ctx, namespace, name, func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM(name).Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, name)
+		markJob(name, rev2)
+		rec(r, name)
+		gatedPod(name, rev2, "10.0.12."+itoa(nsCounter))
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, name)
+			return getDM(name).Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseAwaitingPromotion),
+			"a running-stable BlueGreen rollout still waits for manual approval")
+		Expect(getDM(name).Status.StableStoppedForRevision).To(BeEmpty(), "nothing is stopped under BlueGreen")
+		Expect(getDM(name).Status.StableRevision.Hash).To(Equal(rev1), "stable keeps serving while parked")
+		Expect(svcRev(name)).To(Equal(rev1), "traffic stays on the stable")
+	})
+
 	// the Service at ready>=1 (availability first) but reports Ready only when BOTH
 	// replicas are model-ready; it is Degraded=ReplicasNotModelReady at 1/2.
 	It("switches at one ready replica but reports Ready only when all N are model-ready (rollback)", func() {
