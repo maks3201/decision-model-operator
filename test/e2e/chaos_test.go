@@ -523,7 +523,13 @@ spec:
 			datasetCM:    "chaos-stab",
 			minAccuracy:  "0.0",
 			evaluatingTO: "20m",
-			promotion:    "Automatic",
+			// the promotion-bounded stabilization grace ends at
+			// promotedAt+startingTimeout, so held-down Pods roll back only after that
+			// bound (then the 30s debounce). Shorten the Starting timeout from the 10m
+			// default to 3m (still ample for laya:en to load) so (b) rolls back within
+			// the job budget instead of ~10.5m.
+			startingTO: "3m",
+			promotion:  "Automatic",
 		})
 
 		var candHash, promotedAt string
@@ -568,7 +574,9 @@ spec:
 		By("(b) holding the stable Pods down past the debounce -> RolledBackAfterPromotion")
 		// Keep the new stable below quorum for longer than postPromotionDebounce (30s) so
 		// the window's safety net fires. holdRevisionPodsDown force-deletes that revision's
-		// Pods in a loop; the stabilization window (10m) is still open.
+		// Pods in a loop; the StoreRecovering/ModelLoading grace is bounded by
+		// promotedAt+startingTimeout (3m here), so churned Pods cannot extend it forever and
+		// the shortfall rolls back once that bound and the 30s debounce pass.
 		stop := make(chan struct{})
 		stopped := false
 		closeStop := func() {
@@ -581,8 +589,8 @@ spec:
 		go holdRevisionPodsDown(chaosNS, dm, candHash, stop)
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.failedRevision.reason}")
-		}, 8*time.Minute, 5*time.Second).Should(Equal("PostPromotionUnhealthy"),
-			"a stable held unhealthy past the debounce should roll back with PostPromotionUnhealthy")
+		}, 6*time.Minute, 5*time.Second).Should(Equal("PostPromotionUnhealthy"),
+			"a stable held unhealthy past the grace bound should roll back with PostPromotionUnhealthy")
 		Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(BeNumerically(">=", 1),
 			"holding the stable down past the debounce should emit RolledBackAfterPromotion")
 		closeStop() // stop deleting so the rolled-back previous revision can serve
@@ -609,8 +617,13 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 
 			By("promoting a new revision (bump CPU) and capturing the moment it becomes stable")
+			// Keep a generous Starting timeout so the store-recovery grace (bounded by
+			// promotedAt+startingTimeout) spans the rebuild+reload and the
+			// fresh stable is NOT rolled back; this is the no-rollback counterpart to
+			// chaos:512, which caps Starting low to force a rollback.
 			_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
-				"-p", `{"spec":{"resources":{"requests":{"cpu":"800m","memory":"1Gi"},"limits":{"memory":"4Gi"}}}}`)
+				"-p", `{"spec":{"resources":{"requests":{"cpu":"800m","memory":"1Gi"},"limits":{"memory":"4Gi"}},`+
+					`"rollout":{"timeouts":{"starting":"10m"}}}}`)
 			Expect(err).NotTo(HaveOccurred())
 			var newStable string
 			Eventually(func(g Gomega) {
