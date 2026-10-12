@@ -61,6 +61,13 @@ var _ = Describe("Recreate rollout strategy", func() {
 			Recorder: events.NewFakeRecorder(128),
 		}
 	}
+	newReconcilerClient := func(eng engine.Engine, prober Prober, cl client.Client) *DecisionModelReconciler {
+		return &DecisionModelReconciler{
+			Client: cl, APIReader: cl, Scheme: k8sClient.Scheme(),
+			Engines: map[string]engine.Engine{"ollaya": eng}, Prober: prober,
+			Recorder: events.NewFakeRecorder(128),
+		}
+	}
 	getDM := func(name string) *decisionmodelv1alpha1.DecisionModel {
 		dm := &decisionmodelv1alpha1.DecisionModel{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, dm)).To(Succeed())
@@ -457,6 +464,389 @@ var _ = Describe("Recreate rollout strategy", func() {
 		}, "5s", "50ms").Should(BeNil(), "rollback marker cleared")
 		Expect(getDM("rbk").Status.FailedRevision).NotTo(BeNil())
 		Expect(getDM("rbk").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	It("stages a capacity-safe rollback even when the strategy is flipped to BlueGreen after the Recreate stop", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "flip"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "flip")
+
+		// New model under Recreate: drive to Cached + stable stopped.
+		Expect(updateDM(ctx, namespace, "flip", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM("flip").Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, "flip")
+		markJob("flip", rev2)
+		rec(r, "flip") // Cached -> stable stopped (under Recreate)
+		Expect(getDM("flip").Status.StableStoppedForRevision).To(Equal(rev2))
+		Expect(depReplicas("flip", rev1)).To(Equal(int32(0)), "old stable stopped under Recreate")
+
+		// The user flips the live strategy to BlueGreen BEFORE promotion. The
+		// candidate identity (revision hash) does not change (strategy is excluded
+		// from the hash), so this is the same rollout, now with a mismatched live
+		// spec.
+		Expect(updateDM(ctx, namespace, "flip", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+		})).To(Succeed())
+		Expect(RevisionHash(getDM("flip").Spec, defaultDigest, fakeImage)).To(Equal(rev2),
+			"strategy flip must not change the candidate identity")
+
+		// Finish the rollout: the old stable Pod goes, the candidate starts and
+		// promotes.
+		deleteStablePod("flip", rev1)
+		rec(r, "flip")
+		gatedPod("flip", rev2, "10.0.7.2")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "flip")
+			return getDM("flip").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM("flip").Status.StableRevision.Hash).To(Equal(rev2))
+		Expect(getDM("flip").Status.PreviousRevision).NotTo(BeNil())
+		Expect(getDM("flip").Status.PreviousRevision.Hash).To(Equal(rev1))
+		// The promotion recorded Recreate from the durable stop signal, NOT the
+		// flipped-to BlueGreen live spec.
+		Expect(getDM("flip").Status.PreviousRevision.Strategy).To(Equal(decisionmodelv1alpha1.RolloutRecreate),
+			"strategy recorded from how the rollout actually ran, not the live spec")
+
+		// The previous revision stays at 0 for the whole window (single-GPU safety).
+		Expect(depReplicas("flip", rev1)).To(Equal(int32(0)), "previous revision stays at 0 during the window")
+
+		// Make the new stable unhealthy within the window.
+		settleDeployment("flip", rev2)
+		deleteStablePod("flip", rev2)
+		rec(r, "flip") // starts the unhealthy debounce
+		clock.add(postPromotionDebounce + time.Minute)
+
+		// The rollback must be STAGED (Recreate), not an instant BlueGreen Service
+		// switch onto the zero-replica previous revision. Throughout the staged
+		// rollback, the Service selector must never point at rev1 while rev1 is at 0.
+		assertServiceNeverOnZeroTarget := func() {
+			if svcRev("flip") == rev1 && depReplicas("flip", rev1) == 0 {
+				Fail("Service selector targets the previous revision while it is scaled to 0")
+			}
+		}
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "flip")
+			assertServiceNeverOnZeroTarget()
+			return getDM("flip").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil(), "rollback is staged (Recreate), not an instant BlueGreen switch")
+		Expect(getDM("flip").Status.RecreateRollback.Target).To(Equal(rev1))
+		Expect(svcRev("flip")).NotTo(Equal(rev1), "Service not switched to the target before it is model-ready")
+
+		// The target comes up on the freed GPU; only then does the Service switch.
+		gatedPod("flip", rev1, "10.0.7.3")
+		Eventually(func() string {
+			rec(r, "flip")
+			assertServiceNeverOnZeroTarget()
+			return svcRev("flip")
+		}, "5s", "50ms").Should(Equal(rev1), "Service switches to the target once it is model-ready")
+		Expect(depReplicas("flip", rev1)).To(Equal(int32(1)), "target scaled back up before the Service points at it")
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "flip")
+			return getDM("flip").Status.RecreateRollback
+		}, "5s", "50ms").Should(BeNil(), "rollback marker cleared")
+		Expect(getDM("flip").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	// Crash boundary: recreateStopStable persists the stop INTENT
+	// (StableStoppedForRevision) before it scales the stable down. If the process
+	// dies after that write but before the scale-down, and the live strategy is then
+	// flipped to BlueGreen, the persisted intent must stay sticky for THIS candidate:
+	// the next reconcile resumes and completes the scale-down before the candidate
+	// starts, and promotion records Recreate from the durable intent — never leaving
+	// the previous revision running or staging a rollback onto a zero-replica target.
+	It("keeps a persisted Recreate stop intent sticky when the strategy flips to BlueGreen before scale-down", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "sticky"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "sticky")
+
+		Expect(updateDM(ctx, namespace, "sticky", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		rev2 := RevisionHash(getDM("sticky").Spec, defaultDigest, fakeImage)
+		pr.set(rev2, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, "sticky")
+		markJob("sticky", rev2)
+
+		// Simulate the crash: the stop-intent status write lands, but the scale-down
+		// Update of the stable Deployment fails. Use a reconciler whose client fails
+		// the stable Deployment Update; the intent is persisted (status Patch) before
+		// the scale-down, so after this reconcile the intent is set yet rev1 is still
+		// at replicas 1 with its Pod present.
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		depName := "sticky-" + rev1
+		var blockUpdate atomic.Bool
+		blockUpdate.Store(true)
+		ic := interceptor.NewClient(wc, interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if d, ok := obj.(*appsv1.Deployment); ok && d.Name == depName && blockUpdate.Load() {
+					return apierrors.NewServerTimeout(schema.GroupResource{Group: "apps", Resource: "deployments"}, "update", 1)
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		})
+		rCrash := newReconcilerClient(eng, pr, ic)
+		rCrash.Now = clock.now
+		_, _ = rCrash.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: "sticky"}})
+
+		Expect(getDM("sticky").Status.StableStoppedForRevision).To(Equal(rev2),
+			"the stop intent is persisted before the scale-down")
+		Expect(depReplicas("sticky", rev1)).To(Equal(int32(1)),
+			"the scale-down did not happen (crash before the Deployment Update)")
+
+		// The user flips the live strategy to BlueGreen while the intent is pending.
+		Expect(updateDM(ctx, namespace, "sticky", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+		})).To(Succeed())
+		Expect(RevisionHash(getDM("sticky").Spec, defaultDigest, fakeImage)).To(Equal(rev2),
+			"a strategy flip does not change the candidate identity")
+
+		// Fresh reconciler (no interceptor): the sticky intent resumes the stop even
+		// though the live spec is now BlueGreen. The stable is scaled to 0 and the
+		// candidate is NOT created until its Pods are gone.
+		r2 := newReconciler(eng, pr)
+		r2.Now = clock.now
+		rec(r2, "sticky")
+		Expect(depReplicas("sticky", rev1)).To(Equal(int32(0)),
+			"the persisted Recreate intent resumes the scale-down despite the BlueGreen flip")
+		Expect(depExists("sticky", rev2)).To(BeFalse(),
+			"the candidate is not created while the old stable Pods are still present")
+
+		deleteStablePod("sticky", rev1)
+		rec(r2, "sticky")
+		Expect(depExists("sticky", rev2)).To(BeTrue(), "candidate created once the old Pods are gone")
+		gatedPod("sticky", rev2, "10.0.9.2")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r2, "sticky")
+			return getDM("sticky").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM("sticky").Status.StableRevision.Hash).To(Equal(rev2))
+		Expect(getDM("sticky").Status.PreviousRevision).NotTo(BeNil())
+		Expect(getDM("sticky").Status.PreviousRevision.Strategy).To(Equal(decisionmodelv1alpha1.RolloutRecreate),
+			"promotion records Recreate from the durable stop intent, not the flipped-to BlueGreen spec")
+
+		// A stabilization failure stages a Recreate rollback (never an instant switch
+		// to the zero-replica previous revision).
+		settleDeployment("sticky", rev2)
+		deleteStablePod("sticky", rev2)
+		rec(r2, "sticky")
+		clock.add(postPromotionDebounce + time.Minute)
+		assertNotOnZeroTarget := func() {
+			if svcRev("sticky") == rev1 && depReplicas("sticky", rev1) == 0 {
+				Fail("Service selector targets the previous revision while it is scaled to 0")
+			}
+		}
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r2, "sticky")
+			assertNotOnZeroTarget()
+			return getDM("sticky").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil(), "rollback is staged (Recreate), not an instant BlueGreen switch")
+		Expect(getDM("sticky").Status.RecreateRollback.Target).To(Equal(rev1))
+		Expect(svcRev("sticky")).NotTo(Equal(rev1), "Service not switched to the target before it is model-ready")
+	})
+
+	// Candidate supersession: candidate A stops the stable (marker=A), then the user
+	// replaces A with a valid candidate B and flips the live strategy to BlueGreen.
+	// B must NOT start BlueGreen against the held-at-zero prior stable: the non-empty
+	// marker forces B through Recreate too, the marker is handed off to B before
+	// promotion, and a later rollback stages (never switches Service to the
+	// zero-replica prior stable).
+	It("forces a superseding candidate through Recreate while the prior stable is held at zero", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "super"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "super")
+
+		// Candidate A: new model under Recreate; drive to Cached + stable stopped.
+		Expect(updateDM(ctx, namespace, "super", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		revA := RevisionHash(getDM("super").Spec, defaultDigest, fakeImage)
+		pr.set(revA, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, "super")
+		markJob("super", revA)
+		rec(r, "super") // Cached -> stable stopped for A
+		Expect(getDM("super").Status.StableStoppedForRevision).To(Equal(revA))
+		Expect(depReplicas("super", rev1)).To(Equal(int32(0)), "prior stable held at zero for A")
+
+		// Supersede A with a valid candidate B AND flip the live strategy to BlueGreen
+		// before A ever promoted. B is a different revision (different model).
+		Expect(updateDM(ctx, namespace, "super", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = "jevk5:en"
+			d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+		})).To(Succeed())
+		revB := RevisionHash(getDM("super").Spec, defaultDigest, fakeImage)
+		Expect(revB).NotTo(Equal(revA), "B is a distinct candidate")
+		pr.set(revB, engine.Loaded{Name: "jevk5:en", Digest: defaultDigest, Device: "cpu"})
+
+		rec(r, "super") // resolve + prefetch B
+		markJob("super", revB)
+		rec(r, "super") // Cached -> stop gate for B: the marker is handed off to B
+		Expect(getDM("super").Status.StableStoppedForRevision).To(Equal(revB),
+			"the non-empty marker forces B through Recreate; the marker is handed off to B before promotion")
+		Expect(depExists("super", revB)).To(BeFalse(),
+			"B is not created while the prior stable Pods are still present (Recreate, not BlueGreen)")
+
+		deleteStablePod("super", rev1)
+		rec(r, "super")
+		Expect(depExists("super", revB)).To(BeTrue(), "B created once the prior stable Pods are gone")
+		gatedPod("super", revB, "10.0.10.2")
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			rec(r, "super")
+			return getDM("super").Status.Phase
+		}, "5s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseReady))
+		Expect(getDM("super").Status.StableRevision.Hash).To(Equal(revB))
+		Expect(getDM("super").Status.PreviousRevision).NotTo(BeNil())
+		Expect(getDM("super").Status.PreviousRevision.Hash).To(Equal(rev1))
+		Expect(getDM("super").Status.PreviousRevision.Strategy).To(Equal(decisionmodelv1alpha1.RolloutRecreate),
+			"B promotes recording Recreate, not the flipped-to BlueGreen")
+
+		// Make B unhealthy in the window: the rollback stages (Recreate), never an
+		// instant switch to the zero-replica prior stable rev1.
+		settleDeployment("super", revB)
+		deleteStablePod("super", revB)
+		rec(r, "super")
+		clock.add(postPromotionDebounce + time.Minute)
+		assertNotOnZero := func() {
+			if svcRev("super") == rev1 && depReplicas("super", rev1) == 0 {
+				Fail("Service selector targets the zero-replica prior stable")
+			}
+		}
+		Eventually(func() *decisionmodelv1alpha1.RecreateRollbackStatus {
+			rec(r, "super")
+			assertNotOnZero()
+			return getDM("super").Status.RecreateRollback
+		}, "5s", "50ms").ShouldNot(BeNil(), "rollback staged (Recreate), not an instant BlueGreen switch")
+		Expect(getDM("super").Status.RecreateRollback.Target).To(Equal(rev1))
+		Expect(svcRev("super")).NotTo(Equal(rev1), "Service not switched to the zero-replica prior stable")
+	})
+
+	// Reverting the spec to a failed revision while a Recreate stop is held must
+	// clear the stop marker: reconcileFailedRevision drops the abandoned candidate
+	// but, without the clear, the stable would stay at 0 forever and the next
+	// independent rollout would be forced into Recreate by `recreate := ... ||
+	// stableStopped(dm)`.
+	It("clears the stop marker when the spec reverts to a failed revision while the stable is held at zero", func() {
+		clock := newSafeClock()
+		pr := stableProber()
+		eng := newFakeEngine()
+		r := newReconciler(eng, pr)
+		r.Now = clock.now
+		Expect(k8sClient.Create(ctx, &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "revfail"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model1, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Strategy: decisionmodelv1alpha1.RolloutRecreate},
+			},
+		})).To(Succeed())
+		rev1 := driveFirstStable(r, pr, "revfail")
+
+		// Candidate F (model2): stop the stable, then let it fail to start so it is
+		// recorded as FailedRevision (rollbackOrFail restores the stable + clears the
+		// marker on this failure).
+		Expect(updateDM(ctx, namespace, "revfail", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		revF := RevisionHash(getDM("revfail").Spec, defaultDigest, fakeImage)
+		pr.set(revF, engine.Loaded{Name: model2, Digest: defaultDigest, Device: "cpu"})
+		rec(r, "revfail")
+		markJob("revfail", revF)
+		rec(r, "revfail")
+		Expect(getDM("revfail").Status.StableStoppedForRevision).To(Equal(revF))
+		deleteStablePod("revfail", rev1)
+		rec(r, "revfail") // candidate started; never model-ready
+		clock.add(startingTimeout(getDM("revfail")) + time.Minute)
+		Eventually(func() string {
+			rec(r, "revfail")
+			if fr := getDM("revfail").Status.FailedRevision; fr != nil {
+				return fr.Hash
+			}
+			return ""
+		}, "5s", "50ms").Should(Equal(revF), "F recorded as the failed revision")
+		// The stable was restored and the marker cleared on F's failure.
+		Eventually(func() int32 {
+			rec(r, "revfail")
+			return depReplicas("revfail", rev1)
+		}, "5s", "50ms").Should(Equal(int32(1)))
+		Expect(getDM("revfail").Status.StableStoppedForRevision).To(BeEmpty())
+		// Re-create the stable Pod so it serves again (envtest has no RS controller).
+		gatedPod("revfail", rev1, "10.0.11.1")
+
+		// Candidate X (a different model) under Recreate: stop the stable (marker=X).
+		Expect(updateDM(ctx, namespace, "revfail", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = "winnow:en"
+		})).To(Succeed())
+		revX := RevisionHash(getDM("revfail").Spec, defaultDigest, fakeImage)
+		pr.set(revX, engine.Loaded{Name: "winnow:en", Digest: defaultDigest, Device: "cpu"})
+		rec(r, "revfail")
+		markJob("revfail", revX)
+		rec(r, "revfail")
+		Expect(getDM("revfail").Status.StableStoppedForRevision).To(Equal(revX), "X holds the stable at 0")
+		Expect(depReplicas("revfail", rev1)).To(Equal(int32(0)))
+
+		// Revert the spec to the failed revision F while X's marker is still held.
+		Expect(updateDM(ctx, namespace, "revfail", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = model2
+		})).To(Succeed())
+		Expect(RevisionHash(getDM("revfail").Spec, defaultDigest, fakeImage)).To(Equal(revF),
+			"the spec is back on the failed revision F")
+
+		// reconcileFailedRevision must clear the stop marker and restore the stable.
+		Eventually(func() string {
+			rec(r, "revfail")
+			return getDM("revfail").Status.StableStoppedForRevision
+		}, "5s", "50ms").Should(BeEmpty(), "the stop marker is cleared on the failed-revision path")
+		Eventually(func() int32 {
+			rec(r, "revfail")
+			return depReplicas("revfail", rev1)
+		}, "5s", "50ms").Should(Equal(int32(1)), "the stable returns to spec.replicas")
+		Expect(getDM("revfail").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+
+		// A following independent BlueGreen candidate must NOT stop the stable.
+		Expect(updateDM(ctx, namespace, "revfail", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = "gliclass:en"
+			d.Spec.Rollout.Strategy = decisionmodelv1alpha1.RolloutBlueGreen
+		})).To(Succeed())
+		revBG := RevisionHash(getDM("revfail").Spec, defaultDigest, fakeImage)
+		pr.set(revBG, engine.Loaded{Name: "gliclass:en", Digest: defaultDigest, Device: "cpu"})
+		rec(r, "revfail")
+		markJob("revfail", revBG)
+		rec(r, "revfail")
+		Expect(getDM("revfail").Status.StableStoppedForRevision).To(BeEmpty(),
+			"a BlueGreen rollout after the clear does not stop the stable")
+		Expect(depReplicas("revfail", rev1)).To(Equal(int32(1)), "the stable keeps serving under BlueGreen")
 	})
 
 	It("resumes a staged Recreate rollback after a restart", func() {

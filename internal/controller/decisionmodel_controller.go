@@ -830,6 +830,16 @@ func (r *DecisionModelReconciler) reconcileFailedRevision(
 	apiKey string,
 	cacheDegraded bool,
 ) (ctrl.Result, error) {
+	// If a Recreate stop is still held (the stable scaled to 0 for a now-abandoned
+	// candidate) and the spec has reverted to this failed revision, clear the stop
+	// marker persist-first before rendering the stable — otherwise the stable stays
+	// at 0 forever and, under `recreate := ... || stableStopped(dm)`, the next
+	// independent rollout would be forced into Recreate. Same helper the stable
+	// path uses; it requeues so the stable is rendered at its real replicas from
+	// clean state.
+	if stable != nil && stableStopped(dm) {
+		return r.clearStopMarkerThenRequeue(ctx, dm)
+	}
 	dm.Status.CandidateRevision = nil
 	// A revision that never cached/evaluated should not advertise those
 	// conditions; drop stale "prefetching"/eval conditions.
@@ -1350,7 +1360,13 @@ func (r *DecisionModelReconciler) reconcileStablePath(
 		}
 	}
 
-	stableParams := r.stableParams(ctx, dm, stable, claim)
+	stableParams, spErr := r.stableParams(ctx, dm, stable, claim)
+	if spErr != nil {
+		// A transient read of the live stable Deployment failed while legacy fields
+		// are missing: do not render incomplete params (which would roll the running
+		// stable). Requeue and retry from clean state.
+		return r.finish(ctx, dm, ctrl.Result{}, spErr)
+	}
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
 	if err := r.ensureDeployment(ctx, dm, eng, stableParams, stable.Hash, true, keyChecksum, legacyChecksum, storeTerminating); err != nil {
 		return r.finish(ctx, dm, ctrl.Result{}, err)
@@ -1845,7 +1861,10 @@ func (r *DecisionModelReconciler) reconcileStable(
 	// Render the stable revision from its own recorded fields, not
 	// the live spec which describes the failed candidate.
 	claim, _ := r.storeClaimForStable(ctx, dm, stable)
-	params := r.stableParams(ctx, dm, stable, claim)
+	params, spErr := r.stableParams(ctx, dm, stable, claim)
+	if spErr != nil {
+		return 0, spErr
+	}
 	keyChecksum, legacyChecksum := r.apiKeyTrigger(ctx, dm, apiKey)
 	if err := r.ensureDeployment(ctx, dm, eng, params, stable.Hash, true, keyChecksum, legacyChecksum, false); err != nil {
 		return 0, err

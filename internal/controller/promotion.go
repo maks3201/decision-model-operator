@@ -277,6 +277,10 @@ func (r *DecisionModelReconciler) promote(
 ) (ctrl.Result, error) {
 	rev := candidate.Hash
 	prevStable := dm.Status.StableRevision
+	// Capture the durable Recreate signal BEFORE it is cleared below: it records
+	// how THIS rollout actually ran, which is what a stabilization-window rollback
+	// must stage with (not the mutable live spec).
+	promoStrategy := promotionStrategy(dm, rev)
 	// Do not promote onto a foreign Service: traffic would go to someone else's
 	// Service, not our Pods. Check through the uncached APIReader (a foreign
 	// unlabelled Service is invisible to the cache) BEFORE persisting Ready.
@@ -318,10 +322,11 @@ func (r *DecisionModelReconciler) promote(
 		if prevStable != nil {
 			dm.Status.PreviousRevision = &decisionmodelv1alpha1.PreviousRevisionStatus{
 				Hash: prevStable.Hash, PromotedAt: &now, Revision: prevStable.DeepCopy(),
-				// Record the strategy the rollout ran under so a rollback in the
+				// Record the strategy the rollout ACTUALLY ran under (derived from the
+				// durable stop signal, captured above), so a rollback in the
 				// stabilization window stages correctly even if the live spec's
 				// strategy changed since (it is not part of the revision hash).
-				Strategy: rolloutStrategy(dm),
+				Strategy: promoStrategy,
 			}
 		}
 		setStatusCondition(dm, metav1.Condition{
