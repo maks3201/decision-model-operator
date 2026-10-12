@@ -197,9 +197,11 @@ var _ = Describe("lost-store recovery marker on the PVC", func() {
 		rr := newRec(k8sClient)
 
 		// A Complete prefetch Job that filled a PREVIOUS volume (created first).
+		staleParams, staleErr := rr.stableParams(ctx, dm, stable, claim)
+		Expect(staleErr).NotTo(HaveOccurred())
 		staleJob := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: prefetchName(dm, "r1"), Labels: revisionLabels(dm, "r1")},
-			Spec:       newFakeEngine().PrefetchJobSpec(rr.stableParams(ctx, dm, stable, claim)),
+			Spec:       newFakeEngine().PrefetchJobSpec(staleParams),
 		}
 		Expect(controllerutil.SetControllerReference(dm, staleJob, rr.Scheme)).To(Succeed())
 		Expect(k8sClient.Create(ctx, staleJob)).To(Succeed())

@@ -86,3 +86,31 @@ func TestRecreateBaselineUnavailable(t *testing.T) {
 		t.Errorf("stop marker set: baseline must be unavailable")
 	}
 }
+
+// promotionStrategy records Recreate only when the persisted stop intent names the
+// candidate being promoted. A marker for a DIFFERENT candidate (or none) is
+// BlueGreen, so a stale marker never pins a new candidate to Recreate.
+func TestPromotionStrategy(t *testing.T) {
+	mk := func(marker string) *decisionmodelv1alpha1.DecisionModel {
+		return &decisionmodelv1alpha1.DecisionModel{
+			Status: decisionmodelv1alpha1.DecisionModelStatus{StableStoppedForRevision: marker},
+		}
+	}
+	tests := []struct {
+		name      string
+		marker    string
+		candidate string
+		want      decisionmodelv1alpha1.RolloutStrategy
+	}{
+		{"intent names this candidate", "cand1", "cand1", decisionmodelv1alpha1.RolloutRecreate},
+		{"intent names a different candidate", "other", "cand1", decisionmodelv1alpha1.RolloutBlueGreen},
+		{"no intent", "", "cand1", decisionmodelv1alpha1.RolloutBlueGreen},
+		{"empty candidate hash with empty marker", "", "", decisionmodelv1alpha1.RolloutBlueGreen},
+	}
+	for _, tc := range tests {
+		if got := promotionStrategy(mk(tc.marker), tc.candidate); got != tc.want {
+			t.Errorf("%s: promotionStrategy(marker=%q, cand=%q) = %q, want %q",
+				tc.name, tc.marker, tc.candidate, got, tc.want)
+		}
+	}
+}

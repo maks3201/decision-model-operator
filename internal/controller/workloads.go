@@ -133,7 +133,7 @@ func (r *DecisionModelReconciler) stableParams(
 	dm *decisionmodelv1alpha1.DecisionModel,
 	stable *decisionmodelv1alpha1.RevisionStatus,
 	claimName string,
-) engine.Params {
+) (engine.Params, error) {
 	rev := stable.DeepCopy()
 	needImageOrResources := rev.Image == "" || len(rev.Resources.Limits)+len(rev.Resources.Requests) == 0
 	if needImageOrResources || rev.Registry == "" {
@@ -141,7 +141,9 @@ func (r *DecisionModelReconciler) stableParams(
 		// image/resources and/or adopt the registry it is actually running with.
 		dep := &appsv1.Deployment{}
 		key := types.NamespacedName{Namespace: dm.Namespace, Name: revisionName(dm, stable.Hash)}
-		if err := r.Get(ctx, key, dep); err == nil {
+		err := r.Get(ctx, key, dep)
+		switch {
+		case err == nil:
 			if cs := dep.Spec.Template.Spec.Containers; len(cs) > 0 {
 				if rev.Image == "" {
 					rev.Image = cs[0].Image
@@ -168,9 +170,21 @@ func (r *DecisionModelReconciler) stableParams(
 					}
 				}
 			}
+		case apierrors.IsNotFound(err):
+			// The live Deployment is gone: there is nothing to adopt from. This is
+			// not a transient read error — ensureDeployment will (re)create the
+			// Deployment. Render with the recorded fields as-is (legacy fields may
+			// be empty; the engine fills its defaults on a genuine first create).
+		default:
+			// A transient API/cache error. The recorded legacy fields are missing,
+			// so rendering now would substitute the engine's current defaults/registry
+			// and silently roll a running legacy stable (the Pod template loses the
+			// registry env, or gains a changed image). Fail closed: surface the error
+			// so the caller requeues and renders nothing until the read succeeds.
+			return engine.Params{}, fmt.Errorf("reading the live stable Deployment to recover legacy fields: %w", err)
 		}
 	}
-	return r.paramsForRevision(dm, rev, claimName)
+	return r.paramsForRevision(dm, rev, claimName), nil
 }
 
 // ollayaRegistryEnv is the serving-container env var the ollaya engine uses to
@@ -678,14 +692,34 @@ func (r *DecisionModelReconciler) ensureService(
 	}
 
 	desiredPort := corev1.ServicePort{Name: portNameHTTP, Protocol: corev1.ProtocolTCP, Port: port, TargetPort: intstrFromInt32(port)}
+	// Compare only the port fields this controller owns (name, protocol, service
+	// port, target port). A mutating admission webhook may add fields it owns,
+	// e.g. AppProtocol: "http"; a full struct equality would see that as drift and
+	// rewrite the port on every reconcile, which the webhook re-adds — an infinite
+	// Service update fight. Owned fields match => no-op.
+	portOwnedEqual := len(svc.Spec.Ports) == 1 &&
+		svc.Spec.Ports[0].Name == desiredPort.Name &&
+		svc.Spec.Ports[0].Protocol == desiredPort.Protocol &&
+		svc.Spec.Ports[0].Port == desiredPort.Port &&
+		svc.Spec.Ports[0].TargetPort == desiredPort.TargetPort
 	unchanged := svc.Spec.Type == corev1.ServiceTypeClusterIP &&
 		labelsEqual(svc.Spec.Selector, selector) &&
-		len(svc.Spec.Ports) == 1 && svc.Spec.Ports[0] == desiredPort
+		portOwnedEqual
 	if unchanged {
 		return nil
 	}
 	svc.Spec.Type = corev1.ServiceTypeClusterIP
 	svc.Spec.Selector = selector
-	svc.Spec.Ports = []corev1.ServicePort{desiredPort}
+	if len(svc.Spec.Ports) == 1 {
+		// Repair the owned fields in place and keep any webhook-added fields
+		// (AppProtocol, …) so a legitimate repair does not restart the fight.
+		svc.Spec.Ports[0].Name = desiredPort.Name
+		svc.Spec.Ports[0].Protocol = desiredPort.Protocol
+		svc.Spec.Ports[0].Port = desiredPort.Port
+		svc.Spec.Ports[0].TargetPort = desiredPort.TargetPort
+	} else {
+		// Wrong number of ports (extra/missing): reset to exactly the one we own.
+		svc.Spec.Ports = []corev1.ServicePort{desiredPort}
+	}
 	return r.Update(ctx, svc)
 }
