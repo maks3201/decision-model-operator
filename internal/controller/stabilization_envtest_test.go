@@ -591,6 +591,78 @@ var _ = Describe("post-promotion stabilization window", func() {
 		Expect(getDM("s-stuckload").Status.FailedRevision.Hash).To(Equal(rev2))
 	})
 
+	// The ModelLoading grace is bounded by the PROMOTION, not just per-Pod age:
+	// Pods repeatedly replaced with fresh StartTimes (eviction/preemption/deletion)
+	// must not keep the grace alive forever. Once promotedAt + startingTimeout plus
+	// the debounce have passed, it rolls back regardless of how young each Pod is.
+	It("rolls back a churning new stable whose Pods keep being replaced young, bounded by the promotion", func() {
+		prober := &revProber{}
+		r := newRec(prober)
+		rev1, rev2 := setStable(r, prober, "s-churn", nil)
+		promotedAt := getDM("s-churn").Status.PreviousRevision.PromotedAt
+		Expect(promotedAt).NotTo(BeNil())
+
+		// Replace the model-ready Pod with a freshly-started loading Pod, and keep
+		// replacing it young on every reconcile — simulating churn.
+		replaceYoung := func() {
+			_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: "s-churn-pod-" + rev2}})
+			loadingPod("s-churn", rev2, time.Second) // always just-started
+		}
+		replaceYoung()
+
+		// While within promotedAt + startingTimeout the grace holds (ModelLoading),
+		// even past the debounce, because the Pod is young.
+		clock = clock.Add(postPromotionDebounce + time.Minute)
+		replaceYoung()
+		Expect(rec(r, "s-churn")).NotTo(Equal(decisionmodelv1alpha1.PhaseRolledBack))
+		Expect(meta_Find(getDM("s-churn"), decisionmodelv1alpha1.ConditionStabilizing).Reason).
+			To(Equal(reasonModelLoading), "young Pods are graced while within the promotion bound")
+
+		// Cross promotedAt + startingTimeout (keeping the Pod young each tick): the
+		// promotion bound ends the grace, so the shortfall debounces and rolls back.
+		clock = metav1.NewTime(promotedAt.Add(startingTimeout(getDM("s-churn")) + time.Second)).Time
+		Eventually(func() decisionmodelv1alpha1.DecisionModelPhase {
+			replaceYoung()
+			clock = clock.Add(postPromotionDebounce)
+			return rec(r, "s-churn")
+		}, "10s", "50ms").Should(Equal(decisionmodelv1alpha1.PhaseRolledBack),
+			"a churning new stable rolls back once the promotion bound passes, despite young Pods")
+		Expect(serviceRev("s-churn")).To(Equal(rev1))
+		Expect(getDM("s-churn").Status.FailedRevision.Hash).To(Equal(rev2))
+	})
+
+	// The StoreRecovering and ModelLoading graces share one promotion bound,
+	// recoveryOrLoadGraceAllowed: both apply only while within
+	// promotedAt + startingTimeout. The ModelLoading end-to-end bound is covered by
+	// the churning-stable spec above; here the helper itself is checked directly so
+	// the StoreRecovering bound (whose operative grace is awkward to isolate in
+	// envtest, since a Terminating store's finalize scale-to-0 reads as a rollout)
+	// is proven at its source: false once the promotion is older than startingTimeout.
+	It("bounds the recovery/load grace by promotedAt + startingTimeout", func() {
+		r := newRec(&revProber{})
+		base := time.Now()
+		clock = base
+		dm := &decisionmodelv1alpha1.DecisionModel{}
+		st := startingTimeout(dm)
+
+		// No previous revision / no promotedAt: grace allowed (falls back to the
+		// per-Pod and recovery-budget bounds).
+		Expect(r.recoveryOrLoadGraceAllowed(dm, nil)).To(BeTrue())
+		Expect(r.recoveryOrLoadGraceAllowed(dm, &decisionmodelv1alpha1.PreviousRevisionStatus{})).To(BeTrue())
+
+		promotedAt := metav1.NewTime(base)
+		p := &decisionmodelv1alpha1.PreviousRevisionStatus{Hash: "prev", PromotedAt: &promotedAt}
+
+		// Within the bound: allowed.
+		clock = base.Add(st - time.Second)
+		Expect(r.recoveryOrLoadGraceAllowed(dm, p)).To(BeTrue(), "within promotedAt + startingTimeout")
+
+		// At/after the bound: not allowed, so the shortfall becomes a normal one.
+		clock = base.Add(st + time.Second)
+		Expect(r.recoveryOrLoadGraceAllowed(dm, p)).To(BeFalse(), "past promotedAt + startingTimeout")
+	})
+
 	It("rolls back immediately on a gate mismatch even while a Pod is young (loading window)", func() {
 		prober := &revProber{}
 		r := newRec(prober)
