@@ -1749,7 +1749,27 @@ pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
 if [ -z "${EXPECT_DIGEST:-}" ]; then
   echo "no expected digest; skipping verification"
 else
-  got="$(sha256sum "$OLLAYA_MODELS/$MANIFEST_PATH" | cut -d' ' -f1)"
+  # Read the pulled manifest's digest. ollaya pull reported success, so the file
+  # should exist. A missing, unreadable or empty manifest here is not a digest
+  # mismatch, and it is not a positively identified availability error either
+  # (a runtime store-layout change would repeat forever), so it is Unknown:
+  # retried within the bounded budget. Reading via "got=$(sha256sum | cut)"
+  # would hide a sha256sum failure behind cut's success and turn it into a
+  # permanent DigestMismatch, so the digest is computed in two checked steps.
+  manifest_file="$OLLAYA_MODELS/$MANIFEST_PATH"
+  if [ ! -f "$manifest_file" ]; then
+    echo "manifest $manifest_file missing after a successful pull" >&2
+    fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` "manifest missing after pull"
+  fi
+  sha_line="$(sha256sum "$manifest_file")" || {
+    echo "sha256sum could not read $manifest_file after pull" >&2
+    fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` "manifest unreadable after pull"
+  }
+  got="$(printf '%s' "$sha_line" | cut -d' ' -f1)"
+  if [ -z "$got" ]; then
+    echo "empty digest for $manifest_file after pull" >&2
+    fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` "empty manifest digest after pull"
+  fi
   echo "pulled digest: $got"
   if [ "$got" != "$EXPECT_DIGEST" ]; then
     echo "digest mismatch: got $got want $EXPECT_DIGEST" >&2
@@ -1761,7 +1781,7 @@ else
     # digests (first 12 hex) so the user sees what moved.
     want_short="$(printf '%s' "$EXPECT_DIGEST" | cut -c1-12)"
     got_short="$(printf '%s' "$got" | cut -c1-12)"
-    if grep -q '"schemaVersion"[[:space:]]*:[[:space:]]*2' "$OLLAYA_MODELS/$MANIFEST_PATH" 2>/dev/null; then
+    if grep -q '"schemaVersion"[[:space:]]*:[[:space:]]*2' "$manifest_file" 2>/dev/null; then
       echo "tag moved upstream: recorded $want_short, registry now serves $got_short" >&2
       fail ` + PrefetchReasonUpstreamTagMoved + ` ` + prefetchExitTagMovedStr + ` "recorded $want_short, registry now serves $got_short"
     fi
