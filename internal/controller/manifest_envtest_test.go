@@ -826,4 +826,83 @@ var _ = Describe("per-revision manifest persistence", func() {
 		_, errC := manifestCM("leak", revC)
 		Expect(errC).NotTo(HaveOccurred(), "the live candidate C keeps its manifest")
 	})
+
+	// F1: when the spec reverts to the failed revision, an in-flight candidate's
+	// manifest ConfigMap must be abandoned (GC'd by name) even if it never got a
+	// store PVC — reconcileFailedRevision clears the candidate and must record it.
+	abandonOnFailedRevert := func(name string, withStable bool) {
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		r := newR(eng)
+		dmObj := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: "laya:en", Device: "cpu", Replicas: int32Ptr(1),
+			},
+		}
+		Expect(k8sClient.Create(ctx, dmObj)).To(Succeed())
+		dmObj = getDM(name)
+		// The live spec (laya:en) resolves to this revision: make it the FAILED one
+		// so Reconcile takes the reconcileFailedRevision path (rev == failed, !isStable).
+		failedRev := RevisionHash(dmObj.Spec, wantDigest, fakeImage)
+		// A different, in-flight candidate B (another model) with a manifest ConfigMap
+		// and NO store PVC — the leak case.
+		candB := "b1b1b1b1b1b1b1b1"
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: name + "-manifest-" + candB,
+				Labels: revisionLabels(dmObj, candB),
+			},
+			BinaryData: map[string][]byte{manifestKey: manifestBody},
+		}
+		Expect(controllerutil.SetControllerReference(dmObj, cm, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		_, err := manifestCM(name, candB)
+		Expect(err).NotTo(HaveOccurred(), "precondition: candidate B's manifest exists")
+
+		var stableRev string
+		Expect(updateDMStatus(ctx, namespace, name, func(dm *decisionmodelv1alpha1.DecisionModel) {
+			dm.Status.FailedRevision = &decisionmodelv1alpha1.RevisionStatus{
+				Hash: failedRev, Engine: "ollaya", Model: "laya:en",
+				Digest: wantDigest, Device: "cpu", Image: fakeImage, Placement: placementNone,
+			}
+			dm.Status.CandidateRevision = &decisionmodelv1alpha1.RevisionStatus{
+				Hash: candB, Engine: "ollaya", Model: "kev:en",
+				Digest: wantDigest, Device: "cpu", Image: fakeImage, Placement: placementNone,
+			}
+			if withStable {
+				stableRev = "5ab1e5ab1e5ab1e5"
+				dm.Status.StableRevision = &decisionmodelv1alpha1.RevisionStatus{
+					Hash: stableRev, Engine: "ollaya", Model: "jevk5:en",
+					Digest: wantDigest, Device: "cpu", Image: fakeImage, Placement: placementNone,
+				}
+			}
+		})).To(Succeed())
+
+		rec(r, name)
+
+		// Candidate B's manifest ConfigMap is abandoned and GC'd by name.
+		Eventually(func() bool {
+			c, gerr := manifestCM(name, candB)
+			return apierrors.IsNotFound(gerr) || (gerr == nil && c.DeletionTimestamp != nil)
+		}, "3s", "50ms").Should(BeTrue(), "the abandoned candidate's manifest ConfigMap is deleted by name")
+
+		// The failed revision is still recorded (not retried) and the candidate is cleared.
+		dm := getDM(name)
+		Expect(dm.Status.FailedRevision).NotTo(BeNil())
+		Expect(dm.Status.FailedRevision.Hash).To(Equal(failedRev))
+		Expect(dm.Status.CandidateRevision).To(BeNil())
+		if withStable {
+			Expect(dm.Status.StableRevision).NotTo(BeNil())
+			Expect(dm.Status.StableRevision.Hash).To(Equal(stableRev), "the stable still serves")
+		}
+	}
+
+	It("abandons the candidate manifest when the spec reverts to the failed revision (with a stable)", func() {
+		abandonOnFailedRevert("fail-revert-stable", true)
+	})
+
+	It("abandons the candidate manifest when the spec reverts to the failed revision (no stable)", func() {
+		abandonOnFailedRevert("fail-revert-nostable", false)
+	})
 })
