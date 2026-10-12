@@ -751,4 +751,79 @@ var _ = Describe("per-revision manifest persistence", func() {
 		}
 		Expect(warned).To(Equal(1), "one ManifestInvalid Warning, no loop")
 	})
+
+	It("does not leak a candidate manifest when its admission write conflicts and the spec moves on", func() {
+		// Root-cause regression: the manifest ConfigMap is written persist-then-act
+		// BEFORE the candidateRevision status write. If that write does not become
+		// durable (conflict), the revision is recorded nowhere durable (no store PVC
+		// yet, abandoned-revs state discarded on the early return), so a later spec
+		// change that admits a different candidate would never collect it. The fix
+		// rolls the speculative manifest back on the non-durable admission return.
+		eng := newFakeEngine()
+		eng.manifest = manifestBody
+		// Admit candidate A normally.
+		rOK := newR(eng)
+		createDM("leak")
+		rec(rOK, "leak")
+		revA := getDM("leak").Status.CandidateRevision.Hash
+		Expect(revA).NotTo(BeEmpty())
+
+		// Change the model to B and reconcile with a client that makes B's admission
+		// status write conflict, so manifest-B is written but B is never recorded.
+		Expect(updateDM(ctx, namespace, "leak", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = "kev:en"
+		})).To(Succeed())
+		revB := RevisionHash(getDM("leak").Spec, wantDigest, fakeImage)
+		Expect(revB).NotTo(Equal(revA))
+
+		conflictOnB := interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object,
+				patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if dm, ok := obj.(*decisionmodelv1alpha1.DecisionModel); ok && sub == "status" &&
+					dm.Status.CandidateRevision != nil && dm.Status.CandidateRevision.Hash == revB {
+					return apierrors.NewConflict(
+						decisionmodelv1alpha1.GroupVersion.WithResource("decisionmodels").GroupResource(),
+						dm.Name, fmt.Errorf("forced admission conflict"))
+				}
+				return cl.Status().Patch(ctx, obj, patch, opts...)
+			},
+		}
+		wc, werr := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(werr).NotTo(HaveOccurred())
+		failing := interceptor.NewClient(wc, conflictOnB)
+		rConflict := &DecisionModelReconciler{
+			Client: failing, APIReader: k8sClient, Scheme: k8sClient.Scheme(),
+			Engines:  map[string]engine.Engine{"ollaya": eng},
+			Prober:   &fakeProber{loaded: engine.Loaded{Name: "laya:en", Digest: wantDigest, Device: "cpu"}},
+			Recorder: events.NewFakeRecorder(128),
+		}
+		rec(rConflict, "leak")
+
+		// B's admission did not become durable (status still records candidate A),
+		// and the speculative manifest-B was rolled back in the same reconcile — so
+		// there is no orphan waiting for a spec change to strand it.
+		Expect(getDM("leak").Status.CandidateRevision.Hash).To(Equal(revA), "B never recorded durably")
+		_, errRolled := manifestCM("leak", revB)
+		Expect(apierrors.IsNotFound(errRolled)).To(BeTrue(),
+			"manifest-B rolled back when its admission write did not become durable")
+
+		// Restart (fresh reconciler, empty RAM): the spec moves on to C and
+		// reconciles normally. There is no durable or in-RAM record of B, so only
+		// the fix's rollback keeps manifest-B from leaking. Assert the end state.
+		Expect(updateDM(ctx, namespace, "leak", func(d *decisionmodelv1alpha1.DecisionModel) {
+			d.Spec.Model = "jevk5:en"
+		})).To(Succeed())
+		revC := RevisionHash(getDM("leak").Spec, wantDigest, fakeImage)
+		Expect(revC).NotTo(Equal(revB))
+		rFresh := newR(eng)
+		rec(rFresh, "leak")
+		rec(rFresh, "leak")
+
+		cmB, errB := manifestCM("leak", revB)
+		leaked := errB == nil && cmB.DeletionTimestamp == nil
+		Expect(leaked).To(BeFalse(), "manifest-B must not leak after the spec moves on (leaked=%v)", leaked)
+		// Sanity: C's own manifest is present (the fix only touched the stranded B).
+		_, errC := manifestCM("leak", revC)
+		Expect(errC).NotTo(HaveOccurred(), "the live candidate C keeps its manifest")
+	})
 })

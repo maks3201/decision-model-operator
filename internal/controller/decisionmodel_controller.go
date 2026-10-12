@@ -621,14 +621,17 @@ func (r *DecisionModelReconciler) reconcileCandidatePath(
 		dm.Status.CandidateRevision = candidate
 		persisted, conflict, perr := r.persistStatus(ctx, dm)
 		if conflict {
+			r.rollbackSpeculativeManifest(ctx, dm, rev)
 			r.releaseReservation(dm.Namespace, dm.Name)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		if perr != nil {
+			r.rollbackSpeculativeManifest(ctx, dm, rev)
 			r.releaseReservation(dm.Namespace, dm.Name)
 			return r.finish(ctx, dm, ctrl.Result{}, perr)
 		}
 		if !persisted {
+			r.rollbackSpeculativeManifest(ctx, dm, rev)
 			r.releaseReservation(dm.Namespace, dm.Name)
 			return ctrl.Result{}, nil
 		}
