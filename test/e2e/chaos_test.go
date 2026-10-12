@@ -523,7 +523,13 @@ spec:
 			datasetCM:    "chaos-stab",
 			minAccuracy:  "0.0",
 			evaluatingTO: "20m",
-			promotion:    "Automatic",
+			// the promotion-bounded stabilization grace ends at
+			// promotedAt+startingTimeout, so held-down Pods roll back only after that
+			// bound (then the 30s debounce). Shorten the Starting timeout from the 10m
+			// default to 3m (still ample for laya:en to load) so (b) rolls back within
+			// the job budget instead of ~10.5m.
+			startingTO: "3m",
+			promotion:  "Automatic",
 		})
 
 		var candHash, promotedAt string
@@ -568,7 +574,9 @@ spec:
 		By("(b) holding the stable Pods down past the debounce -> RolledBackAfterPromotion")
 		// Keep the new stable below quorum for longer than postPromotionDebounce (30s) so
 		// the window's safety net fires. holdRevisionPodsDown force-deletes that revision's
-		// Pods in a loop; the stabilization window (10m) is still open.
+		// Pods in a loop; the StoreRecovering/ModelLoading grace is bounded by
+		// promotedAt+startingTimeout (3m here), so churned Pods cannot extend it forever and
+		// the shortfall rolls back once that bound and the 30s debounce pass.
 		stop := make(chan struct{})
 		stopped := false
 		closeStop := func() {
@@ -581,8 +589,8 @@ spec:
 		go holdRevisionPodsDown(chaosNS, dm, candHash, stop)
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.failedRevision.reason}")
-		}, 8*time.Minute, 5*time.Second).Should(Equal("PostPromotionUnhealthy"),
-			"a stable held unhealthy past the debounce should roll back with PostPromotionUnhealthy")
+		}, 6*time.Minute, 5*time.Second).Should(Equal("PostPromotionUnhealthy"),
+			"a stable held unhealthy past the grace bound should roll back with PostPromotionUnhealthy")
 		Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(BeNumerically(">=", 1),
 			"holding the stable down past the debounce should emit RolledBackAfterPromotion")
 		closeStop() // stop deleting so the rolled-back previous revision can serve
@@ -595,6 +603,74 @@ spec:
 				"the Service should select the previous revision after the rollback")
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 	})
+
+	It("recovers a freshly promoted stable store inside the window without rolling back",
+		Label("nightly", "chaos"), func() {
+			// #173: a store fault on a stable promoted moments ago (inside the
+			// stabilization window) must NOT roll back. The operator rebuilds the store
+			// and keeps the SAME stable; the window is extended with a grace reason
+			// (StoreRecovering / ModelLoading / StableRolling), the revision is not
+			// recorded failed, and no RolledBackAfterPromotion Event fires. This is the
+			// in-window counterpart to the settled-store recovery specs (which wait for
+			// the window to close first).
+			stableBefore, err := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("promoting a new revision (bump CPU) and capturing the moment it becomes stable")
+			// Keep a generous Starting timeout so the store-recovery grace (bounded by
+			// promotedAt+startingTimeout) spans the rebuild+reload and the
+			// fresh stable is NOT rolled back; this is the no-rollback counterpart to
+			// chaos:512, which caps Starting low to force a rollback.
+			_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", chaosNS, "--type=merge",
+				"-p", `{"spec":{"resources":{"requests":{"cpu":"800m","memory":"1Gi"},"limits":{"memory":"4Gi"}},`+
+					`"rollout":{"timeouts":{"starting":"10m"}}}}`)
+			Expect(err).NotTo(HaveOccurred())
+			var newStable string
+			Eventually(func(g Gomega) {
+				h, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+				g.Expect(h).NotTo(Equal(stableBefore))
+				g.Expect(h).NotTo(BeEmpty())
+				newStable = h
+			}, 12*time.Minute, 3*time.Second).Should(Succeed(), "the new revision should promote")
+			promotedAt := time.Now()
+			rollbacksBefore := eventReasonCountIn("RolledBackAfterPromotion")
+
+			By("within 60s of promotion, deleting the fresh stable's store PVC and its serving Pod")
+			Expect(time.Since(promotedAt)).To(BeNumerically("<", 60*time.Second),
+				"the fault must land inside the stabilization window")
+			_, _ = utils.Kubectl("delete", "pvc", dm+"-store-"+newStable, "-n", chaosNS, "--wait=false")
+			_, _ = utils.Kubectl("delete", "pods", "-l",
+				"decisionmodel.io/name="+dm+",decisionmodel.io/revision="+newStable, "-n", chaosNS,
+				"--grace-period=0", "--force")
+
+			By("the Stabilizing condition shows a grace reason while the store rebuilds (no rollback)")
+			// Poll the Stabilizing condition and record whether a grace reason appears at
+			// least once; in parallel the DM must never land a terminal rollback.
+			graceSeen := false
+			Eventually(func(g Gomega) {
+				reason, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm,
+					"{.status.conditions[?(@.type=='Stabilizing')].reason}")
+				if reason == "StoreRecovering" || reason == "ModelLoading" || reason == "StableRolling" {
+					graceSeen = true
+				}
+				phase, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+				g.Expect(phase).NotTo(Equal("RolledBack"),
+					"an in-window store fault on a fresh stable must not roll back")
+				g.Expect(graceSeen).To(BeTrue(), "Stabilizing should show a grace reason during recovery")
+			}, 6*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("recovery completes: Ready on the same stable, no failed revision, no rollback Event")
+			Eventually(func() (string, error) {
+				return utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.phase}")
+			}, 10*time.Minute, 5*time.Second).Should(Equal("Ready"))
+			stableNow, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.stableRevision.hash}")
+			Expect(stableNow).To(Equal(newStable),
+				"store recovery must keep the same freshly promoted stable, not a new revision")
+			failed, _ := utils.KubectlJSONPath(chaosNS, "decisionmodel", dm, "{.status.failedRevision.hash}")
+			Expect(failed).To(BeEmpty(), "an in-window store recovery must not record a failed revision")
+			Expect(eventReasonCountIn("RolledBackAfterPromotion")).To(Equal(rollbacksBefore),
+				"no RolledBackAfterPromotion Event should fire for an in-window store recovery")
+		})
 })
 
 // ---- chaos helpers ----

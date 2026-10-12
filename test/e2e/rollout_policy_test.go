@@ -230,10 +230,12 @@ spec:
 		By("promoting a new revision with a generous stabilization window (cpu bump)")
 		// A long stabilization window keeps the previous revision alive while the fault
 		// is injected and detected. No evaluation: promotion is automatic once the
-		// candidate is model-ready.
+		// candidate is model-ready. The model-load grace is bounded by
+		// promotedAt+startingTimeout, so cap Starting at 3m (ample for laya:en) to keep
+		// the held-down rollback within the job budget instead of the 10m default.
 		_, err = utils.Kubectl("patch", "decisionmodel", dm, "-n", ppNS, "--type=merge",
 			"-p", `{"spec":{"resources":{"requests":{"cpu":"300m","memory":"1Gi"},"limits":{"memory":"4Gi"}},`+
-				`"rollout":{"stabilization":"10m"}}}`)
+				`"rollout":{"stabilization":"10m","timeouts":{"starting":"3m"}}}}`)
 		Expect(err).NotTo(HaveOccurred())
 
 		var newStable string
@@ -272,8 +274,8 @@ spec:
 		By("the operator detects the unhealthy new stable and rolls back to the previous revision")
 		Eventually(func() (string, error) {
 			return utils.KubectlJSONPath(ppNS, "decisionmodel", dm, "{.status.phase}")
-		}, 10*time.Minute, 10*time.Second).Should(Equal("RolledBack"),
-			"the operator should roll back after the new stable stays unhealthy")
+		}, 6*time.Minute, 10*time.Second).Should(Equal("RolledBack"),
+			"the operator should roll back after the new stable stays unhealthy past the grace bound")
 		stopKilling()
 
 		By("status.failedRevision.reason is PostPromotionUnhealthy and the failed revision is the new one")
@@ -343,6 +345,7 @@ type rolloutPatch struct {
 	minAccuracy  string
 	minMacroF1   string
 	evaluatingTO string
+	startingTO   string
 	promotion    string
 }
 
@@ -362,8 +365,15 @@ func patchRollout(name, ns string, p rolloutPatch) {
 	rollout := map[string]any{
 		"evaluation": evaluation,
 	}
+	timeouts := map[string]any{}
 	if p.evaluatingTO != "" {
-		rollout["timeouts"] = map[string]any{"evaluating": p.evaluatingTO}
+		timeouts["evaluating"] = p.evaluatingTO
+	}
+	if p.startingTO != "" {
+		timeouts["starting"] = p.startingTO
+	}
+	if len(timeouts) > 0 {
+		rollout["timeouts"] = timeouts
 	}
 	if p.promotion != "" {
 		rollout["promotion"] = p.promotion
