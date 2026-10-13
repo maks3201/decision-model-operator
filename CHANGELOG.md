@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.1](https://github.com/maks3201/decision-model-operator/compare/v0.5.0...v0.5.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* bound Recreate stable-stop wait ([#165](https://github.com/maks3201/decision-model-operator/issues/165)) ([aa80a7b](https://github.com/maks3201/decision-model-operator/commit/aa80a7b393fdf7dd79b070406bc1c9ca21bfa87e))
+* **chart:** refuse more than one manager replica without leader election ([#177](https://github.com/maks3201/decision-model-operator/issues/177)) ([a3ae3af](https://github.com/maks3201/decision-model-operator/commit/a3ae3af043ac249493447e504536e6139babe371))
+* clear the Recreate stop marker when the spec returns to a failed revision ([2e06304](https://github.com/maks3201/decision-model-operator/commit/2e06304442339a1751a6a4822f1ba97161f2b212))
+* do not fail a prefetch as DigestMismatch when the manifest cannot be read ([#174](https://github.com/maks3201/decision-model-operator/issues/174)) ([fad7194](https://github.com/maks3201/decision-model-operator/commit/fad7194f31e0325de54afc9907e48afc51247411))
+* do not park a candidate for manual approval while the stable is stopped for a Recreate rollout ([660d49c](https://github.com/maks3201/decision-model-operator/commit/660d49ca0ccfee30f3693054a13f160cc43ab9aa))
+* do not re-render a legacy stable when its Deployment cannot be read ([2e06304](https://github.com/maks3201/decision-model-operator/commit/2e06304442339a1751a6a4822f1ba97161f2b212))
+* drop the candidate manifest when the spec reverts to a failed revision ([#176](https://github.com/maks3201/decision-model-operator/issues/176)) ([3abaa9e](https://github.com/maks3201/decision-model-operator/commit/3abaa9e55b6a6d611e0030c20703530bf46c1ff3))
+* end the store and load stabilization grace at promotion plus the Starting timeout ([#178](https://github.com/maks3201/decision-model-operator/issues/178)) ([824fd51](https://github.com/maks3201/decision-model-operator/commit/824fd51b07f0dff26e90a0fec9e8f3d8fddbb95c))
+* finish a Recreate rollout as Recreate after the stable is stopped, including a replacement candidate ([2e06304](https://github.com/maks3201/decision-model-operator/commit/2e06304442339a1751a6a4822f1ba97161f2b212))
+* keep a freshly promoted stable while its store recovers or its model loads ([#173](https://github.com/maks3201/decision-model-operator/issues/173)) ([4f3a0c4](https://github.com/maks3201/decision-model-operator/commit/4f3a0c49d696537e5a77de9c8a063a07ec08579c))
+* keep admission-added Service port fields instead of rewriting them every reconcile ([2e06304](https://github.com/maks3201/decision-model-operator/commit/2e06304442339a1751a6a4822f1ba97161f2b212))
+* remove the manifest ConfigMap of a candidate whose admission did not persist ([660d49c](https://github.com/maks3201/decision-model-operator/commit/660d49ca0ccfee30f3693054a13f160cc43ab9aa))
+
 ## [0.5.0](https://github.com/maks3201/decision-model-operator/compare/v0.4.0...v0.5.0) (2026-10-11)
 
 
