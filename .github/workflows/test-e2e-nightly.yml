@@ -20,7 +20,9 @@ jobs:
   test-e2e:
     name: kind (kustomize, CPU, ${{ matrix.model }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The full non-laya suite takes ~40-44 min on a runner; give go test 60m and
+    # the job room for setup and teardown.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +69,7 @@ jobs:
           # against non-laya models. fault-matrix is laya-specific (gap 1 pulls
           # laya:multilingual) and runs in its own job below.
           E2E_LABEL_FILTER: "!ha && !ha-switch && !chaos && !recreate && !scheduler && !fleet && !scheduler-edge && !registry-outage && !fault-matrix"
+          E2E_GO_TIMEOUT: 60m
         run: make test-e2e
 
   # Fault-matrix container (fault_matrix_test.go): a spec.model change during an

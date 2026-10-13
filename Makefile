@@ -133,6 +133,8 @@ KIND_CLUSTER ?= dmo
 # default) runs every spec. The per-PR workflow sets '!nightly' to skip the
 # heavier specs labelled "nightly" (which the nightly workflow runs in full).
 E2E_LABEL_FILTER ?=
+# E2E_GO_TIMEOUT is the go test -timeout for the e2e run.
+E2E_GO_TIMEOUT ?= 40m
 ifneq ($(strip $(E2E_LABEL_FILTER)),)
 GINKGO_LABEL_FILTER := -ginkgo.label-filter="$(E2E_LABEL_FILTER)"
 endif
@@ -147,7 +149,7 @@ kind-down: ## Delete the kind cluster '$(KIND_CLUSTER)' (idempotent).
 
 .PHONY: test-e2e
 test-e2e: kind-up manifests generate fmt vet ## Run the e2e tests on kind. Leaves the cluster DOWN unless E2E_KEEP_CLUSTER=1.
-	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v $(GINKGO_LABEL_FILTER) -timeout 40m; \
+	KIND_CLUSTER=$(KIND_CLUSTER) go test ./test/e2e/ -v -ginkgo.v $(GINKGO_LABEL_FILTER) -timeout $(E2E_GO_TIMEOUT); \
 		status=$$?; \
 		if [ -z "$(E2E_KEEP_CLUSTER)" ]; then $(MAKE) kind-down; fi; \
 		exit $$status
