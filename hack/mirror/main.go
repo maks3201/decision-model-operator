@@ -24,6 +24,12 @@
 //	    manifest bytes, so the digest the operator records (sha256 of the served
 //	    bytes) is the sha256 of this stripped manifest; the prefetch Job verifies
 //	    against the same bytes, so resolve and pull stay consistent.
+//	GET /v2/<namespace>/<model>/manifests/sha256:<hex> -> the manifest whose SERVED
+//	    (urls-stripped) bytes hash to <hex>, independent of which tag it was baked
+//	    under. Ollaya 0.13.0 pulls a pinned revision by digest (spike 011); the
+//	    prefetch Job on 0.13.0 pulls <model>@sha256:<recorded-digest>, so the mirror
+//	    must answer the digest route with the exact bytes the operator recorded.
+//	    An unknown digest is a 404, as for an unknown tag.
 //	GET /v2/<namespace>/<model>/blobs/sha256:<hex> -> the blob, with Range support
 //	    (http.ServeContent): `ollaya pull` downloads large blobs with parallel
 //	    byte-range requests and rejects a server that ignores Range ("corrupt data:
@@ -35,13 +41,23 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+)
+
+// errBadManifest / errReMarshal are returned by strippedManifest for a file that
+// is not a parseable schemaVersion-2 manifest, or that fails to re-marshal.
+var (
+	errBadManifest = errors.New("bad manifest")
+	errReMarshal   = errors.New("re-marshal manifest")
 )
 
 func main() {
@@ -63,6 +79,15 @@ func main() {
 	fault := faultStatus(faultEnv)
 	faultReset := faultEnv == "reset"
 
+	// MIRROR_TAG_MOVED, when "1"/"true", makes every tag request (not a digest
+	// request) answer with a byte-different-but-valid manifest: the baked manifest
+	// with an extra top-level field. It simulates an upstream tag that was
+	// repackaged (a new revision) while the digest route still serves the original
+	// bytes. The e2e flips it at test time with `kubectl set env` + a rollout, the
+	// same mechanism as MIRROR_FAULT, so a store recovery after the flip must pull
+	// the recorded revision by digest, not whatever the tag now points at.
+	tagMoved := os.Getenv("MIRROR_TAG_MOVED") == "1" || os.Getenv("MIRROR_TAG_MOVED") == "true"
+
 	// The store keeps manifests under a single <registry-host> directory (the host
 	// the model was pulled from at bake time). Discover it so the served repo path
 	// is independent of that bake-time host.
@@ -71,7 +96,13 @@ func main() {
 		log.Fatalf("mirror: no manifests found under %s/manifests/*", store)
 	}
 	host := filepath.Base(hostDirs[0])
-	log.Printf("mirror: store=%s manifestHost=%s addr=%s fault=%d reset=%v", store, host, addr, fault, faultReset)
+	// Index every baked manifest by the sha256 of the bytes we SERVE for it (urls
+	// stripped), so a digest request (Ollaya 0.13.0 pulls a pinned revision by
+	// digest) is answered with the exact bytes the operator recorded. Keyed by bare
+	// hex, value is the on-disk manifest file path.
+	digestIndex := buildDigestIndex(store)
+	log.Printf("mirror: store=%s manifestHost=%s addr=%s fault=%d reset=%v tagMoved=%v digests=%d",
+		store, host, addr, fault, faultReset, tagMoved, len(digestIndex))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -106,8 +137,10 @@ func main() {
 			return
 		}
 		switch {
+		case strings.Contains(p, "/manifests/sha256:"):
+			serveManifestByDigest(w, r, digestIndex)
 		case strings.Contains(p, "/manifests/"):
-			serveManifest(w, r, store, host)
+			serveManifest(w, r, store, host, tagMoved)
 		case strings.Contains(p, "/blobs/"):
 			serveBlob(w, r, store)
 		case p == "/v2/" || p == "/v2":
@@ -141,7 +174,7 @@ func faultStatus(v string) int {
 	}
 }
 
-func serveManifest(w http.ResponseWriter, r *http.Request, store, host string) {
+func serveManifest(w http.ResponseWriter, r *http.Request, store, host string, tagMoved bool) {
 	p := r.URL.Path
 	idx := strings.Index(p, "/manifests/")
 	repo := strings.TrimPrefix(p[:idx], "/v2/")
@@ -152,12 +185,93 @@ func serveManifest(w http.ResponseWriter, r *http.Request, store, host string) {
 		log.Printf("mirror: 404 manifest %s/%s (%v)", repo, tag, err)
 		return
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		http.Error(w, "bad manifest", http.StatusInternalServerError)
+	out, err := strippedManifest(raw)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Strip "urls" so `ollaya pull` fetches blobs from this registry, not upstream.
+	// MIRROR_TAG_MOVED simulates an upstream repackage: the tag now serves a
+	// byte-different (still valid) manifest, so a tag pull would get the new
+	// revision. A digest pull is unaffected (serveManifestByDigest serves the
+	// original bytes). The marker is an added top-level field, which changes the
+	// bytes and therefore the sha256 the client would record for the tag.
+	if tagMoved {
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err == nil {
+			m["ollayaMirrorMoved"] = "true"
+			if moved, err := json.Marshal(m); err == nil {
+				out = moved
+			}
+		}
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		_, _ = w.Write(out)
+		log.Printf("mirror: 200 manifest %s/%s (%d bytes, urls stripped, TAG MOVED)", repo, tag, len(out))
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+	_, _ = w.Write(out)
+	log.Printf("mirror: 200 manifest %s/%s (%d bytes, urls stripped)", repo, tag, len(out))
+}
+
+// serveManifestByDigest answers GET .../manifests/sha256:<hex> with the baked
+// manifest whose SERVED (urls-stripped) bytes hash to <hex>. Ollaya 0.13.0 pulls a
+// pinned revision by digest (spike 011), so the digest route must return the exact
+// bytes the operator recorded, regardless of where the tag now points. An unknown
+// digest is a 404, matching an unknown tag and the real registry's behaviour.
+func serveManifestByDigest(w http.ResponseWriter, r *http.Request, index map[string][]byte) {
+	p := r.URL.Path
+	i := strings.Index(p, "sha256:")
+	hexDigest := p[i+len("sha256:"):]
+	out, ok := index[hexDigest]
+	if !ok {
+		http.NotFound(w, r)
+		log.Printf("mirror: 404 manifest by digest sha256:%s (not baked)", hexDigest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+	_, _ = w.Write(out)
+	log.Printf("mirror: 200 manifest by digest sha256:%s (%d bytes)", hexDigest, len(out))
+}
+
+// buildDigestIndex walks every baked manifest file and maps the sha256 of its
+// SERVED bytes (urls stripped) to those bytes. The served bytes, not the on-disk
+// bytes, are what the operator records as the digest, so the index must key on the
+// same stripping serveManifest applies.
+func buildDigestIndex(store string) map[string][]byte {
+	index := make(map[string][]byte)
+	root := filepath.Join(store, "manifests")
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		raw, err := os.ReadFile(path) // #nosec G304 - walking a fixed store root
+		if err != nil {
+			return nil
+		}
+		out, err := strippedManifest(raw)
+		if err != nil {
+			return nil // not a manifest (e.g. a stray file); skip
+		}
+		sum := sha256.Sum256(out)
+		index[hex.EncodeToString(sum[:])] = out
+		return nil
+	})
+	return index
+}
+
+// strippedManifest parses a baked manifest and removes every config/layer "urls"
+// field so `ollaya pull` fetches blobs from this registry, not upstream. The
+// returned bytes are what the mirror serves and what the operator records as the
+// digest. It is the single source of the stripping both the tag and digest routes
+// use, so their digests stay consistent.
+func strippedManifest(raw []byte) ([]byte, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, errBadManifest
+	}
+	if _, ok := m["schemaVersion"]; !ok {
+		return nil, errBadManifest
+	}
 	if c, ok := m["config"].(map[string]any); ok {
 		delete(c, "urls")
 	}
@@ -170,12 +284,9 @@ func serveManifest(w http.ResponseWriter, r *http.Request, store, host string) {
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
-		http.Error(w, "re-marshal manifest", http.StatusInternalServerError)
-		return
+		return nil, errReMarshal
 	}
-	w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
-	_, _ = w.Write(out)
-	log.Printf("mirror: 200 manifest %s/%s (%d bytes, urls stripped)", repo, tag, len(out))
+	return out, nil
 }
 
 func serveBlob(w http.ResponseWriter, r *http.Request, store string) {
