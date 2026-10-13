@@ -29,9 +29,12 @@ import (
 )
 
 // seedParams returns baseParams whose Model carries a manifest whose sha256
-// matches the Digest, so seeding is enabled.
+// matches the Digest, so seeding is enabled. Seeding is the pre-0.13.0 tag-pull
+// workaround, so the params pin a pre-digest-pull runtime version; on 0.13.0+ the
+// prefetch pulls by digest and skips seeding (covered by the digest-path tests).
 func seedParams(manifest []byte) engine.Params {
 	p := baseParams()
+	p.RuntimeVersion = preDigestPullVersion
 	sum := sha256.Sum256(manifest)
 	p.Model = engine.ModelRef{
 		Name:     modelLayaEn,

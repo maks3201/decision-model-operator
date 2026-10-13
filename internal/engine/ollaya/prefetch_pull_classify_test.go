@@ -22,31 +22,30 @@ import (
 	"testing"
 )
 
-// pullCaseFromScript extracts the real `case "$pull_err" in … esac` block from
-// prefetchScript so the test classifies the exact strings the shipped script
-// classifies (no duplicated patterns).
+// pullCaseFromScript extracts the real `case "$1" in … esac` block from
+// classify_pull_failure() in prefetchScript so the test classifies the exact
+// strings the shipped script classifies (no duplicated patterns).
 func pullCaseFromScript(t *testing.T) string {
 	t.Helper()
-	const start = `case "$pull_err" in`
+	const start = `case "$1" in`
 	i := strings.Index(prefetchScript, start)
 	if i < 0 {
-		t.Fatalf("prefetchScript has no pull_err case")
+		t.Fatalf("prefetchScript has no classify_pull_failure case")
 	}
 	rest := prefetchScript[i:]
 	j := strings.Index(rest, "esac")
 	if j < 0 {
-		t.Fatalf("could not find the end of the pull_err case")
+		t.Fatalf("could not find the end of the classify case")
 	}
 	return rest[:j+len("esac")]
 }
 
-// runPullCase feeds pullErr through the real fail() + pull_err case and returns
+// runPullCase feeds pullErr through the real fail() + classify case and returns
 // the fail() exit code (the prefetch exit the Job reports). No network.
 func runPullCase(t *testing.T, pullErr string) int {
 	t.Helper()
 	prog := "set -u\n" +
 		failFuncFromScript(t) + "\n" +
-		"pull_err=\"$1\"\n" +
 		pullCaseFromScript(t) + "\n"
 	cmd := exec.Command("/bin/sh", "-c", prog, "sh", pullErr)
 	out, err := cmd.CombinedOutput()
@@ -61,10 +60,12 @@ func runPullCase(t *testing.T, pullErr string) int {
 }
 
 // These are the real `ollaya pull` stderr strings observed against
-// ghcr.io/ollaya-dev/ollaya:0.12.1 (see the engine string table). The script
-// must map availability errors to Transient (exit 1), a missing tag to
-// ModelNotFound (exit 3), auth/space/permission and anything unrecognised to
-// Unknown (exit 2) — never a blind Transient catch-all.
+// ghcr.io/ollaya-dev/ollaya:0.12.1, plus the 0.13.0 digest-pull strings from
+// spike 011. The script must map availability errors to Transient (exit 1), a
+// missing tag or an unknown digest to ModelNotFound (exit 3), a digest the
+// registry cannot honour (DIGEST_MISMATCH) to DigestMismatch (exit 4),
+// auth/space/permission and anything unrecognised to Unknown (exit 2) — never a
+// blind Transient catch-all.
 func TestPrefetchPullErrorClassification(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -81,6 +82,12 @@ func TestPrefetchPullErrorClassification(t *testing.T) {
 		{"operation timed out", "Error: operation timed out after 30s", prefetchExitTransient},
 		// missing tag -> ModelNotFound (3)
 		{"model not found in registry", `Error: model "laya:nope" not found in registry ollaya.dev`, prefetchExitModelNotFound},
+		// 0.13.0 digest pull: unknown digest -> MODEL_NOT_FOUND / ModelNotFound (3)
+		{"unknown digest (0.13.0)", `Error: model "laya:en@sha256:0000000000000000000000000000000000000000000000000000000000000000" not found in registry ollaya.dev: it has no manifest with that digest`, prefetchExitModelNotFound},
+		// 0.13.0 digest pull: registry served the wrong bytes for the digest ->
+		// DigestMismatch (4), permanent (retrying the same digest cannot help).
+		{"digest mismatch CLI message (0.13.0)", `Error: the registry served manifest sha256:f6888fde... for "laya:en@sha256:aaaa", not the one its digest names; nothing was stored`, prefetchExitDigestMismatch},
+		{"digest mismatch code (0.13.0)", `Error: DIGEST_MISMATCH`, prefetchExitDigestMismatch},
 		// auth / space / permission / unknown -> Unknown (2)
 		{"401 unauthorized", "Error: HTTP status client error (401 Unauthorized) for url (http://ollaya.dev/v2/...)", prefetchExitUnknown},
 		{"403 forbidden", "Error: HTTP status client error (403 Forbidden) for url (http://ollaya.dev/v2/...)", prefetchExitUnknown},
