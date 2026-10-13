@@ -27,6 +27,13 @@ import (
 	"github.com/maks3201/decision-model-operator/internal/engine"
 )
 
+// preDigestPullVersion is a runtime version below RuntimeDigestPullVersion
+// (0.13.0): the prefetch Job then pulls by tag and seeds the manifest (the
+// pre-0.13.0 path). Tests that exercise seeding, the post-pull digest check and
+// UpstreamTagMoved detection pin this so the default bump to a digest-pull
+// runtime does not silently route them through the digest path.
+const preDigestPullVersion = "0.12.1"
+
 // runPrefetchScript renders the real prefetch script for p and runs it in
 // /bin/sh with a stub `ollaya` on PATH that writes pulledBytes to
 // $OLLAYA_MODELS/$MANIFEST_PATH (standing in for a real `ollaya pull`). The
@@ -86,7 +93,8 @@ func digestOf(b []byte) string {
 // exit with UpstreamTagMoved (5), NOT DigestMismatch (4) — a well-formed but
 // different manifest is a moved tag, which re-pulling the tag cannot fix.
 func TestPrefetchNoSeedTagMovedExitsUpstreamTagMoved(t *testing.T) {
-	p := baseParams() // no Manifest -> no seed
+	p := baseParams()                       // no Manifest -> no seed
+	p.RuntimeVersion = preDigestPullVersion // tag path (UpstreamTagMoved only exists there)
 	// EXPECT_DIGEST is baseParams' recorded laya:en digest; the pull returns a
 	// DIFFERENT but well-formed (schemaVersion 2) manifest.
 	moved := []byte(`{"schemaVersion":2,"config":{"digest":"newer"}}`)
@@ -109,6 +117,7 @@ func TestPrefetchNoSeedTagMovedExitsUpstreamTagMoved(t *testing.T) {
 // the script must exit DigestMismatch (4), distinct from UpstreamTagMoved (5).
 func TestPrefetchNoSeedCorruptManifestExitsDigestMismatch(t *testing.T) {
 	p := baseParams()
+	p.RuntimeVersion = preDigestPullVersion // tag path
 	corrupt := []byte(`not a manifest at all`)
 	if digestOf(corrupt) == p.Model.Digest {
 		t.Fatal("test setup: corrupt manifest must differ from the recorded digest")
