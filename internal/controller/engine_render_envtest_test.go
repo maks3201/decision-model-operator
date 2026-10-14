@@ -171,19 +171,20 @@ var _ = Describe("rendered workloads with the real engine", func() {
 		Expect(jc.Image).To(ContainSubstring("@sha256:"), "default image is digest-pinned")
 		Expect(jc.Image).To(ContainSubstring(":" + ollaya.DefaultRuntimeVersion + "@"))
 
-		By("the manifest is mounted from its ConfigMap (not an env var) when the ConfigMap exists")
+		By("on the default runtime the Job pulls by digest and does not mount the manifest ConfigMap")
 		cm := &corev1.ConfigMap{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "real-manifest-" + rev}, cm)).To(Succeed())
-		// B-070: the engine mounts the manifest ConfigMap read-only instead of
-		// carrying the bytes in an env var (argv/env is capped at 128 KiB). A volume
-		// references the per-revision ConfigMap by name.
-		mountsManifestCM := false
-		for _, v := range job.Spec.Template.Spec.Volumes {
-			if v.ConfigMap != nil && v.ConfigMap.Name == "real-manifest-"+rev {
-				mountsManifestCM = true
+		var modelEnv string
+		for _, e := range jc.Env {
+			if e.Name == "MODEL" {
+				modelEnv = e.Value
 			}
 		}
-		Expect(mountsManifestCM).To(BeTrue(), "the prefetch Job mounts the manifest ConfigMap when it exists")
+		Expect(modelEnv).To(Equal(dm.Spec.Model+"@sha256:"+wantDigest), "the default runtime pulls the pinned digest")
+		for _, v := range job.Spec.Template.Spec.Volumes {
+			Expect(v.ConfigMap == nil || v.ConfigMap.Name != "real-manifest-"+rev).To(BeTrue(),
+				"a digest pull needs no seeded manifest")
+		}
 
 		// Complete the Job so the controller creates the serving Deployment.
 		markJobComplete("real", rev)

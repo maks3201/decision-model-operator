@@ -223,6 +223,7 @@ func TestReadCappedBodyBoundary(t *testing.T) {
 }
 
 func TestCanonicalName(t *testing.T) {
+	const sixtyFourHex = "c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d"
 	tests := []struct {
 		in      string
 		want    string
@@ -248,6 +249,17 @@ func TestCanonicalName(t *testing.T) {
 		// With a non-default host the namespace may contain dots: the host is kept.
 		{"registry.example.com/my.team/laya:en", "registry.example.com/my.team/laya:en", false},
 		{"localhost/laya:en", "localhost/library/laya:en", false},
+		// 0.13.0 digest-pinned names (ollaya-dev/ollaya#64, spike 011): the
+		// "@sha256:<hex>" suffix is parsed off and dropped from the canonical form,
+		// so a model loaded by a pinned name compares equal to its bare form in the
+		// readiness gate. The digest field from /api/ps (bare hex) carries identity.
+		{"laya:en@sha256:" + sixtyFourHex, "laya:en", false},
+		{"Laya:EN@sha256:" + sixtyFourHex, "laya:en", false},
+		{"ollaya.dev/library/laya:en@sha256:" + sixtyFourHex, "laya:en", false},
+		{"laya@sha256:" + sixtyFourHex, "laya:latest", false},
+		// A malformed pin is rejected (not silently kept as part of the tag).
+		{"laya:en@sha256:tooshort", "", true},
+		{"laya:en@notadigest", "", true},
 		{"la*ya", "", true},
 		{"", "", true},
 	}
@@ -290,6 +302,30 @@ func TestCanonicalNameEquivalence(t *testing.T) {
 	}
 	if canon != modelLayaEn {
 		t.Errorf("canonical = %q, want %q", canon, modelLayaEn)
+	}
+}
+
+// TestCanonicalNameDigestPinMatchesGate reproduces the readiness-gate comparison
+// for a 0.13.0 digest-pulled model: /api/ps reports the loaded name with the
+// "@sha256:<hex>" suffix, but the controller compares CanonicalName(spec.model)
+// against CanonicalName(loaded.Name). Both must collapse to the same string so
+// the gate still matches (spike 011).
+func TestCanonicalNameDigestPinMatchesGate(t *testing.T) {
+	const digest = "c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d"
+	specModel := "laya:en"                   // what the DecisionModel pins
+	loadedName := "laya:en@sha256:" + digest // what /api/ps reports after a pinned load
+
+	wantSpec, err := CanonicalName(specModel)
+	if err != nil {
+		t.Fatalf("CanonicalName(%q): %v", specModel, err)
+	}
+	gotLoaded, err := CanonicalName(loadedName)
+	if err != nil {
+		t.Fatalf("CanonicalName(%q): %v", loadedName, err)
+	}
+	if gotLoaded != wantSpec {
+		t.Errorf("gate mismatch: CanonicalName(%q) = %q, CanonicalName(%q) = %q; want equal",
+			loadedName, gotLoaded, specModel, wantSpec)
 	}
 }
 

@@ -350,6 +350,13 @@ func TestInspect(t *testing.T) {
 	const psPinnedFalse = `{"models":[{"name":"kev:en","digest":"deadbeef","device":"cuda",
  "details":{"quantization_level":"F16"},"expires_at":"2026-09-27T17:00:00Z"}]}`
 
+	// Ollaya 0.13.0: a model loaded by a digest-pinned name reports name AND model
+	// as "laya:en@sha256:<hex>", while the digest field stays bare hex (spike 011).
+	const psDigestPinnedName = `{"models":[{"name":"laya:en@sha256:c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d",
+ "model":"laya:en@sha256:c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d",
+ "size":852602879,"digest":"c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d",
+ "details":{"quantization_level":"F32"},"expires_at":null,"device":"cpu"}]}`
+
 	tests := []struct {
 		name    string
 		apiKey  string
@@ -401,6 +408,31 @@ func TestInspect(t *testing.T) {
 			verify: func(t *testing.T, got []engine.Loaded) {
 				if len(got) != 0 {
 					t.Errorf("len = %d, want 0", len(got))
+				}
+			},
+		},
+		{
+			// 0.13.0 digest-pinned load: Inspect returns the name verbatim
+			// (including the @sha256: suffix) and the digest bare. The readiness
+			// gate collapses the pinned name to the bare one via CanonicalName
+			// (covered by TestCanonicalNameDigestPin); the bare digest is the
+			// robust identity key and must stay unprefixed.
+			name:   "digest-pinned name keeps bare digest, name verbatim",
+			status: http.StatusOK,
+			body:   psDigestPinnedName,
+			verify: func(t *testing.T, got []engine.Loaded) {
+				if len(got) != 1 {
+					t.Fatalf("len = %d, want 1", len(got))
+				}
+				m := got[0]
+				if m.Name != "laya:en@sha256:c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d" {
+					t.Errorf("name = %q, want the verbatim pinned name", m.Name)
+				}
+				if m.Digest != "c305a9276531a47000bf93559d2c94f1ed6cbb67055c9151084682dad7655e9d" {
+					t.Errorf("digest = %q, want bare hex (no sha256: prefix)", m.Digest)
+				}
+				if m.Device != "cpu" || m.Precision != "F32" || !m.Pinned {
+					t.Errorf("device/precision/pinned mismatch: %+v", m)
 				}
 			},
 		},

@@ -404,6 +404,10 @@ type parsedName struct {
 	namespace string
 	model     string
 	tag       string
+	// pinnedDigest is the bare hex of a trailing "@sha256:<hex>" pin, or "" when
+	// the name carried none. Recorded for completeness; canonical() omits it so a
+	// pinned name compares equal to its bare form in the readiness gate.
+	pinnedDigest string
 }
 
 // canonical returns the shortest canonical name with the tag always shown,
@@ -530,15 +534,37 @@ func looksLikeHost(seg string) bool {
 	return strings.Contains(s, ".") || strings.Contains(s, ":")
 }
 
-// parseName parses [host/][namespace/]model[:tag] per docs/api.md §3, applying
-// normalization (trim, lowercase). Invalid names return an error without any
-// network call. The tag is split only from the last path segment.
+// parseName parses [host/][namespace/]model[:tag][@sha256:<hex>] per docs/api.md
+// §3, applying normalization (trim, lowercase). Invalid names return an error
+// without any network call. The tag is split only from the last path segment.
+//
+// A trailing "@sha256:<64 hex>" pin (Ollaya 0.13.0, ollaya-dev/ollaya#64) is
+// parsed off and recorded in parsedName.pinnedDigest but intentionally dropped
+// from canonical(): a model loaded by a pinned name is reported by /api/ps as
+// "laya:en@sha256:<hex>" (spike 011), and the readiness gate must still match it
+// against the bare "laya:en" (the gate keys identity off the separate /api/ps
+// "digest" field, which stays bare hex). Stripping the pin here lets CanonicalName
+// collapse both forms to the same string.
 func parseName(name string) (parsedName, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return parsedName{}, fmt.Errorf("ollaya: empty model name")
 	}
 	lower := strings.ToLower(trimmed)
+
+	// Split off an optional "@sha256:<hex>" digest pin before any other parsing.
+	// It is validated and remembered, never fed to the host/namespace/tag split.
+	pinnedDigest := ""
+	if at := strings.LastIndex(lower, "@"); at >= 0 {
+		pin := lower[at+1:]
+		rest := lower[:at]
+		pinHex := strings.TrimPrefix(pin, "sha256:")
+		if pinHex == pin || !digestHexRE.MatchString(pinHex) {
+			return parsedName{}, fmt.Errorf("ollaya: model name %q has an invalid digest pin (want @sha256:<64 hex>)", name)
+		}
+		pinnedDigest = pinHex
+		lower = rest
+	}
 
 	// A leading http:// or https:// scheme belongs to the host; strip it before
 	// splitting on "/" and re-attach it to the host segment afterwards.
@@ -604,6 +630,7 @@ func parseName(name string) (parsedName, error) {
 	if !namePartRE.MatchString(p.tag) {
 		return parsedName{}, fmt.Errorf("ollaya: invalid tag in model name %q", name)
 	}
+	p.pinnedDigest = pinnedDigest
 	return p, nil
 }
 
@@ -1044,10 +1071,16 @@ func setAuth(req *http.Request, apiKey string) {
 const (
 	// DefaultRuntimeVersion is the Ollaya release this operator build defaults to
 	// when a DecisionModel pins no version and sets no explicit image.
-	DefaultRuntimeVersion = "0.12.1"
+	DefaultRuntimeVersion = "0.13.0"
 	// MinRuntimeVersion is the oldest release we have verified; older versions are
 	// rejected by ValidateRuntimeVersion.
 	MinRuntimeVersion = "0.7.3"
+	// RuntimeDigestPullVersion is the first release whose CLI and /api/pull accept
+	// a pinned name "<name>[:<tag>]@sha256:<hex>" and verify the manifest against
+	// that digest before writing anything (ollaya-dev/ollaya#64, spike 011). On
+	// this version or newer the prefetch Job pulls by digest; older pinned
+	// runtimes keep the tag-pull + seed-manifest + post-pull-verify path.
+	RuntimeDigestPullVersion = "0.13.0"
 
 	imageRepo = "ghcr.io/ollaya-dev/ollaya"
 )
@@ -1063,6 +1096,11 @@ type runtimeImageDigest struct {
 	cpu string
 	// cuda is the sha256 of the -cuda image's OCI index (empty if unknown).
 	cuda string
+	// Note: 0.13.0 also publishes a `-cuda12` variant (index
+	// sha256:e2787b27bfd6e8d611c536fb11f167962fabca2b1fd9f532944fd94e78d6edfd,
+	// amd64-only; spike 011). The engine renders only :tag and :tag-cuda, so there
+	// is no cuda12 field today; add one here and in imageForVersion if a cuda12
+	// device class is introduced.
 }
 
 // runtimeImageDigests pins the engine's known runtime versions to their image
@@ -1084,6 +1122,9 @@ type runtimeImageDigest struct {
 //	0.12.0-cuda  index sha256:ee3c316db37b1dfc828bd8bf5db1d269c98e49ad4918cf2e18748292e1f178e7  (linux/amd64 only)
 //	0.12.1       index sha256:3df3abed69968abd8957f07edb9658b82d23e483dd10d946e4b7b9af4359d38c  (linux/amd64 + linux/arm64)
 //	0.12.1-cuda  index sha256:65b5213ac30c68f93d6cd8554602d90ca85854f68e1e8339c41fce6e7644c470  (linux/amd64 only)
+//	0.13.0       index sha256:31f749def61165d7bbb15def4e3d799a403461e0b8b777f359a924bb9b845ce6  (linux/amd64 + linux/arm64)
+//	0.13.0-cuda  index sha256:03ba657824d300e1cbcf05e5ef67045e52cdfc2b86caebbbc434a63168490d24  (linux/amd64 only)
+//	0.13.0-cuda12 index sha256:e2787b27bfd6e8d611c536fb11f167962fabca2b1fd9f532944fd94e78d6edfd (linux/amd64 only)
 var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.7.3": {
 		cpu:  "sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9",
@@ -1104,6 +1145,10 @@ var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.12.1": {
 		cpu:  "sha256:3df3abed69968abd8957f07edb9658b82d23e483dd10d946e4b7b9af4359d38c",
 		cuda: "sha256:65b5213ac30c68f93d6cd8554602d90ca85854f68e1e8339c41fce6e7644c470",
+	},
+	"0.13.0": {
+		cpu:  "sha256:31f749def61165d7bbb15def4e3d799a403461e0b8b777f359a924bb9b845ce6",
+		cuda: "sha256:03ba657824d300e1cbcf05e5ef67045e52cdfc2b86caebbbc434a63168490d24",
 	},
 }
 
@@ -1135,6 +1180,11 @@ var (
 // runtimeVersionRE matches a plain MAJOR.MINOR.PATCH version (no "v" prefix, no
 // pre-release/build suffix), matching the ghcr tag form.
 var runtimeVersionRE = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// digestHexRE matches a bare sha256 digest: exactly 64 lowercase hex chars (the
+// form Ollaya reports in /api/ps and the controller records in status). parseName
+// uses it to validate an "@sha256:<hex>" name pin.
+var digestHexRE = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // InvalidRuntimeVersionError is returned by ValidateRuntimeVersion for a version
 // the engine will not build an image from. It is a typed error so the controller
@@ -1279,6 +1329,16 @@ func (e *Engine) RuntimeImagePinned(version, device string) bool {
 // comparable (treated as "unknown").
 func comparableVersion(v string) bool {
 	return runtimeVersionRE.MatchString(v) && ValidateRuntimeVersion(v) == nil
+}
+
+// supportsDigestPull reports whether the resolved runtime version can pull a
+// pinned name "<name>[:<tag>]@sha256:<hex>" (ollaya-dev/ollaya#64, spike 011):
+// true for a comparable version >= RuntimeDigestPullVersion. An empty, malformed
+// or below-minimum version is not comparable and returns false, so the prefetch
+// Job keeps the tag-pull path for anything the engine cannot positively place at
+// or above 0.13.0.
+func supportsDigestPull(version string) bool {
+	return comparableVersion(version) && compareVersions(version, RuntimeDigestPullVersion) >= 0
 }
 
 // RuntimeVersionFromImage implements engine.RuntimeVersioner: it extracts the
@@ -1721,30 +1781,76 @@ if [ -n "${MANIFEST_SEED_FILE:-}" ] || [ -n "${MANIFEST_SEED_B64:-}" ]; then
 fi
 pull_err="$(ollaya pull -- "$MODEL" 2>&1 1>/dev/null)" || {
   echo "$pull_err" >&2
-  case "$pull_err" in
-    # Permanent: the registry has no such tag.
-    *"not found in registry"*|*"not found"*)
-      fail ` + PrefetchReasonModelNotFound + ` ` + prefetchExitModelNotFoundStr + ` ;;
-    # Positively-identified availability errors (retry): transport failures
-    # (DNS, connection refused/reset, timeout -> "error sending request for url")
-    # and retryable HTTP statuses 408/429/5xx. Strings verified against
-    # ollaya 0.12.1 (see the engine's string table).
-    *"error sending request for url"*|*"operation timed out"*|*"timed out"*|\
-    *"HTTP status server error ("*|\
-    *"HTTP status client error (408 "*|*"HTTP status client error (429 "*)
-      fail ` + PrefetchReasonTransient + ` ` + prefetchExitTransientStr + ` ;;
-    # Not positively transient and not permanent: auth (401/403), out of space,
-    # permission denied -> Unknown. Retrying the same request will not help
-    # without operator action (fix credentials / free disk / fix permissions),
-    # but it is not a "permanent" model error, so it is surfaced as Unknown
-    # rather than silently retried as transient.
-    *"HTTP status client error (401 "*|*"HTTP status client error (403 "*|\
-    *"no space left on device"*|*"permission denied"*)
-      fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
-    # Anything else: Unknown (never a blind Transient catch-all).
-    *)
-      fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
-  esac
+  # classify_pull_failure maps an "ollaya pull" stderr string to a fail() call.
+  # $1 is the error text. It is a function so the digest-path not-found fallback
+  # can reuse the exact same classification for the tag pull's error.
+  classify_pull_failure() {
+    case "$1" in
+      # Permanent: the registry has no such tag, or (0.13.0 digest pull) no
+      # manifest with the requested digest. Ollaya 0.13.0 reports an unknown
+      # digest as MODEL_NOT_FOUND / "it has no manifest with that digest"
+      # (spike 011), which the "not found" patterns already cover.
+      *"not found in registry"*|*"not found"*)
+        fail ` + PrefetchReasonModelNotFound + ` ` + prefetchExitModelNotFoundStr + ` ;;
+      # Permanent (0.13.0 digest pull): the registry served a manifest whose bytes
+      # do not hash to the requested digest; the runtime refuses it BEFORE writing
+      # anything (HTTP 502 DIGEST_MISMATCH, "not the one its digest names; nothing
+      # was stored", spike 011). Retrying the same digest cannot fix a registry
+      # that serves the wrong bytes, so this is a permanent DigestMismatch — not a
+      # moved tag (a pinned digest pull never silently returns a different
+      # revision). It never triggers the tag fallback below.
+      *"its digest names"*|*"DIGEST_MISMATCH"*)
+        fail ` + PrefetchReasonDigestMismatch + ` ` + prefetchExitDigestMismatchStr + ` ;;
+      # Positively-identified availability errors (retry): transport failures
+      # (DNS, connection refused/reset, timeout -> "error sending request for url")
+      # and retryable HTTP statuses 408/429/5xx. Strings verified against
+      # ollaya 0.12.1 (see the engine's string table).
+      *"error sending request for url"*|*"operation timed out"*|*"timed out"*|\
+      *"HTTP status server error ("*|\
+      *"HTTP status client error (408 "*|*"HTTP status client error (429 "*)
+        fail ` + PrefetchReasonTransient + ` ` + prefetchExitTransientStr + ` ;;
+      # Not positively transient and not permanent: auth (401/403), out of space,
+      # permission denied -> Unknown. Retrying the same request will not help
+      # without operator action (fix credentials / free disk / fix permissions),
+      # but it is not a "permanent" model error, so it is surfaced as Unknown
+      # rather than silently retried as transient.
+      *"HTTP status client error (401 "*|*"HTTP status client error (403 "*|\
+      *"no space left on device"*|*"permission denied"*)
+        fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
+      # Anything else: Unknown (never a blind Transient catch-all).
+      *)
+        fail ` + PrefetchReasonUnknown + ` ` + prefetchExitUnknownStr + ` ;;
+    esac
+  }
+  # not_found_class reports whether an error string is the permanent not-found
+  # class (an unknown tag, or on the digest path a registry/mirror that does not
+  # serve the by-digest manifest route and answers 404). Only this class triggers
+  # the tag fallback; DIGEST_MISMATCH and transient/unknown never do.
+  not_found_class() {
+    case "$1" in
+      *"not found in registry"*|*"not found"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  # Digest-path fallback (FALLBACK_MODEL set only on the digest path, to the bare
+  # tag). If the pinned pull failed because the registry has no by-digest route
+  # (not-found class), retry once with today's tag path so upgrading a 0.12 setup
+  # whose mirror serves only /manifests/<tag> keeps working. The post-pull sha256
+  # check below still runs, so a tag that moved upstream ends as UpstreamTagMoved
+  # and corruption as DigestMismatch — exactly 0.12 behaviour. No seed is mounted
+  # on the digest path, so this fallback runs unseeded: a moved tag is caught by
+  # the post-pull check (UpstreamTagMoved), it is simply not pre-written. Every
+  # other digest-pull failure keeps its classification (handled above).
+  if [ -n "${FALLBACK_MODEL:-}" ] && not_found_class "$pull_err"; then
+    echo "digest pull of $MODEL failed with a not-found error; the registry may not serve the by-digest manifest route. Falling back to the tag pull of $FALLBACK_MODEL." >&2
+    tag_err="$(ollaya pull -- "$FALLBACK_MODEL" 2>&1 1>/dev/null)" || {
+      echo "$tag_err" >&2
+      classify_pull_failure "$tag_err"
+    }
+    # Tag pull succeeded: fall through to the post-pull digest verification.
+  else
+    classify_pull_failure "$pull_err"
+  fi
 }
 if [ -z "${EXPECT_DIGEST:-}" ]; then
   echo "no expected digest; skipping verification"
@@ -1967,24 +2073,60 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 		manifestPath = parsed.manifestDiskPath(e.manifestHostDirFor(p))
 	}
 
+	// On a runtime that supports pull-by-digest (>= 0.13.0; the engine knows the
+	// version from resolvedRuntimeVersion(p) — p.RuntimeVersion or the engine
+	// default), and when the revision recorded a digest, pull the pinned name
+	// "<model>@sha256:<digest>" instead of the bare tag. Ollaya 0.13.0 fetches
+	// /manifests/sha256:<hex>, verifies the bytes against <hex> BEFORE writing
+	// anything, and stores the manifest under the tag path (spike 011), so
+	// MANIFEST_PATH is unchanged and the post-pull sha256 check below stays as
+	// defence in depth. Seeding (the pre-0.13.0 workaround) is skipped: the pinned
+	// pull is itself verified before any write. If the registry/mirror does not
+	// serve the by-digest manifest route (a not-found 404), the script falls back
+	// once to the tag pull (FALLBACK_MODEL) so a 0.12-era setup keeps working after
+	// an upgrade; on that fallback a moved tag is caught by the post-pull check as
+	// UpstreamTagMoved, exactly as on 0.12 without a seed. Only engaged for the
+	// real prefetch script (a refuse script leaves pullModel as the bare name,
+	// which it never pulls).
+	// A user-set image (spec.image) without an explicit runtimeVersion has an
+	// unknown version; an older binary rejects "name@sha256:" as an invalid name,
+	// so only pull by digest when the version is known to support it.
+	knownVersion := p.Image == "" || p.RuntimeVersion != ""
+	digestPull := script == prefetchScript && p.Model.Digest != "" && knownVersion &&
+		supportsDigestPull(resolvedRuntimeVersion(p))
+	pullModel := p.Model.Name
+	if digestPull {
+		pullModel = p.Model.Name + "@sha256:" + p.Model.Digest
+	}
+
 	env := []corev1.EnvVar{
-		{Name: "MODEL", Value: p.Model.Name},
+		{Name: "MODEL", Value: pullModel},
 		{Name: "EXPECT_DIGEST", Value: p.Model.Digest},
 		{Name: "OLLAYA_MODELS", Value: modelsMount},
 		{Name: "MANIFEST_PATH", Value: manifestPath},
 	}
+	// On the digest path, carry the bare tag as FALLBACK_MODEL so the script can
+	// retry the tag pull if the registry/mirror does not serve the by-digest
+	// manifest route (a not-found 404). This keeps a 0.12-era setup working after
+	// an upgrade; the post-pull sha256 check still gates the result. Unset on the
+	// tag path (nothing to fall back to).
+	if digestPull {
+		env = append(env, corev1.EnvVar{Name: "FALLBACK_MODEL", Value: p.Model.Name})
+	}
 
-	// Seed the recorded manifest bytes before pulling. This does NOT make a moved
-	// tag recoverable: `ollaya pull <tag>` overwrites the on-disk manifest with
-	// the tag's CURRENT bytes (ollaya-dev/ollaya#64), so after the pull the store
-	// holds whatever the tag now points at. If that differs from EXPECT_DIGEST the
-	// post-pull check fails the Job with UpstreamTagMoved — the pinned revision
-	// cannot be rebuilt by re-pulling a tag that moved. The seed's value is defence
-	// in depth: a seed whose sha256 != EXPECT_DIGEST fails fast (DigestMismatch)
-	// BEFORE any pull, and it gives the controller a verified copy of the expected
-	// manifest. A future runtime that supports pull-by-digest
-	// (`<name>:<tag>@sha256:<hex>`) will let us pin without relying on the tag; it
-	// is not available in any runtime version we support today (see docs).
+	// Seed the recorded manifest bytes before pulling. This path runs only on
+	// runtimes WITHOUT pull-by-digest (< 0.13.0) or when the revision has no
+	// recorded digest; the digest-pull path above (digestPull) skips seeding
+	// because the pinned pull verifies the manifest before writing. On the tag
+	// path, seeding does NOT make a moved tag recoverable: `ollaya pull <tag>`
+	// overwrites the on-disk manifest with the tag's CURRENT bytes
+	// (ollaya-dev/ollaya#64), so after the pull the store holds whatever the tag
+	// now points at. If that differs from EXPECT_DIGEST the post-pull check fails
+	// the Job with UpstreamTagMoved — the pinned revision cannot be rebuilt by
+	// re-pulling a tag that moved; that is exactly what the digest-pull path on
+	// 0.13.0+ fixes. The seed's value is defence in depth: a seed whose sha256 !=
+	// EXPECT_DIGEST fails fast (DigestMismatch) BEFORE any pull, and it gives the
+	// controller a verified copy of the expected manifest.
 	//
 	// Two sources, picked by the controller and never both:
 	//   - ManifestConfigMap set: mount that key read-only and point the script at
@@ -2002,8 +2144,9 @@ func (e *Engine) PrefetchJobSpec(p engine.Params) batchv1.JobSpec {
 	var seedVolumes []corev1.Volume
 	var seedVolumeMounts []corev1.VolumeMount
 	switch {
-	case script != prefetchScript || manifestPath == "" || !seedManifestUsable(p.Model):
-		// no seed (refuse script, unknown path, or unusable bytes)
+	case digestPull || script != prefetchScript || manifestPath == "" || !seedManifestUsable(p.Model):
+		// no seed: digest-pull verifies before writing (seeding is the pre-0.13.0
+		// workaround), or a refuse script, unknown path, or unusable bytes
 	case p.ManifestConfigMap != nil:
 		env = append(env, corev1.EnvVar{
 			Name:  "MANIFEST_SEED_FILE",

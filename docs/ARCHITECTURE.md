@@ -37,9 +37,9 @@ Verified against code, docs and local runs on 2026-09-27 (details in `docs/spike
 | `laya-serve`: FastAPI, `/v1/systemone`, `/health`; one inference at a time per Pod | `laya/serve.py` | concurrency 1 → scale out; autoscale on in-flight/queue |
 | Laya does not pin the HF revision (`snapshot_download` without `revision`) | `laya/agent.py` | the operator must resolve and pin versions itself |
 | Laya silently falls back to CPU on OOM / missing CUDA; `/health` does not show it | `laya/agent.py`, `serve.py` | the operator needs its own check of the actual device |
-| **Ollaya** (`ollaya-dev/ollaya`, 0.12.1, Rust): "Ollama for decision models". Laya, Kev, JevK5, decider, NLI, GLiClass behind one API; weights pinned to commit + sha256; `/v1/systemone`, `/api/pull`, `/api/ps`, `/api/decide` (load/unload, `keep_alive`), `503 QUEUE_FULL` | README, `docs/api.md` | **primary runtime**: the multi-model abstraction already exists |
+| **Ollaya** (`ollaya-dev/ollaya`, 0.13.0, Rust): "Ollama for decision models". Laya, Kev, JevK5, decider, NLI, GLiClass behind one API; weights pinned to commit + sha256; `/v1/systemone`, `/api/pull`, `/api/ps`, `/api/decide` (load/unload, `keep_alive`), `503 QUEUE_FULL` | README, `docs/api.md` | **primary runtime**: the multi-model abstraction already exists |
 | Ollaya has no `/metrics`; liveness is `GET /` (200 even with an API key); no implicit pull | `docs/api.md` | readiness and prefetch are the operator's job |
-| Image `ghcr.io/ollaya-dev/ollaya:0.12.1` (native arm64 + amd64; `:0.12.1-cuda` amd64 only), rendered as `repo:tag@sha256:<index>`: `ollaya serve`, `0.0.0.0:11435`, UID 1000 | spikes 001, 006 | near-default PodSpec |
+| Image `ghcr.io/ollaya-dev/ollaya:0.13.0` (native arm64 + amd64; `:0.13.0-cuda` amd64 only), rendered as `repo:tag@sha256:<index>`: `ollaya serve`, `0.0.0.0:11435`, UID 1000 | spikes 001, 006 | near-default PodSpec |
 | `/api/ps` reports `name`, `digest`, `device`, precision, `expires_at` | spike 001 | `Inspect()` for the readiness gate |
 | `POST /api/decide {"model":…,"keep_alive":-1}` loads and pins a model | spike 001 | `Warmup()` is one request |
 | Serving from a **read-only** store works; `pull` on a RO store fails | spike 001 | serving Pods mount the PVC read-only; only the prefetch Job writes |
@@ -306,7 +306,7 @@ cluster-scoped and is installed by a cluster admin.
 
 ## 8. Resources and scheduling
 
-- `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.12.1-cuda` image. GPU behaviour verified on EKS
+- `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.13.0-cuda` image. GPU behaviour verified on EKS
   (g4dn.xlarge, T4, Bottlerocket; re-verified on 0.12.1-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
   (only the exact `cuda:<n>` form; anything else fails the gate). A blue-green rollout needs a
   second GPU for the candidate; on a single GPU set `rollout.strategy: Recreate` so the stable is
@@ -323,11 +323,11 @@ cluster-scoped and is installed by a cluster admin.
 - Engine API key from a Secret (`OLLAYA_API_KEY`); the prober and evaluator use the same key.
   Secrets and user ConfigMaps (golden datasets) are read through the uncached API reader with `get`-only RBAC.
   The operator also writes one owned ConfigMap per revision, `<dm>-manifest-<rev>`, holding the raw model
-  manifest; the prefetch Job seeds the store from it and verifies the digest. This does **not** rebuild a
-  revision whose tag moved upstream: `ollaya pull <tag>` replaces the seeded manifest with the tag's current one
-  (confirmed upstream, ollaya-dev/ollaya#64), the digest check then fails with `UpstreamTagMoved` and nothing
-  else is served. Until the registry and CLI support pulling by digest, the only way to restore an exact revision
-  after its tag moved is a copy of the store volume (e.g. a VolumeSnapshot of `<dm>-store-<rev>`). The ConfigMap
+  manifest. On Ollaya 0.13.0 and later the prefetch Job pulls `<model>@sha256:<digest>`, which restores the exact
+  revision even after its tag moved upstream (ollaya-dev/ollaya#64, spike 011); if the registry or mirror has no
+  by-digest route it falls back to the tag. On older runtimes the Job seeds the store from the ConfigMap and pulls
+  the tag: a moved tag then fails with `UpstreamTagMoved` and only a copy of the store volume (e.g. a
+  VolumeSnapshot of `<dm>-store-<rev>`) restores the revision. Either way the digest is verified after the pull. The ConfigMap
   is written after the candidate is admitted and deleted by name with its revision. ConfigMap RBAC is
   `get`, `create` and `delete` only: no `list`, `watch` or informer.
 - Multi-tenant guards: `--allowed-registries` (default `ollaya.dev`),
