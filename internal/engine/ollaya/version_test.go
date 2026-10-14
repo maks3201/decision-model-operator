@@ -31,7 +31,8 @@ func TestValidateRuntimeVersion(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty is default (valid)", "", false},
-		{"default version", "0.12.1", false},
+		{"default version", "0.13.0", false},
+		{"prior default still valid", "0.12.1", false},
 		{"minimum version", "0.7.3", false},
 		{"newer version", "1.2.3", false},
 		{"patch above minimum", "0.7.4", false},
