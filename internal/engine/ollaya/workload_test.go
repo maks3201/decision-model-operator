@@ -335,8 +335,12 @@ func TestPrefetchJobSpec(t *testing.T) {
 	}
 
 	env := envMap(c.Env)
-	if env["MODEL"].Value != modelLayaEn {
-		t.Errorf("MODEL = %q", env["MODEL"].Value)
+	// Default runtime is >= 0.13.0, so the prefetch pulls the pinned name
+	// "<model>@sha256:<digest>" (digest-pull path); MANIFEST_PATH is unchanged
+	// (the manifest is still stored under the tag).
+	wantModel := modelLayaEn + "@sha256:" + baseParams().Model.Digest
+	if env["MODEL"].Value != wantModel {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"].Value, wantModel)
 	}
 	if env["EXPECT_DIGEST"].Value != baseParams().Model.Digest {
 		t.Errorf("EXPECT_DIGEST = %q", env["EXPECT_DIGEST"].Value)
