@@ -21,7 +21,7 @@
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-dmo}"
-OLLAYA_IMAGE="${OLLAYA_IMAGE:-ghcr.io/ollaya-dev/ollaya:0.12.1}"
+OLLAYA_IMAGE="${OLLAYA_IMAGE:-ghcr.io/ollaya-dev/ollaya:0.13.0}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}"
 KIND_CONFIG="${KIND_CONFIG:-}"
 # Docker Hub rate-limits anonymous pulls from shared CI runners (429). Pull the
