@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/maks3201/decision-model-operator/compare/v0.5.1...v0.6.0) (2026-10-14)
+
+
+### Features
+
+* pull pinned models by digest on Ollaya 0.13.0 and make it the default runtime ([#184](https://github.com/maks3201/decision-model-operator/issues/184)) ([4aea440](https://github.com/maks3201/decision-model-operator/commit/4aea440deacab13438f0447a8be55cb4d32dbaf0))
+
 ## [0.5.1](https://github.com/maks3201/decision-model-operator/compare/v0.5.0...v0.5.1) (2026-10-13)
 
 
