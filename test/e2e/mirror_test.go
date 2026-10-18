@@ -70,6 +70,7 @@ var _ = Describe("Registry mirror", Label("mirror"), Ordered, func() {
 		// loaded the mirror image into the kind node in BeforeSuite.
 		installAndDeploy()
 
+		ensureMirrorImageOnNode()
 		By("deploying the mirror Deployment + Service")
 		_, _ = utils.Kubectl("create", "ns", mirrorNS)
 		applyYAML(fmt.Sprintf(`apiVersion: apps/v1
@@ -238,4 +239,14 @@ func mirrorManifestDigest(repo, tag string) string {
 
 	sum := sha256.Sum256([]byte(body))
 	return hex.EncodeToString(sum[:])
+}
+
+// ensureMirrorImageOnNode (re)loads the mirror image into the kind node. Every
+// mirror spec removes the image from the node in its AfterAll to save runner disk,
+// so a later mirror spec in the same run would otherwise hit ErrImageNeverPull.
+// BeforeSuite built the image into the host Docker, so this is a local copy.
+func ensureMirrorImageOnNode() {
+	By("loading the registry mirror image into the kind node")
+	Expect(utils.LoadImageToKindClusterWithName(mirrorImage)).To(Succeed(),
+		"failed to load the mirror image into kind")
 }

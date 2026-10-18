@@ -678,6 +678,7 @@ spec:
 // deployMirror brings up the in-cluster registry mirror Deployment + Service (the
 // same shape the mirror spec uses) and waits for it to be Available.
 func deployMirror() {
+	ensureMirrorImageOnNode()
 	By("deploying the registry mirror")
 	_, _ = utils.Kubectl("create", "ns", mirrorNS)
 	applyYAML(fmt.Sprintf(`apiVersion: apps/v1
