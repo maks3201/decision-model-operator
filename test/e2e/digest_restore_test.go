@@ -189,6 +189,7 @@ spec:
 // be Available. Kept separate from deployMirror so flipping MIRROR_TAG_MOVED here
 // never races the chaos container's mirror lifecycle.
 func deployDigestRestoreMirror() {
+	ensureMirrorImageOnNode()
 	_, _ = utils.Kubectl("create", "ns", digestRestoreMirrorNS)
 	applyYAML(fmt.Sprintf(`apiVersion: apps/v1
 kind: Deployment
