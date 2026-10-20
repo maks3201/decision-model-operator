@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/maks3201/decision-model-operator/compare/v0.6.0...v0.6.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* cap condition and Event messages at the API limits ([a20d8a2](https://github.com/maks3201/decision-model-operator/commit/a20d8a226bf64a2dbf9091845f2df51004d40164))
+* keep missing and unscorable answers out of ECE and Brier ([a20d8a2](https://github.com/maks3201/decision-model-operator/commit/a20d8a226bf64a2dbf9091845f2df51004d40164))
+* treat 404 MODEL_NOT_FOUND during evaluation as transient ([a20d8a2](https://github.com/maks3201/decision-model-operator/commit/a20d8a226bf64a2dbf9091845f2df51004d40164))
+
 ## [0.6.0](https://github.com/maks3201/decision-model-operator/compare/v0.5.1...v0.6.0) (2026-10-18)
 
 
