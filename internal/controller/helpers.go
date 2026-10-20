@@ -653,12 +653,64 @@ func shortDigest(digest string) string {
 	return digest
 }
 
+// maxConditionMessageBytes is the CRD cap on a condition's message field
+// (metav1.Condition.Message, +kubebuilder:validation:MaxLength=32768). A message
+// longer than this makes the API server reject the whole status update, so the
+// rollout can neither progress nor roll back. Messages carrying a runtime error
+// body (up to 1 MiB) must therefore be truncated before they reach a condition.
+const maxConditionMessageBytes = 32768
+
+// maxEventNoteBytes is Kubernetes' cap on an Event note (events.k8s.io/v1 limits
+// the note to 1 KiB). An over-long note makes the Event create fail; truncate to
+// stay under the limit.
+const maxEventNoteBytes = 1024
+
+// truncatedSuffix is appended to a message/note that had to be shortened, so a
+// reader can tell the text is not complete.
+const truncatedSuffix = "… (truncated)"
+
+// truncateMessage shortens s to at most maxBytes bytes, cutting on a UTF-8 rune
+// boundary and appending truncatedSuffix. The returned string (including the
+// suffix) never exceeds maxBytes. A string already within the limit is returned
+// unchanged. Used for condition messages and Event notes, both of which carry a
+// hard byte cap at the API server.
+func truncateMessage(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Reserve room for the suffix. If the suffix alone does not fit (pathological
+	// tiny cap), fall back to a plain rune-safe cut of s.
+	budget := maxBytes - len(truncatedSuffix)
+	if budget <= 0 {
+		return cutOnRuneBoundary(s, maxBytes)
+	}
+	return cutOnRuneBoundary(s, budget) + truncatedSuffix
+}
+
+// cutOnRuneBoundary returns the longest prefix of s that is at most maxBytes
+// bytes and does not split a multi-byte UTF-8 rune.
+func cutOnRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	// Back up off any UTF-8 continuation byte (0b10xxxxxx) so we never slice
+	// through the middle of a rune.
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
 // setStatusCondition sets a condition on dm.Status.Conditions, stamping
 // ObservedGeneration with dm.Generation first (tech.md rule: every condition
 // carries observedGeneration). Use this instead of meta.SetStatusCondition
-// directly so no condition is ever written without it.
+// directly so no condition is ever written without it. The message is capped to
+// the CRD limit (maxConditionMessageBytes): an unbounded runtime error string
+// would otherwise make every status update fail and wedge the rollout.
 func setStatusCondition(dm *decisionmodelv1alpha1.DecisionModel, cond metav1.Condition) {
 	cond.ObservedGeneration = dm.Generation
+	cond.Message = truncateMessage(cond.Message, maxConditionMessageBytes)
 	meta.SetStatusCondition(&dm.Status.Conditions, cond)
 }
 

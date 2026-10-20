@@ -76,15 +76,26 @@ jobs:
 
       - name: Scan latest released image
         env:
-          IMAGE: "ghcr.io/maks3201/decision-model-operator:v0.1.1"
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Resolve the latest release tag at run time so the current release is
+          # always scanned. Fail hard if it cannot be resolved rather than fall
+          # back to a stale image that no longer reflects what is published.
+          tag="$(gh release view --json tagName --jq '.tagName')"
+          if [ -z "$tag" ]; then
+            echo "could not resolve the latest release tag" >&2
+            exit 1
+          fi
+          image="ghcr.io/${GH_REPO}:${tag}"
+          echo "Scanning $image"
           trivy image \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
             --format sarif \
             --output trivy-results.sarif \
-            "$IMAGE"
+            "$image"
 
       - name: Upload SARIF to code scanning
         uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0

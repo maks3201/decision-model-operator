@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -231,6 +232,55 @@ var _ = Describe("eval blip does not promote", func() {
 		for _, c := range getDM("og").Status.Conditions {
 			Expect(c.ObservedGeneration).To(Equal(gen2), "condition %s observedGeneration updated", c.Type)
 		}
+	})
+
+	// A runtime rejection whose detail is larger than the CRD's 32768-byte
+	// message cap must still produce a persisted status: setStatusCondition
+	// truncates the Evaluated message so the API server accepts the update,
+	// instead of rejecting every write and wedging the rollout.
+	It("persists a truncated Evaluated message when the cause exceeds the CRD cap", func() {
+		huge := strings.Repeat("Z", 64*1024) // 64 KiB, well over the 32768 cap
+		eng := &deciderFakeEngine{fakeEngine: newFakeEngine(), choice: "billing", rejectDetail: huge}
+		eng.rejectErr.Store(true)
+		r := newReconciler(eng, &fakeProber{loaded: engine.Loaded{Name: model, Digest: defaultDigest, Device: "cpu"}})
+		Expect(k8sClient.Create(ctx, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "golden-big"},
+			Data:       map[string]string{"cases.jsonl": `{"state":{},"questions":{"q1":{"type":"choice","criteria":{"billing":"b","other":"o","refund":"r"}}},"expected":{"q1":"billing"}}` + "\n"},
+		})).To(Succeed())
+		dm := &decisionmodelv1alpha1.DecisionModel{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "big"},
+			Spec: decisionmodelv1alpha1.DecisionModelSpec{
+				Engine: "ollaya", Model: model, Device: "cpu", Replicas: int32Ptr(1),
+				Rollout: &decisionmodelv1alpha1.RolloutSpec{Evaluation: &decisionmodelv1alpha1.EvaluationSpec{
+					DatasetRef:  decisionmodelv1alpha1.DatasetRef{ConfigMapRef: &decisionmodelv1alpha1.DatasetKeyRef{Name: "golden-big", Key: "cases.jsonl"}},
+					MinAccuracy: "0.90",
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, dm)).To(Succeed())
+		rec(r, "big")
+		rev := RevisionHash(getDM("big").Spec, defaultDigest, fakeImage)
+		markJob("big", rev)
+		rec(r, "big")
+		createReadyPod("big", rev, "big-pod-0")
+
+		// The eval hits the oversized rejection and holds with DatasetInvalid. The
+		// status write must SUCCEED (API server would reject an over-cap message),
+		// so the condition is observable and its message is within the CRD cap.
+		Eventually(func() string {
+			rec(r, "big")
+			c := meta_Find(getDM("big"), decisionmodelv1alpha1.ConditionEvaluated)
+			if c == nil {
+				return ""
+			}
+			return c.Reason
+		}, "5s", "50ms").Should(Equal(reasonDatasetInvalid))
+		cond := meta_Find(getDM("big"), decisionmodelv1alpha1.ConditionEvaluated)
+		Expect(len(cond.Message)).To(BeNumerically("<=", maxConditionMessageBytes),
+			"message must be capped to the CRD limit so the status write is accepted")
+		Expect(cond.Message).To(HaveSuffix(truncatedSuffix))
+		// The persisted status proves the API server accepted the update.
+		Expect(getDM("big").Status.Phase).To(Equal(decisionmodelv1alpha1.PhaseEvaluating))
 	})
 })
 

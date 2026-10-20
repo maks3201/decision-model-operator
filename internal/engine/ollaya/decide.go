@@ -98,9 +98,10 @@ func (e *Engine) Decide(ctx context.Context, baseURL, apiKey string, req engine.
 	if uerr := json.Unmarshal(body, &sr); uerr != nil {
 		// On a non-2xx with an unparseable body, still surface the status and
 		// classify it: a 4xx the runtime rejects cannot be fixed by retrying.
+		// No code is available here, so classification is by status alone.
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			err := fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
-			return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode)
+			return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode, "")
 		}
 		return engine.DecideResponse{}, fmt.Errorf("ollaya: decide %q: invalid JSON: %w", req.Model, uerr)
 	}
@@ -113,7 +114,7 @@ func (e *Engine) Decide(ctx context.Context, baseURL, apiKey string, req engine.
 		} else {
 			err = fmt.Errorf("ollaya: decide %q: unexpected status %d", req.Model, resp.StatusCode)
 		}
-		return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode)
+		return engine.DecideResponse{}, wrapIfRejected(err, resp.StatusCode, sr.Code)
 	}
 
 	return engine.DecideResponse{Answers: mapAnswers(sr.Answers)}, nil
@@ -160,19 +161,33 @@ func (e *Engine) doDecideWithQueueRetry(ctx context.Context, newReq func() (*htt
 
 // wrapIfRejected wraps err with engine.ErrRequestRejected when the status is one
 // the runtime will reject identically on a retry, so the evaluator must treat the
-// case as a dataset/case error rather than a transient transport failure.
+// case as a dataset/case error rather than a transient transport failure. code is
+// the error code from the response body (docs/api.md §4), empty when the body did
+// not parse.
 //
 // Rejected (permanent): any 4xx EXCEPT the ones below. Verified against the
-// runtime (0.10.0): 400 INVALID_JSON (malformed body), 404 MODEL_NOT_FOUND
-// (unknown/unloaded model), 422 INVALID_REQUEST (missing field, wrong field type,
-// unknown question type) are all deterministic for a given request.
+// runtime (0.10.0): 400 INVALID_JSON (malformed body) and 422 INVALID_REQUEST
+// (missing field, wrong field type, unknown question type) are deterministic for
+// a given request.
 //
-// Not rejected (left transient): 401, 403 (auth — a key/permission problem the
-// operator can fix, not the request), 408 (request timeout), 409 (conflict) and
-// 429 (rate limited) can all succeed on a retry. 5xx and network errors never
-// reach here as a status (they surface earlier or as non-4xx) and stay transient.
-func wrapIfRejected(err error, status int) error {
+// Not rejected (left transient):
+//   - 404 MODEL_NOT_FOUND. The model may be temporarily unloaded (a Pod restart,
+//     an unload, or an eval that races the warmup); a warmup/retry can restore it.
+//     Treating it as rejected makes the evaluator cache the run as DatasetInvalid
+//     under the dataset hash and hold the candidate in Evaluating until the
+//     timeout even after the model is back. A 404 with any OTHER code (or none) is
+//     still request-caused and stays rejected — only MODEL_NOT_FOUND is transient.
+//   - 401, 403 (auth — a key/permission problem the operator can fix, not the
+//     request), 408 (request timeout), 409 (conflict) and 429 (rate limited) can
+//     all succeed on a retry. 5xx and network errors never reach here as a status
+//     (they surface earlier or as non-4xx) and stay transient.
+func wrapIfRejected(err error, status int, code string) error {
 	if status < 400 || status >= 500 {
+		return err
+	}
+	// 404 MODEL_NOT_FOUND is transient (model unloaded, not a bad request); any
+	// other 404 stays rejected.
+	if status == http.StatusNotFound && code == "MODEL_NOT_FOUND" {
 		return err
 	}
 	switch status {
