@@ -239,7 +239,8 @@ func (r *DecisionModelReconciler) flushEvents(dm *decisionmodelv1alpha1.Decision
 		return
 	}
 	for _, e := range st.events {
-		r.Recorder.Eventf(dm, nil, e.eventType, e.reason, e.reason, e.note, e.args...)
+		note := truncateMessage(fmt.Sprintf(e.note, e.args...), maxEventNoteBytes)
+		r.Recorder.Eventf(dm, nil, e.eventType, e.reason, e.reason, "%s", note)
 	}
 	st.events = nil
 }
@@ -371,5 +372,6 @@ func (r *DecisionModelReconciler) event(
 	if r.Recorder == nil {
 		return
 	}
-	r.Recorder.Eventf(dm, nil, eventType, reason, reason, noteFmt, args...)
+	note := truncateMessage(fmt.Sprintf(noteFmt, args...), maxEventNoteBytes)
+	r.Recorder.Eventf(dm, nil, eventType, reason, reason, "%s", note)
 }

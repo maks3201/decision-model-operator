@@ -67,6 +67,10 @@ type deciderFakeEngine struct {
 	// runtime rejected the case as invalid). Atomic so a test can clear it after a
 	// dataset "fix".
 	rejectErr atomic.Bool
+	// rejectDetail, when non-empty, is appended to the rejection error so a test
+	// can drive an oversized (> CRD cap) cause into the Evaluated condition
+	// message. Empty keeps the default short message.
+	rejectDetail string
 	// decideCalls counts Decide invocations so a test can assert the runtime was
 	// never called (e.g. a dataset rejected at parse time must not reach Decide).
 	decideCalls atomic.Int64
@@ -79,6 +83,9 @@ func (d *deciderFakeEngine) Decide(
 ) (engine.DecideResponse, error) {
 	d.decideCalls.Add(1)
 	if d.rejectErr.Load() {
+		if d.rejectDetail != "" {
+			return engine.DecideResponse{}, fmt.Errorf("%w: %s", engine.ErrRequestRejected, d.rejectDetail)
+		}
 		return engine.DecideResponse{}, fmt.Errorf("%w: 422 bad case schema", engine.ErrRequestRejected)
 	}
 	if d.decideErr.Load() {

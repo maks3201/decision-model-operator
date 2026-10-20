@@ -242,8 +242,10 @@ func TestDecideScoreProbabilitiesKept(t *testing.T) {
 
 // TestDecideRejectedStatusClassification pins which statuses wrap
 // engine.ErrRequestRejected (permanent) and which stay transient. Status codes
-// and bodies match the real runtime (0.10.0): 404 MODEL_NOT_FOUND, 422
-// INVALID_REQUEST, 400 INVALID_JSON are rejected; 401 UNAUTHORIZED is not.
+// and bodies match the real runtime (0.10.0): 422 INVALID_REQUEST and 400
+// INVALID_JSON are rejected; 404 MODEL_NOT_FOUND is transient (the model may be
+// temporarily unloaded) while any other 404 stays rejected; 401 UNAUTHORIZED is
+// not rejected.
 func TestDecideRejectedStatusClassification(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -252,7 +254,9 @@ func TestDecideRejectedStatusClassification(t *testing.T) {
 		rejected bool
 	}{
 		{"400 invalid json", 400, `{"error":"invalid JSON","code":"INVALID_JSON"}`, true},
-		{"404 model not found", 404, `{"error":"not found","code":"MODEL_NOT_FOUND"}`, true},
+		{"404 model not found is transient", 404, `{"error":"not found","code":"MODEL_NOT_FOUND"}`, false},
+		{"404 other code stays rejected", 404, `{"error":"no route","code":"NOT_FOUND"}`, true},
+		{"404 unparseable body stays rejected", 404, `not json at all`, true},
 		{"413 payload too large", 413, `{"error":"too big","code":"PAYLOAD_TOO_LARGE"}`, true},
 		{"422 invalid request", 422, `{"error":"bad field","code":"INVALID_REQUEST"}`, true},
 		{"418 other 4xx", 418, `{"error":"teapot","code":"TEAPOT"}`, true},

@@ -175,10 +175,12 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 		if a.Noul == nil {
 			// No predicted side: scored, wrong, and counted as the sentinel class
 			// (not the opposite class) so all "no usable answer" cases are treated
-			// alike — a miss for the expected class, never a silent pass.
+			// alike — a miss for the expected class, never a silent pass. It does NOT
+			// feed calibration (hasCalibration stays false): a missing noul value has
+			// no confidence, and a confidence-0/wrong prediction would dilute ECE and
+			// inflate calibratedCases, the same way a missing answer would.
 			cls.scored, cls.correct = true, false
 			cls.predictedClass = noClass
-			cls.pred, cls.hasCalibration = calibration.Prediction{Confidence: 0, Correct: false}, true
 			return cls
 		}
 		p := calibration.FromNoul(*a.Noul, want)
@@ -339,9 +341,12 @@ func runEvaluation(
 			if !ok {
 				// Missing answer: a miss for the expected class. Still record it for
 				// macro-F1 (predicted = sentinel) so a candidate that skips a class
-				// cannot score macro-F1 1.0 on the classes it did answer.
+				// cannot score macro-F1 1.0 on the classes it did answer. It does NOT
+				// feed calibration: a missing answer has no confidence, and counting
+				// it as a perfectly-calibrated (confidence 0, wrong) prediction would
+				// lower ECE and inflate calibratedCases, letting a candidate pass
+				// maxECEIncrease by omitting answers.
 				failed++
-				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
 				if classifiable {
 					records = append(records, eval.Record{QuestionID: qid, Expected: expClass, Predicted: noClass})
 				}
@@ -357,9 +362,11 @@ func runEvaluation(
 			if !out.scored {
 				// Unknown answer type or malformed expected value: a miss. Record it
 				// against the expected class (sentinel predicted) when the expected
-				// value itself is classifiable.
+				// value itself is classifiable. Like a missing answer it does NOT feed
+				// calibration: an unscorable answer carries no usable confidence, and
+				// counting it as confidence-0/wrong would dilute ECE and inflate
+				// calibratedCases.
 				failed++
-				preds = append(preds, calibration.Prediction{Confidence: 0, Correct: false})
 				if classifiable {
 					records = append(records, eval.Record{QuestionID: qid, Expected: expClass, Predicted: noClass})
 				}
