@@ -227,6 +227,7 @@ const (
 	eventUnpinnedRuntimeImage    = "UnpinnedRuntimeImage"
 	eventServingImageApplied     = "ServingImageApplied"
 	eventReplicasCoLocated       = "ReplicasCoLocated"
+	eventServingPodsRecreated    = "ServingPodsRecreated"
 	eventStableStopped           = "StableStopped"
 	eventStableRestored          = "StableRestored"
 	eventManifestRepaired        = "ManifestRepaired"

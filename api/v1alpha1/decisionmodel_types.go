@@ -853,6 +853,15 @@ type DecisionModelStatus struct {
 	// +optional
 	Replicas ReplicaStatus `json:"replicas,omitempty"`
 
+	// Selector is the label selector of the stable revision's serving Pods, in the
+	// form the scale subresource reports to autoscalers (HPA and KEDA list the Pods
+	// they average resource metrics over with it). It selects the stable revision
+	// only: not prefetch Pods and not a candidate. Empty until a stable revision
+	// exists. It is derived from status.stableRevision on every status write, so it
+	// follows promotion and rollback.
+	// +optional
+	Selector string `json:"selector,omitempty"`
+
 	// Evaluation records the most recent eval-gated rollout result.
 	// +operator-sdk:csv:customresourcedefinitions:type=status,displayName="Evaluation",xDescriptors={"urn:alm:descriptor:com.tectonic.ui:text"}
 	// +optional
@@ -868,6 +877,7 @@ type DecisionModelStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas.desired,selectorpath=.status.selector
 // +kubebuilder:resource:shortName=dm
 // +kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.stableRevision.model`
 // +kubebuilder:printcolumn:name="Candidate",type=string,JSONPath=`.status.candidateRevision.model`

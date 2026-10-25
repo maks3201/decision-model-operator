@@ -24,6 +24,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -162,6 +163,9 @@ func (r *DecisionModelReconciler) persistStatus(
 ) (persisted, conflict bool, err error) {
 	dm.Status.ObservedGeneration = dm.Generation
 	dm.Status.Endpoint = r.endpoint(dm)
+	// Derived from status.stableRevision in the same patch, so the autoscaler
+	// selector can never disagree with the stable revision it describes.
+	dm.Status.Selector = stableSelector(dm)
 	st := reconcileStateFrom(ctx)
 	if st != nil && st.base != nil {
 		patch := client.MergeFromWithOptions(st.base, client.MergeFromWithOptimisticLock{})
@@ -374,4 +378,15 @@ func (r *DecisionModelReconciler) event(
 	}
 	note := truncateMessage(fmt.Sprintf(noteFmt, args...), maxEventNoteBytes)
 	r.Recorder.Eventf(dm, nil, eventType, reason, reason, "%s", note)
+}
+
+// stableSelector returns the status.selector value: the label selector of the
+// stable revision's serving Pods (name + revision labels), or "" when no stable
+// revision exists. Prefetch Pods and candidate Pods are excluded by the revision
+// label, so resource-metric autoscalers average over the stable replicas only.
+func stableSelector(dm *decisionmodelv1alpha1.DecisionModel) string {
+	if dm.Status.StableRevision == nil || dm.Status.StableRevision.Hash == "" {
+		return ""
+	}
+	return labels.SelectorFromSet(revisionLabels(dm, dm.Status.StableRevision.Hash)).String()
 }

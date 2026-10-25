@@ -24,7 +24,45 @@ objects.
 You do **not** need `ignoreDifferences` for the `DecisionModel` itself: `status`
 is a Kubernetes subresource on this CRD (`subresources.status: {}`), so neither
 tool treats `status` as part of the desired manifest and there is nothing to
-ignore there.
+ignore there. The one exception is `spec.replicas` when an autoscaler owns it;
+see the next section.
+
+## Autoscaling and `spec.replicas`
+
+When KEDA or an HPA scales a DecisionModel (see [autoscaling.md](autoscaling.md)),
+it writes `spec.replicas` through the `scale` subresource. Git still says the old
+value, so Argo CD and Flux would revert it. Tell them to ignore only that field.
+
+Argo CD (`Application`; the field names are from the Argo CD diffing customization
+documentation):
+
+```yaml
+spec:
+  ignoreDifferences:
+    - group: decisionmodel.io
+      kind: DecisionModel
+      jsonPointers:
+        - /spec/replicas
+```
+
+Flux with a `HelmRelease` that renders the DecisionModel (the field names are from
+the Flux `HelmRelease` drift-detection documentation):
+
+```yaml
+spec:
+  driftDetection:
+    mode: enabled
+    ignore:
+      - paths: ["/spec/replicas"]
+        target:
+          kind: DecisionModel
+```
+
+Flux with a plain `Kustomization` is not covered here: this was not verified against
+its documentation, so do not copy the `HelmRelease` snippet into it without checking.
+
+Keep `spec.replicas` out of Git (or set it once to the autoscaler's minimum) so the
+two writers do not disagree at the next sync.
 
 ## Argo CD — custom health check
 

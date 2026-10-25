@@ -451,7 +451,7 @@ func (r *DecisionModelReconciler) ensureDeployment(
 	if getErr == nil {
 		liveAffinity = dep.Spec.Template.Spec.Affinity
 	}
-	announceColocated := r.applyServingColocation(ctx, dm, &podSpec, liveAffinity, labels, rev, desired, accessModes)
+	announceColocated := r.applyServingColocation(ctx, dm, &podSpec, liveAffinity, getErr == nil, labels, rev, desired, accessModes)
 
 	// The strategy keeps any in-place template change from deadlocking on the
 	// store or on GPUs.
@@ -519,9 +519,11 @@ func (r *DecisionModelReconciler) ensureDeployment(
 		return nil
 	}
 
-	// Keep replicas, template and scheduling in sync (in-place update).
-	// TODO(autoscaling): once HPA/KEDA may own spec.replicas, stop enforcing it
-	// here and reconcile only the template.
+	// Keep replicas, template and scheduling in sync (in-place update). Replicas
+	// are enforced from spec.replicas on purpose: an autoscaler (KEDA, HPA) writes
+	// spec.replicas through the DecisionModel scale subresource, so its decisions
+	// land here and are reconciled to the Deployment, while an out-of-band
+	// `kubectl scale` of the Deployment is still reverted (see docs/autoscaling.md).
 	if dep.Annotations == nil {
 		dep.Annotations = map[string]string{}
 	}
@@ -557,6 +559,7 @@ func (r *DecisionModelReconciler) applyServingColocation(
 	dm *decisionmodelv1alpha1.DecisionModel,
 	podSpec *corev1.PodSpec,
 	liveAffinity *corev1.Affinity,
+	liveExists bool,
 	labels map[string]string,
 	rev string,
 	desired int32,
@@ -571,6 +574,15 @@ func (r *DecisionModelReconciler) applyServingColocation(
 				"revision %s: all %d replicas are co-located on the node holding the ReadWriteOnce "+
 					"model store; a node failure takes all replicas down. Use a ReadWriteMany store "+
 					"(spec.cache.accessModes) to spread replicas across nodes.", rev, desired)
+		}
+		// Crossing the 1 / N>1 boundary on an existing Deployment changes the Pod
+		// template (the co-location term). The Recreate strategy of a ReadWriteOnce
+		// store then recreates the serving Pods, so announce the transition once.
+		if liveExists && colocating != hadColocation {
+			r.event(ctx, dm, corev1.EventTypeWarning, eventServingPodsRecreated,
+				"revision %s: spec.replicas crossed 1 on a ReadWriteOnce store; the co-location affinity "+
+					"changed the serving Pod template, so the Recreate strategy recreated the serving Pods "+
+					"(model-load downtime). Autoscale with minReplicaCount of 2 or more, or use a ReadWriteMany store.", rev)
 		}
 	}
 }

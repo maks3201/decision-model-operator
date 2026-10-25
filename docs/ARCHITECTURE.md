@@ -25,7 +25,8 @@ lifecycle. The evaluation engine decides quality. Promotion decides whether a ca
 active. Only the adapter knows the runtime.
 
 Non-goals: generic model serving (KServe, KubeAI, Ollama operators), GPU scheduling, autoscaling
-(stay compatible with HPA/KEDA), a model registry, experiment tracking, LLM text generation,
+(the operator does not autoscale; a DecisionModel is a KEDA/HPA scale target, see `docs/autoscaling.md`),
+a model registry, experiment tracking, LLM text generation,
 multi-cluster, distributed inference.
 
 ## 2. Facts the design is built on
@@ -137,6 +138,7 @@ status:
   failedRevision: null
   evaluation: { accuracy: "0.9400", baselineAccuracy: "0.9300", cases: 500 }
   replicas: { desired: 2, modelReady: 2 }
+  selector: decisionmodel.io/name=support-router,decisionmodel.io/revision=7c9f…   # autoscaler selector (stable revision only)
   conditions: [Resolved, Cached, ModelReady, Evaluated, Promoted, Ready, Degraded]
 ```
 
@@ -205,6 +207,11 @@ In-place rules:
   any in-place change is a short outage; that is the price of no Multi-Attach / GPU deadlock.
 - Known limit: an `auth` secret-ref change rolls the stable in place, and the prober uses the
   current key for every revision; a per-revision key is a v0.2 item.
+
+Autoscaling: the `DecisionModel` serves the `scale` subresource. An autoscaler (HPA or KEDA) writes
+`spec.replicas` through `/scale`; the minimum is 1 (a 0 or negative write is rejected by the schema).
+`status.selector` is the label selector of the stable revision's serving Pods and is set in the same
+status write as `status.stableRevision`.
 
 Manual promotion: `spec.rollout.manualPromotion: true` parks a candidate that passed its
 gate in `AwaitingPromotion` until `decisionmodel.io/promote=<candidate hash>` is set; no timeout
@@ -306,6 +313,10 @@ cluster-scoped and is installed by a cluster admin.
 
 ## 8. Resources and scheduling
 
+- A ReadWriteOnce store with `replicas` crossing 1 (1 ↔ N) changes the serving Pod template (the
+  co-location affinity), so the Recreate strategy recreates the serving Pods. The operator emits a
+  Warning `ServingPodsRecreated` on each crossing. Changes between 2 and 3 replicas do not recreate
+  Pods. Autoscale with `minReplicaCount` of 2 or more, or use a ReadWriteMany store.
 - `device: cuda` → `nvidia.com/gpu: 1`, `OLLAYA_DEVICE=cuda`, `:0.18.0-cuda` image (the default CUDA image; not yet run on a GPU, last GPU run was on 0.12.1-cuda). GPU behaviour verified on EKS
   (g4dn.xlarge, T4, Bottlerocket; re-verified on 0.12.1-cuda): `/api/ps` reports `cuda:0`, which the gate treats as class `cuda`
   (only the exact `cuda:<n>` form; anything else fails the gate). A blue-green rollout needs a
@@ -372,7 +383,7 @@ Stages, not version numbers; the [CHANGELOG](https://github.com/maks3201/decisio
 | Stage | Scope |
 |---|---|
 | **Released** | `DecisionModel`, `ollaya` engine, CPU + CUDA, per-revision PVC store + prefetch Job, readiness gate (digest + device + pinned), blue-green switch, eval-gated and manual promotion (accuracy, ECE/Brier), security guards, namespace-scoped mode, conditions, Events, e2e on kind |
-| Next | per-revision API key, autoscaling (KEDA on in-flight / queue), metrics, node-local cache, GPU e2e |
+| Next | per-revision API key, CPU autoscaling via KEDA/HPA documented (`docs/autoscaling.md`; in-flight/queue signal open), metrics, node-local cache, GPU e2e |
 | Later | shadow traffic (agreement rate), confidence cascade / fallback to an LLM |
 
 ## 13. Open questions

@@ -32,3 +32,12 @@ rules:
   - decisionmodels/status
   verbs:
   - get
+# kubectl scale and autoscalers (KEDA, HPA) write spec.replicas through this subresource.
+- apiGroups:
+  - decisionmodel.io
+  resources:
+  - decisionmodels/scale
+  verbs:
+  - get
+  - patch
+  - update

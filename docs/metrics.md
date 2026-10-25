@@ -125,6 +125,9 @@ A tighter, phase-independent variant that fires whenever replicas fall short:
 decisionmodel_model_ready_replicas < decisionmodel_desired_replicas
 ```
 
+This variant also fires on every scale-up: `desired` rises at once, while `modelReady` lags until the
+new replicas load the model. Use it for dashboards, or with a `for:` longer than the model load time.
+
 ### Silent model mismatch
 
 Pods pass Kubernetes readiness but load the wrong digest/device.
