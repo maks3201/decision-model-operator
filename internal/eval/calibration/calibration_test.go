@@ -173,6 +173,13 @@ func TestFromChoice(t *testing.T) {
 	if !ok || !approx(p.Confidence, 1) {
 		t.Errorf("clamp: got %+v ok=%v", p, ok)
 	}
+
+	// A non-finite probability for the chosen label is not a usable confidence.
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, ok := FromChoice(map[string]float64{"x": v}, "x", "x"); ok {
+			t.Errorf("FromChoice with %v must return ok=false", v)
+		}
+	}
 }
 
 func TestFromNoul(t *testing.T) {
@@ -192,12 +199,25 @@ func TestFromNoul(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := FromNoul(tt.pYes, tt.expected)
+			p, ok := FromNoul(tt.pYes, tt.expected)
+			if !ok {
+				t.Fatalf("FromNoul(%v,%v) ok=false, want a prediction", tt.pYes, tt.expected)
+			}
 			if !approx(p.Confidence, tt.wantConf) || p.Correct != tt.wantOK {
 				t.Errorf("FromNoul(%v,%v) = %+v, want conf %v correct %v",
 					tt.pYes, tt.expected, p, tt.wantConf, tt.wantOK)
 			}
 		})
+	}
+
+	// NaN and ±Inf are not predictions: no confidence, so no calibration input.
+	// (A NaN used to read as a confident "no".)
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, expected := range []bool{true, false} {
+			if _, ok := FromNoul(v, expected); ok {
+				t.Errorf("FromNoul(%v,%v) ok=true, want false", v, expected)
+			}
+		}
 	}
 }
 
