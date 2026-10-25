@@ -145,6 +145,7 @@ decision-model-operator decides a new version is ready when it is *right*:
 - it never rewrites the running production revision while a candidate is tried.
 
 It does not try to be a general serving platform, a GPU scheduler, an autoscaler or a model registry.
+Autoscaling: KEDA/HPA can target a DecisionModel (`docs/autoscaling.md`); the operator does not autoscale.
 
 ## How evaluation works
 

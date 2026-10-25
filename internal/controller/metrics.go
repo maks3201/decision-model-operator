@@ -53,6 +53,7 @@ const (
 	metricEvaluationECE           = "decisionmodel_evaluation_ece"
 	metricEvaluationMacroF1       = "decisionmodel_evaluation_macro_f1"
 	metricProbeResultsTotal       = "decisionmodel_probe_results_total"
+	metricServingPodsRecreated    = "decisionmodel_serving_pods_recreated_total"
 	metricRegistryResolveDuration = "decisionmodel_registry_resolve_duration_seconds"
 	metricRevisionInfo            = "decisionmodel_revision_info"
 	metricCondition               = "decisionmodel_condition"
@@ -168,6 +169,18 @@ var (
 			"(ready, digest_mismatch, device_mismatch, error).",
 	}, []string{labelNamespace, labelName, labelResult})
 
+	// servingPodsRecreatedTotal counts how often a ReadWriteOnce store's serving
+	// Pods were recreated because spec.replicas crossed the 1 / N>1 boundary and
+	// the co-location affinity changed the Pod template. Incremented immediately
+	// at the emit point (the matching ServingPodsRecreated Event), not through the
+	// status-write buffer: the transition is read from live cluster state and can
+	// be observed at most once, so a failed status write must not drop the signal.
+	servingPodsRecreatedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricServingPodsRecreated,
+		Help: "Total serving-Pod recreations caused by spec.replicas crossing 1 on a " +
+			"ReadWriteOnce store (the co-location affinity changed the Pod template).",
+	}, []string{labelNamespace, labelName})
+
 	registryResolveDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    metricRegistryResolveDuration,
 		Help:    "Duration of a model registry tag->digest resolution, in seconds.",
@@ -206,6 +219,7 @@ func init() {
 		evaluationMacroF1Gauge,
 		probeResultsTotal,
 		registryResolveDuration,
+		servingPodsRecreatedTotal,
 		revisionInfoGauge,
 		conditionGauge,
 	)
@@ -299,6 +313,7 @@ func deleteMetrics(namespace, name string) {
 	evaluationECEGauge.DeletePartialMatch(l)
 	evaluationMacroF1Gauge.DeletePartialMatch(l)
 	probeResultsTotal.DeletePartialMatch(l)
+	servingPodsRecreatedTotal.DeletePartialMatch(l)
 	revisionInfoGauge.DeletePartialMatch(l)
 	conditionGauge.DeletePartialMatch(l)
 }

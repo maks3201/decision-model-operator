@@ -1,0 +1,39 @@
+# KEDA ScaledObject that drives spec.replicas of a DecisionModel.
+#
+# Not listed in config/samples/kustomization.yaml: applying it needs the KEDA CRDs.
+# Install KEDA first (verified with chart 2.21.0, see docs/autoscaling.md).
+#
+# minReplicaCount is 2 on purpose. On a ReadWriteOnce model store, a scale between 1
+# and 2 replicas adds or removes the co-location affinity in the Pod template, and the
+# Recreate strategy then recreates the serving Pods (model-load downtime on the first
+# scale-up). Use minReplicaCount: 1 only with a ReadWriteMany store (spec.cache.accessModes).
+# Never 0: the operator does not scale to zero (the model store and the readiness gate
+# need at least one serving Pod).
+#
+# The CPU trigger is utilisation relative to the Pod's CPU request, so the target
+# DecisionModel must set resources.requests.cpu (decisionmodel_v1alpha1_decisionmodel.yaml does).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: decisionmodel-sample
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: decisionmodel.io/v1alpha1
+    kind: DecisionModel
+    name: decisionmodel-sample
+  minReplicaCount: 2
+  maxReplicaCount: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Do not scale in on a short dip: every scale-in is a Pod removal and a
+          # reload of the model on the next scale-out.
+          stabilizationWindowSeconds: 600
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        # Spike 013: CPU tracks load up to saturation; target 60-70% of the request.
+        value: "65"
