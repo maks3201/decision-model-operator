@@ -17,9 +17,11 @@ concurrency:
   # commit, so a release commit gets its own group (keyed by SHA) and is never
   # cancelled by a later push.
   group: >-
-    ${{ github.workflow }}-${{ github.ref }}${{
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request' && 'pull-requests' || github.ref }}${{
     startsWith(github.event.head_commit.message, 'chore(main): release') && format('-{0}', github.sha) || '' }}
-  cancel-in-progress: true
+  # PR E2E runs share one external model download path. Queue them instead of
+  # making each Dependabot PR pull the same weights concurrently.
+  cancel-in-progress: false
 
 env:
   # The pinned Ollaya runtime image; kept in sync with hack/kind-up.sh and
