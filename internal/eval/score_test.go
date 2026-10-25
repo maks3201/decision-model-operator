@@ -200,6 +200,14 @@ func TestParseScoreExpected(t *testing.T) {
 		{"null rejected", "null", 0, true},
 		{"empty rejected", "", 0, true},
 		{"object rejected", "{}", 0, true},
+		// Upper bound: the highest level is 9 (Ollaya: 2–10 levels, 0 first).
+		{"highest level accepted", "9", 9, false},
+		{"highest level as float accepted", "9.0", 9, false},
+		{"first level above the bound rejected", "10", 0, true},
+		{"1e300 rejected (no int overflow)", "1e300", 0, true},
+		{"9.3e18 rejected", "9.3e18", 0, true},
+		{"2^63 rejected", "9223372036854775808", 0, true},
+		{"1e400 rejected (outside float64)", "1e400", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -217,5 +225,28 @@ func TestParseScoreExpected(t *testing.T) {
 				t.Errorf("ParseScoreExpected(%s) = %d, want %d", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+// Keys that Atoi accepts but that are not the canonical decimal of their level
+// would map two keys onto one level, so the result would depend on map order.
+// They must make the distribution unusable every time (50 runs for map order).
+func TestScoreCalibrationNonCanonicalKeysAlwaysUnusable(t *testing.T) {
+	cases := []struct {
+		name  string
+		probs map[string]float64
+	}{
+		{"+0 and 0", map[string]float64{"0": 0.5, "+0": 0.5}},
+		{"00 and 0", map[string]float64{"0": 0.5, "00": 0.5}},
+		{"0 and 01", map[string]float64{"0": 0.5, "01": 0.5}},
+		{"+0 and 1", map[string]float64{"+0": 0.5, "1": 0.5}},
+		{"-0 and 1", map[string]float64{"-0": 0.5, "1": 0.5}},
+	}
+	for _, tc := range cases {
+		for i := 0; i < 50; i++ {
+			if _, _, ok := ScoreCalibration(tc.probs, 0); ok {
+				t.Fatalf("%s: ScoreCalibration ok=true on run %d, want false", tc.name, i)
+			}
+		}
 	}
 }

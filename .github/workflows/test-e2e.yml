@@ -17,17 +17,15 @@ concurrency:
   # commit, so a release commit gets its own group (keyed by SHA) and is never
   # cancelled by a later push.
   group: >-
-    ${{ github.workflow }}-${{ github.event_name == 'pull_request' && 'pull-requests' || github.ref }}${{
+    ${{ github.workflow }}-${{ github.ref }}${{
     startsWith(github.event.head_commit.message, 'chore(main): release') && format('-{0}', github.sha) || '' }}
-  # PR E2E runs share one external model download path. Queue them instead of
-  # making each Dependabot PR pull the same weights concurrently.
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   # The pinned Ollaya runtime image; kept in sync with hack/kind-up.sh and
   # internal/engine/ollaya DefaultRuntimeVersion. Cached across runs (keyed by
   # this ref) so a shard does not re-pull it every time.
-  OLLAYA_IMAGE: ghcr.io/ollaya-dev/ollaya:0.13.0
+  OLLAYA_IMAGE: ghcr.io/ollaya-dev/ollaya:0.18.0
 
 jobs:
   # Decide whether the heavy E2E matrix needs to run. A docs-only change (only

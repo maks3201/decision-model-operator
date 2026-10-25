@@ -54,16 +54,27 @@ a kind node [[3]](#refs). Two established options:
   plugin" steps with `nvkind cluster create` and its device-plugin install. It is
   the cleaner path when a runner has multiple GPUs.
 
-The operator selects the CUDA runtime image (`ghcr.io/ollaya-dev/ollaya:0.13.0-cuda`)
+The operator selects the CUDA runtime image (`ghcr.io/ollaya-dev/ollaya:0.18.0-cuda`)
 automatically from `device: cuda` (see the engine `imageFor`), so the workflow
-only needs to **load that image into kind** and set `E2E_DEVICE=cuda`.
+only needs to **load that image into kind** and set `E2E_DEVICE=cuda`. `0.18.0-cuda` is not verified on a GPU yet.
 
-> **Pascal / Volta GPUs (compute capability < 7.5):** the default `:0.13.0-cuda`
+> **Pascal / Volta GPUs (compute capability < 7.5):** the default `:0.18.0-cuda`
 > image targets newer CUDA runtimes. On older cards (e.g. GTX 10-series Pascal, or
-> some Volta setups) use the `:0.13.0-cuda12` image instead, set explicitly via
-> `spec.image` with the operator run with `--allow-image-override`. The operator
-> does **not** pick the `-cuda12` variant automatically — there is no device-level
-> GPU-architecture detection; choose it yourself when your GPU needs it.
+> some Volta setups) use the `-cuda12` image instead. The operator does **not** pick
+> it automatically (there is no device-level GPU-architecture detection), so set it
+> yourself:
+>
+> - run the operator with `--allow-image-override` (without it `spec.image` is refused
+>   with `ImageOverrideNotAllowed`);
+> - set `spec.image` to the digest-pinned reference
+>   `ghcr.io/ollaya-dev/ollaya:0.18.0-cuda12@sha256:da484c2c85f86771d27463253d914d4513651d44be976f059f6a0369a350208c`.
+>   A `spec.image` containing `@sha256:` is admitted without `--allow-unpinned-runtime-images`;
+>   an unpinned tag is refused (`UnpinnedRuntimeImage`) unless that flag is also set.
+> - a user-set `spec.image` has no `runtimeVersion`, so its version is unknown and the
+>   prefetch Job pulls the tag, not the digest. A moved tag is then reported as
+>   `UpstreamTagMoved` instead of being restored by digest.
+>
+> The `-cuda12` image is not verified on a GPU yet.
 
 ## 3. Register the runner (private repo)
 

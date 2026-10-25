@@ -34,9 +34,15 @@ const (
 	// expected integer level. 0.5 means "rounds to the expected level".
 	DefaultScoreTolerance = 0.5
 
-	// minScoreLevels / maxScoreLevels bound a valid level set (docs/api.md: 2–10).
+	// minScoreLevels / maxScoreLevels bound a valid level set (docs/api.md of
+	// Ollaya v0.18.0: "score ... 2–10 levels", level 0 first).
 	minScoreLevels = 2
 	maxScoreLevels = 10
+
+	// maxScoreExpected is the highest golden level that can exist: levels run
+	// 0..maxScoreLevels-1. A higher expected value can never equal the argmax of a
+	// valid distribution, so it is rejected up front instead of silently failing.
+	maxScoreExpected = maxScoreLevels - 1
 
 	// scoreProbSumTolerance is how far the probabilities may sum from 1.0 and
 	// still be accepted. Ollaya rounds each probability to 4 decimals, so a valid
@@ -76,11 +82,13 @@ func ScoreCalibration(probabilities map[string]float64, expected int) (confidenc
 		return 0, false, false
 	}
 
-	// Keys must be exactly the contiguous integer levels 0..n-1.
+	// Keys must be exactly the contiguous integer levels 0..n-1 in canonical
+	// decimal form. strconv.Atoi also accepts "+0" and "00", which would map two
+	// keys onto the same level and make the result depend on map order.
 	probs := make([]float64, n)
 	for key, p := range probabilities {
 		idx, err := strconv.Atoi(key)
-		if err != nil || idx < 0 || idx >= n {
+		if err != nil || idx < 0 || idx >= n || strconv.Itoa(idx) != key {
 			return 0, false, false
 		}
 		if math.IsNaN(p) || p < 0 || p > 1 {
@@ -107,9 +115,10 @@ func ScoreCalibration(probabilities map[string]float64, expected int) (confidenc
 	return probs[best], best == expected, true
 }
 
-// ParseScoreExpected parses a golden "score" expected value: a non-negative
-// integer level. It accepts a JSON integer (2) and an integral JSON float (2.0),
-// and rejects strings, negatives, and non-integral fractions (2.5).
+// ParseScoreExpected parses a golden "score" expected value: an integer level in
+// [0, maxScoreExpected]. It accepts a JSON integer (2) and an integral JSON float
+// (2.0), and rejects strings, negatives, non-integral fractions (2.5), and levels
+// above the bound.
 func ParseScoreExpected(raw json.RawMessage) (int, error) {
 	// json.Unmarshal of "null" into a float is a no-op (leaves 0, no error), so
 	// reject it explicitly rather than silently reading it as level 0.
@@ -117,17 +126,21 @@ func ParseScoreExpected(raw json.RawMessage) (int, error) {
 		return 0, fmt.Errorf("eval: score expected is missing")
 	}
 	var f float64
+	// encoding/json rejects NaN, Inf and number literals beyond float64's range
+	// (above MaxFloat64, e.g. 1e400) here. Numbers that fit in float64 but are
+	// larger than any level (1e300, 2^63) are rejected by the bound check below,
+	// before the int conversion, which is implementation-defined for them.
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return 0, fmt.Errorf("eval: score expected must be a number: %w", err)
 	}
-	// NaN/Inf cannot arrive here: encoding/json rejects them (and any overflowing
-	// literal) with an unmarshal error handled above. A non-integral value is a
-	// fraction like 2.5; reject it as not a level.
 	if f != math.Trunc(f) {
 		return 0, fmt.Errorf("eval: score expected %v is not an integer level", f)
 	}
 	if f < 0 {
 		return 0, fmt.Errorf("eval: score expected %v is negative", f)
+	}
+	if f > maxScoreExpected {
+		return 0, fmt.Errorf("eval: score expected %v is above the highest level %d", f, maxScoreExpected)
 	}
 	return int(f), nil
 }

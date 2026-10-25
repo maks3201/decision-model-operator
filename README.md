@@ -76,9 +76,9 @@ StorageClass (kind works).
 <!-- x-release-please-start-version -->
 ```sh
 helm install dmo oci://ghcr.io/maks3201/charts/decision-model-operator \
-  --version 0.6.1 --namespace decision-model-operator-system --create-namespace
+  --version 0.6.0 --namespace decision-model-operator-system --create-namespace
 
-kubectl apply -f https://raw.githubusercontent.com/maks3201/decision-model-operator/v0.6.1/config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml
+kubectl apply -f https://raw.githubusercontent.com/maks3201/decision-model-operator/v0.6.0/config/samples/decisionmodel_v1alpha1_decisionmodel_eval.yaml
 kubectl get dm support-router -w
 ```
 <!-- x-release-please-end -->
@@ -119,7 +119,7 @@ The full walk-through (first request, scaling, proxies, mirrors) is in the
 | Area | Tested | Notes |
 |---|---|---|
 | Kubernetes | 1.35, 1.36 and 1.37 nightly (kind, default suite); 1.37 on every change; 1.35 and 1.37 in the upgrade E2E of each release | 1.29+ is required by the APIs the operator uses. Versions below 1.35 are not tested ([RELEASING.md](RELEASING.md#5-support-policy)); exact patch versions are in [`hack/k8s-versions.env`](hack/k8s-versions.env). |
-| Runtime: [Ollaya](https://github.com/ollaya-dev/ollaya) | 0.13.0 (default), CPU | Known versions (0.7.3, 0.10.0, 0.11.0, 0.12.0, 0.12.1, 0.13.0) run as `repo:tag@sha256:<digest>`. A new revision on any other version, or on a `spec.image` without `@sha256:`, is refused (`UnpinnedRuntimeImage`) unless the operator runs with `--allow-unpinned-runtime-images`. 0.7.3 is the oldest accepted `runtimeVersion` (spikes 001 and 006, not in CI). |
+| Runtime: [Ollaya](https://github.com/ollaya-dev/ollaya) | 0.18.0 (default), CPU | Known versions (0.7.3, 0.10.0, 0.11.0, 0.12.0, 0.12.1, 0.13.0, 0.18.0) run as `repo:tag@sha256:<digest>`. A new revision on any other version, or on a `spec.image` without `@sha256:`, is refused (`UnpinnedRuntimeImage`) unless the operator runs with `--allow-unpinned-runtime-images`. 0.7.3 is the oldest accepted `runtimeVersion` (spikes 001 and 006, not in CI). 0.18.0 measured in spike 012; existing revisions keep the runtime they were recorded with. |
 | Device `cuda` | Manual only: one T4 GPU on EKS (Bottlerocket), runtime 0.7.3 | No GPU in CI. CUDA on 0.12.x is not verified yet. |
 | Storage | `ReadWriteOnce` (kind `standard`, local-path) | `ReadWriteMany` for `replicas > 1` across nodes is supported by the code but not tested. |
 | Models | `laya:en` on every change; more in the nightly matrix | Full list in the [quickstart](https://maks3201.github.io/decision-model-operator/quickstart/#supported-models). |
@@ -184,7 +184,7 @@ and, if a relative gate is set, scores production on the same cases. Results lan
 <!-- x-release-please-start-version -->
 ```sh
 # kubectl instead of Helm
-kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.6.1/install.yaml
+kubectl apply -f https://github.com/maks3201/decision-model-operator/releases/download/v0.6.0/install.yaml
 ```
 <!-- x-release-please-end -->
 
@@ -197,15 +197,15 @@ have build provenance attestations:
 ID='^https://github.com/maks3201/decision-model-operator/.github/workflows/release.yml@refs/'
 ISSUER=https://token.actions.githubusercontent.com
 
-cosign verify ghcr.io/maks3201/decision-model-operator:v0.6.1 \
+cosign verify ghcr.io/maks3201/decision-model-operator:v0.6.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
-cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.6.1 \
+cosign verify ghcr.io/maks3201/charts/decision-model-operator:0.6.0 \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 cosign verify-blob install.yaml --bundle install.yaml.sigstore.json \
   --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
 gh attestation verify install.yaml --repo maks3201/decision-model-operator   # SLSA provenance
 
-docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.6.1 --format '{{json .SBOM}}'
+docker buildx imagetools inspect ghcr.io/maks3201/decision-model-operator:v0.6.0 --format '{{json .SBOM}}'
 ```
 <!-- x-release-please-end -->
 
