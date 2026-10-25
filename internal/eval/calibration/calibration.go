@@ -26,11 +26,18 @@ import "math"
 // label it chose (choice -> probabilities[choice]; noul -> max(p, 1-p)) and
 // whether that choice was correct.
 type Prediction struct {
-	// Confidence is in [0,1]. Values outside [0,1] or NaN are clamped by the
-	// metric functions (NaN -> 0) and still counted.
+	// Confidence is in [0,1]. The constructors (FromChoice, FromNoul) never
+	// produce NaN or Inf; a finite out-of-range value is clamped and still
+	// counted. The metric functions clamp NaN to 0 as a last-resort guard only.
 	Confidence float64
 	// Correct is true when the model's chosen label matched the expected one.
 	Correct bool
+}
+
+// Finite reports whether v is neither NaN nor ±Inf. A runtime probability that
+// fails this check is not a usable confidence.
+func Finite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 // clampConfidence maps NaN to 0 and clamps into [0,1]. Out-of-range and NaN
@@ -119,10 +126,12 @@ func Brier(preds []Prediction) float64 {
 // FromChoice builds a Prediction from a choice answer: Confidence is the
 // probability assigned to the chosen label, Correct is choice == expected.
 // Returns ok=false when the chosen label has no probability entry (nothing to
-// score), including a nil/empty map.
+// score), including a nil/empty map, and when that probability is NaN or ±Inf
+// (not a usable confidence). The caller decides what an unusable value means
+// for accuracy; it must not feed calibration.
 func FromChoice(probabilities map[string]float64, choice, expected string) (Prediction, bool) {
 	p, present := probabilities[choice]
-	if !present {
+	if !present || !Finite(p) {
 		return Prediction{}, false
 	}
 	return Prediction{
@@ -134,8 +143,13 @@ func FromChoice(probabilities map[string]float64, choice, expected string) (Pred
 // FromNoul builds a Prediction from a noul answer. pYes is the model's
 // probability the statement holds; the model's choice is "yes" when pYes >= 0.5.
 // Confidence is the probability of the chosen side (max(pYes, 1-pYes)); Correct
-// is whether the chosen side matches expected.
-func FromNoul(pYes float64, expected bool) Prediction {
+// is whether the chosen side matches expected. ok=false when pYes is NaN or ±Inf:
+// there is no usable prediction, and the caller must not feed calibration with it
+// (a NaN would otherwise read as a confident "no").
+func FromNoul(pYes float64, expected bool) (Prediction, bool) {
+	if !Finite(pYes) {
+		return Prediction{}, false
+	}
 	p := clampConfidence(pYes)
 	yes := p >= 0.5
 	conf := p
@@ -145,5 +159,5 @@ func FromNoul(pYes float64, expected bool) Prediction {
 	return Prediction{
 		Confidence: conf,
 		Correct:    yes == expected,
-	}
+	}, true
 }

@@ -31,8 +31,9 @@ func TestValidateRuntimeVersion(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty is default (valid)", "", false},
-		{"default version", "0.13.0", false},
-		{"prior default still valid", "0.12.1", false},
+		{"default version", "0.18.0", false},
+		{"prior release still valid", "0.13.0", false},
+		{"previous release still valid", "0.12.1", false},
 		{"minimum version", "0.7.3", false},
 		{"newer version", "1.2.3", false},
 		{"patch above minimum", "0.7.4", false},
@@ -100,6 +101,18 @@ func TestImageForParamsVersion(t *testing.T) {
 			name:   "minimum version cpu is digest-pinned",
 			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: MinRuntimeVersion},
 			want:   repo + ":" + MinRuntimeVersion + "@" + runtimeImageDigests[MinRuntimeVersion].cpu,
+		},
+		{
+			// A revision recorded on 0.13.0 must keep rendering its own image after
+			// the default moved to 0.18.0 (only new revisions pick up the new default).
+			name:   "previous default keeps its pinned cpu image",
+			params: engine.Params{Device: engine.DeviceCPU, RuntimeVersion: "0.13.0"},
+			want:   repo + ":0.13.0@sha256:31f749def61165d7bbb15def4e3d799a403461e0b8b777f359a924bb9b845ce6",
+		},
+		{
+			name:   "previous default keeps its pinned cuda image",
+			params: engine.Params{Device: engine.DeviceCUDA, RuntimeVersion: "0.13.0"},
+			want:   repo + ":0.13.0-cuda@sha256:03ba657824d300e1cbcf05e5ef67045e52cdfc2b86caebbbc434a63168490d24",
 		},
 		{
 			name:   "image override wins over version",

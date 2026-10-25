@@ -1071,7 +1071,7 @@ func setAuth(req *http.Request, apiKey string) {
 const (
 	// DefaultRuntimeVersion is the Ollaya release this operator build defaults to
 	// when a DecisionModel pins no version and sets no explicit image.
-	DefaultRuntimeVersion = "0.13.0"
+	DefaultRuntimeVersion = "0.18.0"
 	// MinRuntimeVersion is the oldest release we have verified; older versions are
 	// rejected by ValidateRuntimeVersion.
 	MinRuntimeVersion = "0.7.3"
@@ -1125,6 +1125,9 @@ type runtimeImageDigest struct {
 //	0.13.0       index sha256:31f749def61165d7bbb15def4e3d799a403461e0b8b777f359a924bb9b845ce6  (linux/amd64 + linux/arm64)
 //	0.13.0-cuda  index sha256:03ba657824d300e1cbcf05e5ef67045e52cdfc2b86caebbbc434a63168490d24  (linux/amd64 only)
 //	0.13.0-cuda12 index sha256:e2787b27bfd6e8d611c536fb11f167962fabca2b1fd9f532944fd94e78d6edfd (linux/amd64 only)
+//	0.18.0       index sha256:a1baf26a5cad5510a5f426bf98097f24b01d96e0751c5202d5d382603b51a656  (linux/amd64 + linux/arm64)
+//	0.18.0-cuda  index sha256:82f118ce5549ad8a1e437c03f471bfb94c134bef7522664e5d66a3ddd5bab0b4  (linux/amd64 only)
+//	0.18.0-cuda12 index sha256:da484c2c85f86771d27463253d914d4513651d44be976f059f6a0369a350208c (linux/amd64 only)
 var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.7.3": {
 		cpu:  "sha256:3e3ad48f93baa7d98d43a9655646b6264bd8322493393a6eb7a899b5d231b4a9",
@@ -1149,6 +1152,10 @@ var runtimeImageDigests = map[string]runtimeImageDigest{
 	"0.13.0": {
 		cpu:  "sha256:31f749def61165d7bbb15def4e3d799a403461e0b8b777f359a924bb9b845ce6",
 		cuda: "sha256:03ba657824d300e1cbcf05e5ef67045e52cdfc2b86caebbbc434a63168490d24",
+	},
+	"0.18.0": {
+		cpu:  "sha256:a1baf26a5cad5510a5f426bf98097f24b01d96e0751c5202d5d382603b51a656",
+		cuda: "sha256:82f118ce5549ad8a1e437c03f471bfb94c134bef7522664e5d66a3ddd5bab0b4",
 	},
 }
 
