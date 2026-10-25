@@ -163,6 +163,15 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 			cls.scored, cls.correct, cls.pred, cls.hasCalibration = true, p.Correct, p, true
 			return cls
 		}
+		if p, present := a.Probabilities[a.Choice]; present && !calibration.Finite(p) {
+			// Defensive: encoding/json cannot decode a non-finite probability, so the
+			// runtime cannot send one. If it ever did, it is not a usable confidence:
+			// accuracy counts it as before, but it must not feed calibration (and must
+			// not fall into the zero-confidence fallback below, which would dilute ECE).
+			// Same rule as ScoreCalibration's ok=false.
+			cls.scored, cls.correct = true, a.Choice == want
+			return cls
+		}
 		cls.scored, cls.correct = true, a.Choice == want
 		cls.pred, cls.hasCalibration = calibration.Prediction{Confidence: 0, Correct: a.Choice == want}, true
 		return cls
@@ -183,7 +192,15 @@ func scorePrediction(a engine.Answer, expected json.RawMessage, tol float64) sco
 			cls.predictedClass = noClass
 			return cls
 		}
-		p := calibration.FromNoul(*a.Noul, want)
+		p, ok := calibration.FromNoul(*a.Noul, want)
+		if !ok {
+			// NaN/Inf is not a prediction. Scored and wrong, counted for macro-F1
+			// under the sentinel class (not a confident "no"), and no calibration
+			// contribution.
+			cls.scored, cls.correct = true, false
+			cls.predictedClass = noClass
+			return cls
+		}
 		cls.scored, cls.correct = true, p.Correct
 		cls.predictedClass = boolClass(*a.Noul >= 0.5)
 		cls.pred, cls.hasCalibration = p, true
@@ -264,7 +281,7 @@ type evalResult struct {
 	// then fails rather than passing on a macro-F1 of 0.
 	classifiableCases int
 	// questions is the bounded per-question summary (choice/bool only), worst
-	// macro-F1 first, capped by eval.Summarize.
+	// macro-F1 first, capped by macroF1Summary (macroF1SummaryLimit).
 	questions          []eval.QuestionSummary
 	questionsTruncated bool
 	transport          int // number of per-case transport errors (not scored as answers)
