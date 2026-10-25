@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -30,9 +32,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
@@ -142,10 +146,12 @@ var _ = Describe("DecisionModel as an autoscaler scale target", func() {
 		}
 		return out
 	}
-	countReason := func(evs []string, reason string) int {
+	// countRecreated counts the ServingPodsRecreated Warning events in a drained
+	// event buffer.
+	countRecreated := func(evs []string) int {
 		n := 0
 		for _, e := range evs {
-			if strings.Contains(e, reason) {
+			if strings.Contains(e, eventServingPodsRecreated) {
 				n++
 			}
 		}
@@ -219,17 +225,66 @@ var _ = Describe("DecisionModel as an autoscaler scale target", func() {
 
 		setReplicas(3) // 1 -> 3: the co-location term enters the Pod template.
 		Expect(hasColocationTerm(template().Spec.Template.Spec.Affinity, revisionLabels(getDM("rwo"), rev))).To(BeTrue())
-		Expect(countReason(drainEvents(r), eventServingPodsRecreated)).To(Equal(1), "1 -> 3 announced once")
+		Expect(countRecreated(drainEvents(r))).To(Equal(1), "1 -> 3 announced once")
 		withColocated := template().Spec.Template.Spec.DeepCopy()
 
 		setReplicas(2) // 3 -> 2: both sides co-locate, the Pod template is unchanged, no crossing.
 		Expect(template().Spec.Template.Spec).To(Equal(*withColocated), "2 <-> 3 leaves the Pod template unchanged")
-		Expect(countReason(drainEvents(r), eventServingPodsRecreated)).To(Equal(0), "2 <-> 3 is not a crossing")
+		Expect(countRecreated(drainEvents(r))).To(Equal(0), "2 <-> 3 is not a crossing")
 
 		setReplicas(1) // N -> 1: the term leaves the Pod template.
 		Expect(hasColocationTerm(template().Spec.Template.Spec.Affinity, revisionLabels(getDM("rwo"), rev))).To(BeFalse())
-		Expect(countReason(drainEvents(r), eventServingPodsRecreated)).To(Equal(1), "N -> 1 announced once")
+		Expect(countRecreated(drainEvents(r))).To(Equal(1), "N -> 1 announced once")
 		Expect(template().Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
+	})
+
+	It("announces the RWO recreation even when that reconcile's status write fails, and never twice", func() {
+		r := newR()
+		createDM("rwo-fail", 1)
+		rev, _ := driveToDeployment(r, "rwo-fail")
+		drainEvents(r)
+		servingPodsRecreatedTotal.Reset()
+
+		// A client whose DecisionModel status write fails once. The crossing is
+		// detected and announced during the Deployment Update (before the status
+		// write), so the signal must survive the failure.
+		var failOnce bool
+		wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		failing := interceptor.NewClient(wc, interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object,
+				patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, isDM := obj.(*decisionmodelv1alpha1.DecisionModel); sub == "status" && isDM && !failOnce {
+					failOnce = true
+					return apierrors.NewConflict(
+						schema.GroupResource{Group: decisionmodelv1alpha1.GroupVersion.Group, Resource: "decisionmodels"},
+						"rwo-fail", fmt.Errorf("stale"))
+				}
+				return cl.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		})
+		r.Client = failing
+
+		// Cross 1 -> 2 while the status write of this reconcile fails.
+		Expect(updateDM(ctx, namespace, "rwo-fail", func(d *decisionmodelv1alpha1.DecisionModel) { d.Spec.Replicas = int32Ptr(2) })).To(Succeed())
+		rec(r, "rwo-fail")
+		Expect(failOnce).To(BeTrue(), "the status write was attempted and failed")
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "rwo-fail-" + rev}, dep)).To(Succeed())
+		Expect(hasColocationTerm(dep.Spec.Template.Spec.Affinity, revisionLabels(getDM("rwo-fail"), rev))).To(BeTrue(),
+			"the Deployment was updated (Pods recreated) even though the status write failed")
+		Expect(countRecreated(drainEvents(r))).To(Equal(1),
+			"recreation announced despite the failed status write")
+		Expect(testutil.ToFloat64(servingPodsRecreatedTotal.WithLabelValues(namespace, "rwo-fail"))).To(Equal(1.0),
+			"counter incremented once despite the failed status write")
+
+		// Reconcile again with a working client: the Deployment already carries the
+		// term, so there is no new crossing — no second Event, no second increment.
+		rec(r, "rwo-fail")
+		Expect(countRecreated(drainEvents(r))).To(Equal(0), "not re-announced on a clean reconcile")
+		Expect(testutil.ToFloat64(servingPodsRecreatedTotal.WithLabelValues(namespace, "rwo-fail"))).To(Equal(1.0),
+			"counter not double-incremented")
 	})
 
 	// markJobFailed fails a prefetch Job so the candidate rolls back.

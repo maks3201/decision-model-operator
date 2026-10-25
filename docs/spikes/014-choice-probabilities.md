@@ -85,7 +85,7 @@ Comparison responses (verbatim answer objects):
 
 - None for code. The current scorer already reads `probabilities[choice]` for choice answers and does not
   read `confidence`, so there is no change needed for the measured behaviour.
-- For the architect: if a dashboard or doc shows `confidence` as "probability of the answer", it is wrong for
+- If a dashboard or doc shows `confidence` as "probability of the answer", it is wrong for
   choice answers. The margin formula should be stated in `docs/evaluation.md` (not changed here; out of scope).
 
 ## Not checked

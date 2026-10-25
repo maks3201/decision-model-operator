@@ -373,6 +373,21 @@ func (r *DecisionModelReconciler) event(
 		st.events = append(st.events, bufferedEvent{eventType: eventType, reason: reason, note: noteFmt, args: args})
 		return
 	}
+	r.eventNow(dm, eventType, reason, noteFmt, args...)
+}
+
+// eventNow emits an events.k8s.io/v1 Event immediately, bypassing the
+// reconcile-state buffer (nil-safe on the Recorder). Use it only for a signal
+// derived from live cluster state that can be observed at most once, so losing
+// the buffered copy on a failed status write would leave the signal unrecorded
+// even though the cluster change already happened. Ordinary events must go
+// through event, which defers emission until the status write succeeds so a
+// conflicting/failed write never emits a duplicate.
+func (r *DecisionModelReconciler) eventNow(
+	dm *decisionmodelv1alpha1.DecisionModel,
+	eventType, reason, noteFmt string,
+	args ...interface{},
+) {
 	if r.Recorder == nil {
 		return
 	}

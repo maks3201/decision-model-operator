@@ -578,11 +578,15 @@ func (r *DecisionModelReconciler) applyServingColocation(
 		// Crossing the 1 / N>1 boundary on an existing Deployment changes the Pod
 		// template (the co-location term). The Recreate strategy of a ReadWriteOnce
 		// store then recreates the serving Pods, so announce the transition once.
+		// Emitted immediately (not through the status-write buffer): the transition
+		// is detected from live cluster state and can be observed at most once, so a
+		// failed status write must not drop the Event — the Pods are already gone.
 		if liveExists && colocating != hadColocation {
-			r.event(ctx, dm, corev1.EventTypeWarning, eventServingPodsRecreated,
+			r.eventNow(dm, corev1.EventTypeWarning, eventServingPodsRecreated,
 				"revision %s: spec.replicas crossed 1 on a ReadWriteOnce store; the co-location affinity "+
 					"changed the serving Pod template, so the Recreate strategy recreated the serving Pods "+
 					"(model-load downtime). Autoscale with minReplicaCount of 2 or more, or use a ReadWriteMany store.", rev)
+			servingPodsRecreatedTotal.WithLabelValues(dm.Namespace, dm.Name).Inc()
 		}
 	}
 }

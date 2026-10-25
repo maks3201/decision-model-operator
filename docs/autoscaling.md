@@ -56,9 +56,11 @@ GPU replicas are not covered by a measured signal here.
   between 1 and more than 1 adds or removes that term, which changes the template. The serving
   Deployment uses the Recreate strategy for such a store, so the serving Pods are **recreated**: the
   model is unavailable for its load time. The operator emits a Warning event `ServingPodsRecreated`
-  on each crossing. For autoscaling either keep `minReplicaCount` at 2 or more (no crossing after the
-  first start), or use a ReadWriteMany store (`spec.cache.accessModes`). Changing scale between 2 and
-  N does not restart anything.
+  and increments the counter `decisionmodel_serving_pods_recreated_total` on each crossing, at the
+  recreation itself (not deferred to the status write), so the signal is recorded even if that
+  reconcile's status write fails. For autoscaling either keep `minReplicaCount` at 2 or more (no
+  crossing after the first start), or use a ReadWriteMany store (`spec.cache.accessModes`). Changing
+  scale between 2 and N does not restart anything.
 - **Candidate sizing.** A new revision (a rollout) starts `spec.replicas` Pods, not the autoscaled count.
   With an autoscaled stable at 8 replicas, a candidate also starts 8 Pods, and on CUDA 8 GPUs. Size the
   cluster for the peak of the stable plus one candidate. The operator does not size candidates from the
