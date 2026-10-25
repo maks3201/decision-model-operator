@@ -2317,6 +2317,15 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              selector:
+                description: |-
+                  Selector is the label selector of the stable revision's serving Pods, in the
+                  form the scale subresource reports to autoscalers (HPA and KEDA list the Pods
+                  they average resource metrics over with it). It selects the stable revision
+                  only: not prefetch Pods and not a candidate. Empty until a stable revision
+                  exists. It is derived from status.stableRevision on every status write, so it
+                  follows promotion and rollback.
+                type: string
               stableRevision:
                 description: StableRevision is the revision currently receiving traffic.
                 properties:
@@ -2554,4 +2563,8 @@ spec:
     served: true
     storage: true
     subresources:
+      scale:
+        labelSelectorPath: .status.selector
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas.desired
       status: {}

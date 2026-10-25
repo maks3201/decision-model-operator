@@ -13,7 +13,11 @@ churn of short-lived objects does not leak series.
 Per-DecisionModel gauges and counters are updated **only after a status write the
 API server accepted** (the same rule the operator uses for Events). A conflicting
 or failed status write emits no metric mutation, so metrics never advertise a
-phase, replica count, or outcome that was not persisted.
+phase, replica count, or outcome that was not persisted. The one exception is
+`decisionmodel_serving_pods_recreated_total`: it records a change already made to
+the cluster (serving Pods recreated), detected from live state and observable at
+most once, so it is incremented at the recreation rather than deferred — a failed
+status write must not drop that signal.
 
 ## Metrics
 
@@ -28,6 +32,7 @@ phase, replica count, or outcome that was not persisted.
 | `decisionmodel_evaluation_ece` | gauge | `namespace`, `name` | Expected Calibration Error of the last completed evaluation (decimal in `[0,1]`). |
 | `decisionmodel_evaluation_macro_f1` | gauge | `namespace`, `name` | Macro-averaged F1 of the last completed evaluation over classifiable (choice/bool) questions (decimal in `[0,1]`). Not exported when the dataset had no classifiable question; the series is deleted rather than set to `0`, so an unclassifiable run never reads as perfectly-wrong. |
 | `decisionmodel_probe_results_total` | counter | `namespace`, `name`, `result` | Model-readiness probe outcomes, counted on a gate transition (not re-counted for a steady-state Pod each requeue). `result` is `ready`, `digest_mismatch`, `device_mismatch`, `not_pinned`, or `error`. |
+| `decisionmodel_serving_pods_recreated_total` | counter | `namespace`, `name` | Serving-Pod recreations caused by `spec.replicas` crossing the 1 / N>1 boundary on a ReadWriteOnce store: the co-location affinity changes the Pod template, so the `Recreate` strategy recreates the serving Pods (a model-load gap). Incremented at the recreation (alongside the Warning event `ServingPodsRecreated`), not through the status-write buffer, so the signal survives a failed status write. Avoid it by autoscaling with `minReplicaCount` of 2 or more, or use a ReadWriteMany store. |
 | `decisionmodel_registry_resolve_duration_seconds` | histogram | _(none)_ | Duration of a model registry tag→digest resolution. No per-DecisionModel labels (bounded by design); default Prometheus buckets. |
 | `decisionmodel_revision_info` | gauge | `namespace`, `name`, `role`, `model`, `digest` | An info series (always `1`) carrying the `model` and `digest` of each live revision role. `role` is `stable` or `candidate`, so there are at most two series per DecisionModel. Exactly one series is kept per `(DecisionModel, role)`: on a model/digest change the previous series for that role is deleted (not left stale), and the series is removed entirely when the role has no revision. Use it to join a dashboard panel to the model/digest actually running, e.g. `decisionmodel_phase * on(namespace, name) group_left(model, digest) decisionmodel_revision_info{role="stable"}`. |
 | `decisionmodel_condition` | gauge | `namespace`, `name`, `type`, `status`, `reason` | An info series (always `1`) carrying the current `status` and `reason` of a DecisionModel condition. One series per `(DecisionModel, type)` for `type` in `Ready` and `Degraded`. Exactly one series is kept per `(DecisionModel, type)`: when the `status` or `reason` changes the previous series is deleted (not left stale), and the series is removed when the condition is absent (e.g. `Degraded` clears). Cardinality is bounded — `type` is one of two values, `status` is `True`/`False`, and `reason` strings are controller constants. Use it to alert or dashboard on a specific reason, e.g. `decisionmodel_condition{type="Degraded",status="True"}`. |
@@ -124,6 +129,9 @@ A tighter, phase-independent variant that fires whenever replicas fall short:
 ```promql
 decisionmodel_model_ready_replicas < decisionmodel_desired_replicas
 ```
+
+This variant also fires on every scale-up: `desired` rises at once, while `modelReady` lags until the
+new replicas load the model. Use it for dashboards, or with a `for:` longer than the model load time.
 
 ### Silent model mismatch
 

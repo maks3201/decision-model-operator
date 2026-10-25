@@ -68,6 +68,7 @@ nav:
   - Evaluation: evaluation.md
   - Sizing: sizing.md
   - GitOps: gitops.md
+  - Autoscaling: autoscaling.md
   - Metrics: metrics.md
   - Testing: testing.md
   - GPU CI: gpu-ci.md

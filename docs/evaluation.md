@@ -148,6 +148,12 @@ calibration metrics: they measure whether the model's stated confidence matches
 how often it is right. Accuracy alone does not catch an over-confident model;
 the ECE gates do.
 
+For a `choice` answer the calibration input is `probabilities[<chosen label>]`,
+not the `confidence` field. `confidence` is a normalised margin above the uniform
+distribution, `(p_max − 1/K) / (1 − 1/K)` for K options, so it is not a
+probability. If the chosen label has no entry in `probabilities`, the answer
+counts toward accuracy and as confidence 0 for calibration.
+
 ## Macro-F1: catching class imbalance
 
 Accuracy hides class imbalance. If 90% of the golden cases expect `billing`, a
