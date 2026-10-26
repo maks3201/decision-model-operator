@@ -188,6 +188,7 @@ _Appears in:_
 | `lastRetryToken` _string_ | LastRetryToken is the value of the decisionmodel.io/retry annotation the<br />controller last consumed to clear a failed revision. |  | Optional: \{\} <br /> |
 | `storeRecovery` _[StoreRecoveryStatus](#storerecoverystatus)_ | StoreRecovery tracks the bounded retries of lost-store recovery for the<br />stable revision. It is persisted so the attempt bound survives an operator<br />restart (an in-memory counter would reset and allow more recreations than<br />the documented limit). |  | Optional: \{\} <br /> |
 | `replicas` _[ReplicaStatus](#replicastatus)_ | Replicas reports desired and model-ready replica counts. |  | Optional: \{\} <br /> |
+| `selector` _string_ | Selector is the label selector of the stable revision's serving Pods, in the<br />form the scale subresource reports to autoscalers (HPA and KEDA list the Pods<br />they average resource metrics over with it). It selects the stable revision<br />only: not prefetch Pods and not a candidate. Empty until a stable revision<br />exists. It is derived from status.stableRevision on every status write, so it<br />follows promotion and rollback. |  | Optional: \{\} <br /> |
 | `evaluation` _[EvaluationStatus](#evaluationstatus)_ | Evaluation records the most recent eval-gated rollout result. |  | Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#condition-v1-meta) array_ | Conditions represent the latest available observations of the object's state. |  | Optional: \{\} <br /> |
 

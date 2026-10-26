@@ -25,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	decisionmodelv1alpha1 "github.com/maks3201/decision-model-operator/api/v1alpha1"
 )
@@ -41,6 +42,7 @@ func resetMetrics() {
 	evaluationECEGauge.Reset()
 	evaluationMacroF1Gauge.Reset()
 	probeResultsTotal.Reset()
+	servingPodsRecreatedTotal.Reset()
 	revisionInfoGauge.Reset()
 	conditionGauge.Reset()
 	// registryResolveDuration is a plain Histogram (no labels) and cannot be
@@ -279,6 +281,7 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 	bufferRollout(ctx, rolloutPromoted)
 	bufferProbeResult(ctx, probeReady, 1)
 	flushMetrics(gone, st)
+	servingPodsRecreatedTotal.WithLabelValues("ns", "gone").Inc()
 
 	deleteMetrics("ns", "gone")
 
@@ -295,6 +298,7 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 		testutil.CollectAndCount(evaluationMacroF1Gauge),
 		testutil.CollectAndCount(rolloutsTotal),
 		testutil.CollectAndCount(probeResultsTotal),
+		testutil.CollectAndCount(servingPodsRecreatedTotal),
 	} {
 		if c != 0 {
 			t.Errorf("a gone series survived delete: count %d", c)
@@ -303,6 +307,57 @@ func TestDeleteMetricsRemovesAllSeriesForDM(t *testing.T) {
 	// keep's phase gauge is still one-hot on Ready.
 	if got := testutil.ToFloat64(phaseGauge.WithLabelValues("ns", "keep", string(decisionmodelv1alpha1.PhaseReady))); got != 1 {
 		t.Errorf("keep phase Ready gauge = %v, want 1", got)
+	}
+}
+
+// TestServingPodsRecreatedCounter covers the decisionmodel_serving_pods_recreated_total
+// counter: it is registered on the controller-runtime registry, increments by 1 per
+// recreation, and its series is removed by the per-DecisionModel cleanup.
+func TestServingPodsRecreatedCounter(t *testing.T) {
+	resetMetrics()
+
+	// Registered on the controller-runtime registry that the manager's /metrics
+	// endpoint serves (init registers it there), and usable with no series present.
+	if n := testutil.CollectAndCount(servingPodsRecreatedTotal); n != 0 {
+		t.Fatalf("counter not clean/registered: series = %d, want 0", n)
+	}
+	servingPodsRecreatedTotal.WithLabelValues("ns", "probe").Inc()
+	if n, err := testutil.GatherAndCount(metrics.Registry, metricServingPodsRecreated); err != nil || n != 1 {
+		t.Fatalf("counter not on the controller-runtime registry: count=%d err=%v", n, err)
+	}
+	servingPodsRecreatedTotal.Reset()
+
+	tests := []struct {
+		name string
+		incs int
+		want float64
+	}{
+		{name: "no recreation", incs: 0, want: 0},
+		{name: "single crossing", incs: 1, want: 1},
+		{name: "two crossings", incs: 2, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetMetrics()
+			for i := 0; i < tt.incs; i++ {
+				servingPodsRecreatedTotal.WithLabelValues("ns", "dm").Inc()
+			}
+			if got := testutil.ToFloat64(servingPodsRecreatedTotal.WithLabelValues("ns", "dm")); got != tt.want {
+				t.Errorf("counter = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// The per-DecisionModel cleanup removes the series, and only for that DM.
+	resetMetrics()
+	servingPodsRecreatedTotal.WithLabelValues("ns", "gone").Inc()
+	servingPodsRecreatedTotal.WithLabelValues("ns", "keep").Inc()
+	deleteMetrics("ns", "gone")
+	if got := testutil.ToFloat64(servingPodsRecreatedTotal.WithLabelValues("ns", "keep")); got != 1 {
+		t.Errorf("keep counter lost on delete of another DM: %v", got)
+	}
+	if n := testutil.CollectAndCount(servingPodsRecreatedTotal); n != 1 {
+		t.Errorf("series after delete = %d, want 1 (only keep)", n)
 	}
 }
 
