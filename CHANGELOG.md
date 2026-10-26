@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0](https://github.com/maks3201/decision-model-operator/compare/v0.6.1...v0.7.0) (2026-10-26)
+
+
+### Features
+
+* make Ollaya 0.18.0 the default runtime ([#204](https://github.com/maks3201/decision-model-operator/issues/204)) ([00a8340](https://github.com/maks3201/decision-model-operator/commit/00a83400646f333da267d1d9755c63e76766c79f))
+* serve the scale subresource so KEDA and HPA can target a DecisionModel ([#205](https://github.com/maks3201/decision-model-operator/issues/205)) ([007b667](https://github.com/maks3201/decision-model-operator/commit/007b6671af8ba1c44394e06f429ae099f9f28996))
+
+
+### Bug Fixes
+
+* **ci:** serialize pull request e2e and use patched Go ([#201](https://github.com/maks3201/decision-model-operator/issues/201)) ([dbaa65e](https://github.com/maks3201/decision-model-operator/commit/dbaa65e0ec80182cf9868c43b651ac354a6a13bb))
+* harden evaluation scoring against non-finite values and oversized levels ([#203](https://github.com/maks3201/decision-model-operator/issues/203)) ([6cf9bee](https://github.com/maks3201/decision-model-operator/commit/6cf9bee454f75d79cb3923af2941269de6bfd4b3))
+
 ## [0.6.1](https://github.com/maks3201/decision-model-operator/compare/v0.6.0...v0.6.1) (2026-10-20)
 
 
