@@ -2,7 +2,7 @@
 # BUILDPLATFORM keeps the Go toolchain native to the builder; we cross-compile
 # to TARGETOS/TARGETARCH via GOOS/GOARCH (CGO disabled), so linux/arm64 does not
 # run the toolchain under QEMU.
-FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.27@sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc AS builder
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
