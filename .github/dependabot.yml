@@ -1,7 +1,10 @@
 version: 2
 updates:
   # Go modules. Group the Kubernetes client libraries so their lockstep updates
-  # land in one PR.
+  # land in one PR; everything else in the module goes into a second weekly PR.
+  # Each ecosystem then costs one CI round per week instead of one per bump
+  # (the main ruleset requires an up-to-date branch, so every extra PR repeats
+  # the full required checks).
   - package-ecosystem: gomod
     directory: "/"
     schedule:
@@ -10,6 +13,12 @@ updates:
     groups:
       kubernetes:
         patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      gomod:
+        patterns:
+          - "*"
+        exclude-patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
 
@@ -35,9 +44,31 @@ updates:
       codeql-action:
         patterns:
           - "github/codeql-action*"
+      # All other actions in one PR.
+      actions:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github/codeql-action*"
 
   # Base images in the Dockerfile.
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      docker:
+        patterns:
+          - "*"
+
+  # Documentation site dependencies (mkdocs-material, hash-pinned in
+  # docs/requirements.txt). Without this block Dependabot never bumps them, so
+  # an advisory against e.g. certifi stays open with no PR.
+  - package-ecosystem: pip
+    directory: "/docs"
+    schedule:
+      interval: weekly
+    groups:
+      docs:
+        patterns:
+          - "*"
