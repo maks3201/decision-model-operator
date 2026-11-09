@@ -61,14 +61,9 @@ updates:
         patterns:
           - "*"
 
-  # Documentation site dependencies (mkdocs-material, hash-pinned in
-  # docs/requirements.txt). Without this block Dependabot never bumps them, so
-  # an advisory against e.g. certifi stays open with no PR.
-  - package-ecosystem: pip
-    directory: "/docs"
-    schedule:
-      interval: weekly
-    groups:
-      docs:
-        patterns:
-          - "*"
+  # docs/requirements.txt is intentionally NOT tracked by Dependabot. The file
+  # is installed with `pip install --require-hashes` (see .github/workflows/
+  # docs.yml), which demands == pins plus hashes for every transitive dependency.
+  # Dependabot cannot regenerate that lock, so its PRs fail the "Build site"
+  # check (it bumps the version but not the full hash set). Refresh these deps
+  # with `pip-compile --generate-hashes docs/requirements.in` instead.
