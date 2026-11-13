@@ -31,6 +31,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
+# Runners are pinned to ubuntu-24.04: on ubuntu-latest (26.04) `kind load` fails
+# in `ctr images import`. Move back to ubuntu-latest once that is fixed.
 jobs:
   # Decide whether the heavy upgrade job needs to run. It is relevant only when a
   # surface that could regress the no-roll promise changed; anything else (incl.
@@ -38,7 +40,7 @@ jobs:
   # required check never hangs. The nightly schedule and workflow_dispatch always run.
   changes:
     name: detect relevant changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
@@ -83,7 +85,7 @@ jobs:
       needs.changes.outputs.code == 'true' &&
       (github.event_name != 'pull_request' ||
        github.head_ref != 'release-please--branches--main--components--decision-model-operator')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,7 +134,7 @@ jobs:
     name: chart-upgrade-e2e-required
     needs: [changes, upgrade]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check result
@@ -150,7 +152,7 @@ jobs:
     name: open an issue on a failed scheduled run
     needs: [upgrade, chart-upgrade-e2e-required]
     if: ${{ failure() && github.event_name == 'schedule' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       issues: write
