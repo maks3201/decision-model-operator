@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/maks3201/decision-model-operator/compare/v0.7.0...v0.7.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **deps:** require Go 1.26.11 for the net/http fix ([#227](https://github.com/maks3201/decision-model-operator/issues/227)) ([8d9176d](https://github.com/maks3201/decision-model-operator/commit/8d9176d3e93d136439eb81d0cfebb73239338847))
+* **e2e:** load kind images for the node platform only ([#230](https://github.com/maks3201/decision-model-operator/issues/230)) ([54eaef0](https://github.com/maks3201/decision-model-operator/commit/54eaef0b8f5971d0a9f6b54328edd799041cbbcd))
+
 ## [0.7.0](https://github.com/maks3201/decision-model-operator/compare/v0.6.1...v0.7.0) (2026-10-26)
 
 
