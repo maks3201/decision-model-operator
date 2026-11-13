@@ -1,0 +1,83 @@
+# Throwaway diagnostic, not for merge: reproduces `kind load docker-image` and
+# shows the stderr of `ctr images import` that kind hides.
+name: Debug kind load
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/debug-kind-load.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.runner }}, ${{ matrix.flow }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+        # pull: fresh docker pull. load-prune-pull: the flow of the failing shards
+        # (docker load, `docker image prune -af`, then kind-up.sh pulls again).
+        flow: [pull, load-prune-pull]
+    env:
+      IMG: ghcr.io/ollaya-dev/ollaya:0.18.0
+      NODE: probe-control-plane
+    steps:
+      - name: Runner facts
+        run: |
+          head -3 /etc/os-release
+          uname -r
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+          docker info | grep -iE "storage driver|driver-type|snapshotter|containerd|cgroup" || true
+          df -h / | tail -1
+
+      - name: Install kind
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Prepare the image like the e2e job
+        run: |
+          set -euo pipefail
+          docker pull "$IMG"
+          if [ "${{ matrix.flow }}" = "load-prune-pull" ]; then
+            docker save "$IMG" -o /tmp/ollaya-image.tar
+            docker rmi -f "$IMG"
+            docker load -i /tmp/ollaya-image.tar
+            sudo docker image prune -af
+            docker pull "$IMG"
+          fi
+          echo "== image as Docker sees it =="
+          docker image inspect "$IMG" --format 'ID={{.Id}} RepoDigests={{.RepoDigests}}'
+          docker save "$IMG" | tar -xO index.json | head -c 900; echo
+
+      - name: Create cluster
+        run: kind create cluster --name probe
+
+      - name: Import with the exact failing command, stderr visible
+        run: |
+          set +e
+          ctr_import() { # $1 = label, rest = ctr flags
+            label="$1"; shift
+            docker exec --privileged "$NODE" ctr --namespace=k8s.io images rm "$IMG" >/dev/null 2>&1
+            "$@" 2>/tmp/ctr.err
+            rc=$?
+            echo "[$label] exit=$rc"
+            if [ "$rc" != "0" ]; then sed 's/^/    ctr: /' /tmp/ctr.err | head -8; fi
+            echo "| ${{ matrix.runner }} | ${{ matrix.flow }} | $label | exit=$rc |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          ctr_import "as kind does (--all-platforms)" \
+            bash -c 'docker save "$IMG" | docker exec --privileged -i "$NODE" ctr --namespace=k8s.io images import --all-platforms --digests --snapshotter=overlayfs -'
+          ctr_import "without --all-platforms" \
+            bash -c 'docker save "$IMG" | docker exec --privileged -i "$NODE" ctr --namespace=k8s.io images import --digests --snapshotter=overlayfs -'
+          ctr_import "docker save --platform linux/amd64 + --all-platforms" \
+            bash -c 'docker save --platform linux/amd64 "$IMG" | docker exec --privileged -i "$NODE" ctr --namespace=k8s.io images import --all-platforms --digests --snapshotter=overlayfs -'
+          ctr_import "kind load docker-image" \
+            bash -c 'kind load docker-image "$IMG" --name probe'
+          exit 0
