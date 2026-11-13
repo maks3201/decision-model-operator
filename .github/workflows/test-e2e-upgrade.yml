@@ -41,14 +41,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Runners are pinned to ubuntu-24.04: on ubuntu-latest (26.04) `kind load` fails
-# in `ctr images import`. Move back to ubuntu-latest once that is fixed.
 jobs:
   # Resolve the release tags and the k8s version matrix once, so every job and the
   # job summary agree on them. 'from'/'tag' default to the latest GitHub release.
   resolve:
     name: resolve tags + versions
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       from: ${{ steps.tags.outputs.from }}
@@ -108,7 +106,7 @@ jobs:
   upgrade:
     name: upgrade ${{ needs.resolve.outputs.from }} -> source (k8s ${{ matrix.k8s }})
     needs: resolve
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 50
     strategy:
       fail-fast: false
@@ -143,7 +141,7 @@ jobs:
   smoke:
     name: release-artifact smoke ${{ needs.resolve.outputs.tag }} (k8s ${{ needs.resolve.outputs.newest }})
     needs: resolve
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,7 +178,7 @@ jobs:
     name: OLM bundle smoke (k8s ${{ needs.resolve.outputs.newest }})
     needs: resolve
     if: ${{ inputs.olm }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -63,7 +63,7 @@ if ! docker image inspect "${OLLAYA_IMAGE}" >/dev/null 2>&1; then
 fi
 
 echo "loading ${OLLAYA_IMAGE} into kind cluster '${CLUSTER}'..."
-kind load docker-image "${OLLAYA_IMAGE}" --name "${CLUSTER}"
+"$(dirname "${BASH_SOURCE[0]}")/kind-load.sh" "${OLLAYA_IMAGE}" "${CLUSTER}"
 
 echo
 kubectl cluster-info --context "kind-${CLUSTER}"

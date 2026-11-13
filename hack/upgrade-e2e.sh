@@ -319,7 +319,7 @@ if [[ -n "${token}" ]]; then
 fi
 echo "pulling ${GHCR_IMAGE}"
 docker pull "${GHCR_IMAGE}"
-kind load docker-image "${GHCR_IMAGE}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${GHCR_IMAGE}" "${CLUSTER}"
 
 echo "applying ${from_tag} install.yaml"
 kc apply -f "${work}/install.yaml"
@@ -361,7 +361,7 @@ record_before "${DM_NORES}"
 # --- upgrade to the code under test (built from source) -----------------------
 note "building the operator from source and upgrading"
 make docker-build "IMG=${IMG}"
-kind load docker-image "${IMG}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${IMG}" "${CLUSTER}"
 # Apply the source manifests via the kustomize path (same as the main suite's deploy).
 make install
 make deploy "IMG=${IMG}"

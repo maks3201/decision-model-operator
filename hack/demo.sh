@@ -145,7 +145,7 @@ install_operator() {
     local)
       step "Building the operator image from source and installing it"
       make docker-build "IMG=${IMG}"
-      kind load docker-image "${IMG}" --name "${CLUSTER}"
+      "${repo_root}/hack/kind-load.sh" "${IMG}" "${CLUSTER}"
       make install
       make deploy "IMG=${IMG}"
       ;;

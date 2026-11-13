@@ -164,7 +164,7 @@ connect_registry
 
 note "building the operator image from source and loading it into kind"
 make docker-build "IMG=${IMG}"
-kind load docker-image "${IMG}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${IMG}" "${CLUSTER}"
 
 # --- install OLM --------------------------------------------------------------
 note "installing OLM on the cluster (operator-sdk olm install)"
