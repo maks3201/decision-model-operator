@@ -27,15 +27,13 @@ env:
   # this ref) so a shard does not re-pull it every time.
   OLLAYA_IMAGE: ghcr.io/ollaya-dev/ollaya:0.18.0
 
-# Runners are pinned to ubuntu-24.04: on ubuntu-latest (26.04) `kind load` fails
-# in `ctr images import`. Move back to ubuntu-latest once that is fixed.
 jobs:
   # Decide whether the heavy E2E matrix needs to run. A docs-only change (only
   # docs/** or *.md) skips it; the gate job below still reports success so a
   # required check never hangs on a docs-only PR.
   changes:
     name: detect code changes
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
@@ -87,7 +85,7 @@ jobs:
       needs.changes.outputs.code == 'true' &&
       (github.event_name != 'pull_request' ||
        github.head_ref != 'release-please--branches--main--components--decision-model-operator')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -236,7 +234,7 @@ jobs:
     name: e2e-required
     needs: [changes, test-e2e]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check result

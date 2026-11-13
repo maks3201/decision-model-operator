@@ -23,12 +23,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-# Runners are pinned to ubuntu-24.04: on ubuntu-latest (26.04) `kind load` fails
-# in `ctr images import`. Move back to ubuntu-latest once that is fixed.
 jobs:
   ha-switch:
     name: kind (kustomize, CPU, laya:en) HA switch points
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +62,7 @@ jobs:
 
   fleet:
     name: kind (kustomize, CPU) 500-DM fleet stress
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,7 +99,7 @@ jobs:
     name: open an issue on a failed scheduled run
     needs: [ha-switch, fleet]
     if: ${{ failure() && github.event_name == 'schedule' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       issues: write

@@ -196,7 +196,7 @@ KIND_CLUSTER="${CLUSTER}" KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-}" ./hack/kind-up.
 # --- 2. install the previous released chart + its image -----------------------
 note "pulling + loading the released operator image ghcr.io/${REPO}:v${from_ver}"
 docker pull "ghcr.io/${REPO}:v${from_ver}"
-kind load docker-image "ghcr.io/${REPO}:v${from_ver}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "ghcr.io/${REPO}:v${from_ver}" "${CLUSTER}"
 
 note "helm install the released chart ${from_ver}"
 hc install "${RELEASE}" "${CHART_REF}" --version "${from_ver}" \
@@ -314,7 +314,7 @@ echo "pre-upgrade  ${DM_AWAIT}: parked, candidateHash=${await_cand_before} appro
 # --- 3. build the source image + upgrade --------------------------------------
 note "building the operator image from source: ${IMG}"
 make docker-build "IMG=${IMG}"
-kind load docker-image "${IMG}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${IMG}" "${CLUSTER}"
 
 # Helm never upgrades crds/ (chart README "CRD upgrade caveat"); apply the source
 # CRD out of band FIRST so the new fields exist before the new controller runs.
@@ -455,7 +455,7 @@ echo "PASS: the upgraded CRD accepts spec.runtimeVersion."
 # --- 6. opt-in roll: set spec.runtimeVersion on ONE DM ------------------------
 note "preloading the pin-target runtime image ${PIN_IMAGE} into the cluster"
 docker image inspect "${PIN_IMAGE}" >/dev/null 2>&1 || docker pull "${PIN_IMAGE}"
-kind load docker-image "${PIN_IMAGE}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${PIN_IMAGE}" "${CLUSTER}"
 
 note "opt-in: set spec.runtimeVersion=${RUNTIME_VERSION} on ${DM_AWAIT} only -> expect one roll there"
 # ${DM_AWAIT} is Ready and quiet after its post-upgrade promotion; read its CURRENT

@@ -81,7 +81,7 @@ if [[ -n "${token}" ]]; then
 fi
 echo "pulling ${GHCR_IMAGE}"
 docker pull "${GHCR_IMAGE}"
-kind load docker-image "${GHCR_IMAGE}" --name "${CLUSTER}"
+"${repo_root}/hack/kind-load.sh" "${GHCR_IMAGE}" "${CLUSTER}"
 
 # --- 1. kustomize install.yaml ------------------------------------------------
 note "smoke 1: kubectl apply -f install.yaml (${tag})"

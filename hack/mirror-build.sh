@@ -100,6 +100,6 @@ echo "mirror-build: building ${MIRROR_IMAGE}..."
 docker build -t "${MIRROR_IMAGE}" -f "${CTX}/Dockerfile" "${CTX}"
 
 echo "mirror-build: loading ${MIRROR_IMAGE} into kind cluster '${CLUSTER}'..."
-kind load docker-image "${MIRROR_IMAGE}" --name "${CLUSTER}"
+"${SCRIPT_DIR}/kind-load.sh" "${MIRROR_IMAGE}" "${CLUSTER}"
 
 echo "mirror-build: done."
