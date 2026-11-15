@@ -2,7 +2,7 @@
 # BUILDPLATFORM keeps the Go toolchain native to the builder; we cross-compile
 # to TARGETOS/TARGETARCH via GOOS/GOARCH (CGO disabled), so linux/arm64 does not
 # run the toolchain under QEMU.
-FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.27@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e AS builder
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.27@sha256:ec47ea3725fea0cc88f6de94919aef19f40f12fc1ec0e2d1b3426dbf15ecca04 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
+FROM gcr.io/distroless/static:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
